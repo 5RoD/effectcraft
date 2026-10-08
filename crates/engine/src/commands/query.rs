@@ -52,6 +52,8 @@ fn summary(s: &mut Session, _: &Value) -> Result<Value> {
     Ok(json!({
         "path": s.path,
         "dirty": s.is_dirty(),
+        "needsSave": s.needs_save(),
+        "historyDirty": s.history_dirty,
         "bitDepth": s.project.settings.bit_depth.label(),
         "renderer": super::file::backend_status(s),
         "items": items,

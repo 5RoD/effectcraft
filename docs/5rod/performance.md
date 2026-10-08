@@ -1,0 +1,127 @@
+# Measured development-build performance
+
+Measured on 2026-10-09 (local date) on the user's Windows machine: i9-10900F,
+32 GiB RAM, RTX 3050 with 8 GiB VRAM, Vulkan, driver 32.0.16.1714. Both binaries
+were built with Rust 1.99.0 for x86_64-pc-windows-msvc using normal release
+optimization, Thin LTO and one codegen unit. `RAYON_NUM_THREADS=20` was explicit.
+Compiler jobs and other agent benchmarks were idle. Normal desktop background
+activity remained; CPU temperature, OS file cache and power state were not controlled.
+
+The baseline is upstream commit `d60cb71e297a4bb76851b27b48c0014b56ccab69`.
+[Recorded results and executable hashes](performance-results.json) identify the
+development binaries and include the operation/render runs. These measurements
+cover the synthetic cases below, rather than overall After Effects parity or export speed.
+
+## Editing and opening
+
+The built-in `bench --ops --small --layers 1000 --json` case creates 12 comps,
+1,043 total layers, 45 items, a five-level precomp chain and synthetic missing-media
+references. It does not decode real gaming footage. Three baseline/development
+pairs ran in A/B, B/A, A/B order. The table reports the median of the three harness
+results. The harness uses best-of-20 for the small edit, best-of-three for the batch
+edit/open, and a single first frame per run; these are not interactive latency percentiles.
+
+| Operation | Original (ms) | Development (ms) |
+| --- | ---: | ---: |
+| Change one layer's opacity | 5.147 | 0.226 |
+| Toggle Shy on 1,000 layers | 6.992 | 0.618 |
+| Open the generated project | 97.776 | 98.776 |
+| First CPU frame at quarter resolution | 25.653 | 26.760 |
+
+Sharing unchanged property trees removes most snapshot-copy cost in this case.
+Opening and first-frame times are effectively unchanged at this sample size.
+An earlier development candidate opened in 215 ms; streaming metadata parsing
+removed that regression before this comparison.
+
+## Styled CPU rendering
+
+An original pink solid with Outer Glow and Drop Shadow is rendered in 1080p/4K
+comps. Full opacity and ordinary blend-channel settings exercise the direct
+composite path. Each run uses nine uncached renders and thirty playback frames,
+starting at time zero. Three alternating pairs ran at each resolution. The table
+reports the median of the three per-run medians.
+
+| Case | Original (ms/frame) | Development (ms/frame) |
+| --- | ---: | ---: |
+| 1080p uncached frame | 71.45 | 63.74 |
+| 1080p playback, no layer cache | 77.57 | 61.11 |
+| 1080p playback, layer cache | 20.06 | 6.55 |
+| 4K uncached frame | 129.30 | 70.39 |
+| 4K playback, no layer cache | 129.65 | 71.54 |
+| 4K playback, layer cache | 74.77 | 15.44 |
+
+This scene benefits from removing a full-frame clone and interpolation pass.
+Partial-opacity, knockout, channel-restricted and isolated styles retain their
+existing paths and regression coverage. The table is a CPU-compositor comparison;
+it does not measure the desktop GPU display loop or a complex real project.
+
+## Existing Glow
+
+Four original fixtures use radius 40 and threshold 10 with Original Colors or
+Arbitrary Map. Full/Half CPU and GPU cold/warm/display paths ran with nine samples
+per path and three alternating pairs. Full-resolution cold-cache medians follow;
+the recorded results also include warm/display and half-resolution values.
+
+| Fixture | CPU original/development (ms) | GPU original/development (ms) |
+| --- | ---: | ---: |
+| 1080p Original Colors | 52.77 / 48.50 | 58.28 / 57.33 |
+| 1080p Arbitrary Map | 66.78 / 49.34 | 58.28 / 56.51 |
+| 4K Original Colors | 193.76 / 193.58 | 226.33 / 225.02 |
+| 4K Arbitrary Map | 257.24 / 199.09 | 225.05 / 231.54 |
+
+Removing per-pixel heap allocation improves the Arbitrary Map CPU path. A general
+GPU speed improvement is not established: several GPU measurements are higher,
+including 4K Arbitrary Map above. The GPU readback paths include transfer costs;
+the direct display path is recorded separately. Native Bloom was not included.
+
+Every CPU/GPU fixture comparison reported 0.000% differing pixels under the
+harness's comparison. Separately, six production PNG renders—1080p/4K styles,
+Original Glow and Arbitrary Map Glow—were byte-identical between original and
+development builds, verified by SHA-256. This covers those inputs, not all effects.
+
+## Persisted long history
+
+One production stress run creates 100 Null layers, changes 5,000 unique opacity
+values, undoes 25 edits and creates an alternative future, then saves and reopens.
+
+| Measurement | Result |
+| --- | ---: |
+| All 5,000 scripted edits | 263 ms |
+| Mean per scripted edit | 0.0526 ms |
+| Save project plus branching history | 514 ms |
+| Reopen project plus branching history | 645 ms |
+| Saved states before/after reopen | 5,103 / 5,103 |
+| Project file size | 14,527,527 bytes |
+| Peak process working set | 284,291,072 bytes (about 271 MiB) |
+
+An earlier production candidate took 5,581 ms to save the same case. Pointer and
+content-hash buckets avoid scanning every earlier layer variant; equality checks
+still verify hash collisions. The archive format did not change. The stress run
+is one observation, not a repeated latency distribution; working set includes
+the whole process and open/save work, rather than history storage alone. The parent sampled the
+process's peak-working-set counter every 100 ms, so this is an observed peak.
+
+Separate checks retained abandoned branch content after JSON/XML reopening.
+The font counter also preserved seven history states and evaluated the expected
+Unicode-prefixed values at three keyframe times after a production save/reopen.
+Unlimited history still uses RAM and is not lazily loaded from disk. Thirty-second
+checkpoints are not a durable per-edit journal; those stronger guarantees remain open.
+
+## Reproduction
+
+Generate the original scenes using [benchmark-fixtures.jsx](benchmark-fixtures.jsx)
+with the baseline CLI in an empty working directory. Generating with this fork
+also saves its history extension, changing the open-workload shape.
+
+```text
+effectcraft-cli script path/to/docs/5rod/benchmark-fixtures.jsx
+effectcraft-cli bench --ops --small --layers 1000 --json
+effectcraft-cli bench --project styled-4k.ecproj --comp "Styled 1080p" --time 0 --n 9 --play 30
+effectcraft-cli bench --gpu --project glow.ecproj --comp "4K Arbitrary" --time 0 --n 9
+```
+
+Use separate configuration folders via `EFFECTCRAFT_CONFIG_DIR`; run baseline and
+development binaries sequentially, alternate pair order, and keep compiler/GPU
+test jobs idle. Always pass `--time 0` for these short comps. The CLI's default
+benchmark time of three seconds can land outside their active footage and produce
+an empty-frame timing. No such timings are included here.

@@ -39,6 +39,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("view.transparencyGrid", "Transparency Grid", [], None),
     uic!("view.fastPreviews", "Fast Previews", [], None),
     uic!("view.theme.dark", "Theme: Dark", [], None),
+    uic!("view.theme.5rod", "Theme: 5RoD", [], None),
     uic!("view.theme.darker", "Theme: Darker", [], None),
     uic!("view.theme.light", "Theme: Light", [], None),
     uic!("timeline.zoomIn", "Zoom In Time", [], Some("=")),
@@ -49,6 +50,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("timeline.switchesModes", "Toggle Switches / Modes", [], Some("F4")),
     uic!("timeline.workAreaBegin", "Set Work Area Begin", [], Some("B")),
     uic!("timeline.workAreaEnd", "Set Work Area End", [], Some("N")),
+    uic!("timeline.workAreaFromLayers", "Set Work Area to Selected Layers", [], Some("Cmd+Alt+B")),
     uic!("timeline.moveInToTime", "Move Layer In Point to Current Time", [], Some("[")),
     uic!("timeline.moveOutToTime", "Move Layer Out Point to Current Time", [], Some("]")),
     uic!("timeline.trimInToTime", "Trim Layer In Point to Current Time", [], Some("Alt+[")),
@@ -491,6 +493,7 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
         "timeline.search" => {
             app.ui.timeline.search = params.get("query").and_then(Value::as_str).unwrap_or_default().to_string();
             app.show_panel(PanelKind::Timeline);
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("focus-timeline-search"), true));
         }
         "timeline.graphEditor" => app.ui.timeline.graph_editor = !app.ui.timeline.graph_editor,
         "timeline.switchesModes" => app.ui.timeline.show_modes = !app.ui.timeline.show_modes,
@@ -520,6 +523,7 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
         }
         "timeline.workAreaBegin" => return app.session.execute("comp.workArea", json!({"set": "begin"})).map_err(|e| e.to_string()),
         "timeline.workAreaEnd" => return app.session.execute("comp.workArea", json!({"set": "end"})).map_err(|e| e.to_string()),
+        "timeline.workAreaFromLayers" => return app.session.execute("comp.workArea", json!({"set": "selectedLayers"})).map_err(|e| e.to_string()),
         "timeline.moveInToTime" => return timing(app, "moveInToTime"),
         "timeline.moveOutToTime" => return timing(app, "moveOutToTime"),
         "timeline.trimInToTime" => return timing(app, "trimInToTime"),
@@ -745,10 +749,17 @@ pub fn frontend(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, p: Valu
             Value::Null
         }
         "app.find" => {
+            let timeline = app.ui.focused == PanelKind::Timeline;
             if let Some(q) = p.get("query").and_then(Value::as_str) {
-                app.ui.project_search = q.to_string();
+                if timeline {
+                    app.ui.timeline.search = q.to_string();
+                } else {
+                    app.ui.project_search = q.to_string();
+                }
             }
-            app.show_panel(PanelKind::Project);
+            let (panel, focus) = if timeline { (PanelKind::Timeline, "focus-timeline-search") } else { (PanelKind::Project, "focus-project-search") };
+            app.show_panel(panel);
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new(focus), true));
             Value::Null
         }
         "playback.toggle" => {
@@ -1105,6 +1116,8 @@ fn file_dialog(app: &mut EffectcraftApp, id: &str, params: &Value) -> Option<Res
         "anim.applyPreset" => ("path", Ask::Open(&["ecpreset", "json"])),
         "view.exportGuides" => ("path", Ask::Save("Guides.json")),
         "view.importGuides" => ("path", Ask::Open(&["json"])),
+        "keys.easePreset.export" => ("path", Ask::Save("Ease Library.json")),
+        "keys.easePreset.import" if params.get("library").is_none() => ("path", Ask::Open(&["json"])),
         "file.exportLottie" => ("path", Ask::Save("Animation.json")),
         "file.importLottie" => ("path", Ask::Open(&["json", "lottie"])),
         "file.importTimeline" => ("path", Ask::Open(&["xml", "fcpxml", "otio", "edl", "aaf", "omf"])),
@@ -1383,24 +1396,41 @@ pub type Binding = (egui::Modifiers, egui::Key, String, Value);
 
 /// All bindings of the active keyboard shortcut preset, most modifiers first.
 pub fn bindings(session: &effectcraft_engine::Session) -> Vec<Binding> {
-    let mut v: Vec<Binding> = Vec::new();
+    scoped_bindings(session, None)
+}
+
+fn scoped_bindings(session: &effectcraft_engine::Session, focused: Option<PanelKind>) -> Vec<Binding> {
+    let mut v: Vec<(Binding, bool)> = Vec::new();
     for (sc, b) in session.shortcuts().bindings() {
+        if let Some(panel) = focused {
+            let viewer = matches!(panel, PanelKind::Composition | PanelKind::Layer | PanelKind::Viewer(_));
+            let allowed = match b.scope.as_str() {
+                "Timeline" => panel == PanelKind::Timeline || viewer,
+                "Composition" => viewer,
+                "Application" => true,
+                scope => scope == panel.title(),
+            };
+            if !allowed {
+                continue;
+            }
+        }
         // Off macOS `Cmd` is Ctrl, so a Ctrl+Cmd shortcut (Enter Full Screen's Ctrl+Cmd+F) would
         // steal the plain Cmd one (Find's Cmd+F): such macOS-only shortcuts aren't bound there.
         if !cfg!(target_os = "macos") && sc.split('+').any(|p| p == "Ctrl") && sc.split('+').any(|p| p == "Cmd") {
             continue;
         }
         if let Some((m, k)) = parse_shortcut(sc) {
+            let panel_override = focused.is_some() && b.scope != "Application";
             if m.shift
                 && let Some(alias) = shifted_alias(k)
             {
-                v.push((m, alias, b.command.clone(), b.params.clone()));
+                v.push(((m, alias, b.command.clone(), b.params.clone()), panel_override));
             }
-            v.push((m, k, b.command.clone(), b.params.clone()));
+            v.push(((m, k, b.command.clone(), b.params.clone()), panel_override));
         }
     }
-    v.sort_by_key(|(m, ..)| std::cmp::Reverse(m.command as u8 + m.shift as u8 + m.alt as u8 + m.ctrl as u8));
-    v
+    v.sort_by_key(|((m, ..), panel)| std::cmp::Reverse((m.command as u8 + m.shift as u8 + m.alt as u8 + m.ctrl as u8, *panel)));
+    v.into_iter().map(|(binding, _)| binding).collect()
 }
 
 fn mods_match(want: egui::Modifiers, got: egui::Modifiers) -> bool {
@@ -1471,7 +1501,7 @@ pub fn handle_shortcuts(app: &mut EffectcraftApp, ctx: &egui::Context) {
     if events.is_empty() {
         return;
     }
-    let binds = bindings(&app.session);
+    let binds = scoped_bindings(&app.session, Some(app.ui.focused));
     for (key, mods, pressed) in events {
         // Plain Spacebar runs its shortcut (Play Current Preview) on the release: held, it is
         // the Hand tool (After Effects), and a drag with it must not start or stop playback.

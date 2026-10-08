@@ -244,6 +244,52 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
     Ok(presets(s).map(|(name, curve, built_in)| json!({"name": name, "builtIn": built_in, "curve": curve})).collect())
 }
 
+fn export_library(s: &mut Session, p: &Value) -> Result<Value> {
+    let library = serde_json::to_value(PresetFile { version: 1, presets: &s.ease_presets }).map_err(|e| bad("keys.easePreset.export", e.to_string()))?;
+    if let Some(path) = str_p(p, "path") {
+        let text = serde_json::to_vec_pretty(&library).map_err(|e| bad("keys.easePreset.export", e.to_string()))?;
+        s.services.write_file(path, &text).map_err(|e| bad("keys.easePreset.export", e.to_string()))?;
+    }
+    Ok(library)
+}
+
+fn import_library(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "keys.easePreset.import";
+    let library = if let Some(path) = str_p(p, "path") {
+        let bytes = s.services.read_file(path).map_err(|e| bad(C, e.to_string()))?;
+        serde_json::from_slice::<Value>(&bytes).map_err(|e| bad(C, e.to_string()))?
+    } else {
+        p.get("library").cloned().ok_or_else(|| bad(C, "pass a library or its file path"))?
+    };
+    if library.get("version").and_then(Value::as_u64) != Some(1) {
+        return Err(bad(C, "unsupported ease library version"));
+    }
+    let entries = library.get("presets").and_then(Value::as_array).ok_or_else(|| bad(C, "library must contain a presets array"))?;
+    let mut imported: Vec<EasePreset> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let name = name_p(entry, "name", C)?;
+        if is_built_in(&name) || imported.iter().any(|q| q.name.eq_ignore_ascii_case(&name)) {
+            return Err(bad(C, format!("reserved or duplicate preset name `{name}`")));
+        }
+        let curve = curve_v(entry.get("curve").ok_or_else(|| bad(C, "preset is missing its curve"))?, C)?;
+        imported.push(EasePreset { name, curve });
+    }
+    let count = imported.len();
+    let mut merged = s.ease_presets.clone();
+    for preset in imported {
+        if let Some(old) = merged.iter_mut().find(|q| q.name.eq_ignore_ascii_case(&preset.name)) {
+            if !crate::commands::b_p(p, "replace").unwrap_or(false) {
+                return Err(bad(C, format!("preset `{}` exists; enable replace to overwrite it", preset.name)));
+            }
+            *old = preset;
+        } else {
+            merged.push(preset);
+        }
+    }
+    store(s, merged)?;
+    Ok(json!({"imported": count, "total": s.ease_presets.len()}))
+}
+
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!(
@@ -266,6 +312,16 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         cmd!("keys.easePreset.rename", "Rename Ease Preset", [], None, "{name, newName}", always, rename),
         cmd!("keys.easePreset.delete", "Delete Ease Preset", [], None, "{name}", always, delete),
+        cmd!("keys.easePreset.export", "Export Ease Library", [], None, "{path?} — portable user presets; returns the library", always, export_library),
+        cmd!(
+            "keys.easePreset.import",
+            "Import Ease Library",
+            [],
+            None,
+            "{path? | library? (object), replace?: bool} — validates the whole library before updating presets",
+            always,
+            import_library
+        ),
         query!("keys.easePreset.list", "Ease Presets", "{} — [{name, builtIn, curve}]", list),
         query!("keys.easePreset.capture", "Ease Curve of Selected Keyframes", "{} — the curve between the first selected pair of keyframes", capture),
     ]

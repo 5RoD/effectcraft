@@ -366,8 +366,30 @@ pub fn history(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let p = ui.painter().with_clip_rect(rect);
     // The branching history (EffectCraft's History panel): every state, branches indented under
     // the state they grew from; click any state to go there (`edit.history.goto`).
-    let nodes = app.session.history_tree();
+    // Building the complete tree on every animation frame becomes expensive with unlimited
+    // history. Reuse it until the project or history topology changes.
+    type CachedHistory = ((u64, usize, usize, usize), std::sync::Arc<Vec<effectcraft_engine::history::HistoryNode>>);
+    let key = (app.session.revision, app.session.history.undo.len(), app.session.history.redo.len(), app.session.history.branches.len());
+    let cache_id = egui::Id::new("history-tree-cache");
+    let cached = ui.data(|d| d.get_temp::<CachedHistory>(cache_id));
+    let nodes = match cached {
+        Some((old, nodes)) if old == key => nodes,
+        _ => {
+            let nodes = std::sync::Arc::new(app.session.history_tree());
+            ui.data_mut(|d| d.insert_temp(cache_id, (key, nodes.clone())));
+            nodes
+        }
+    };
     let row_h = 22.0;
+    p.text(
+        pos2(rect.min.x + 12.0, rect.min.y + 12.0),
+        Align2::LEFT_CENTER,
+        format!("{} states · included in project saves", nodes.len()),
+        Tokens::ui(11.0),
+        t.text_dim,
+    );
+    let rect = Rect::from_min_max(pos2(rect.min.x, rect.min.y + 26.0), rect.max);
+    let p = ui.painter().with_clip_rect(rect);
     let cur = nodes.iter().position(|n| n.current).unwrap_or(0);
     let scroll_id = egui::Id::new("history-scroll");
     let mut scroll = widgets::PanelScroll::begin(ui, scroll_id, rect);

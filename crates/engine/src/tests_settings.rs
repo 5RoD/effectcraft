@@ -140,7 +140,9 @@ fn prefs_commands_get_set_reset_and_persist() {
 
 #[test]
 fn undo_levels_are_honoured() {
+    // A finite limit is optional in this fork; full persistent history is the default.
     let mut s = session_with_comp();
+    s.prefs.general.keep_all_history = false;
     s.execute("prefs.set", json!({"key": "general.undoLevels", "value": 3})).unwrap();
     for i in 0..6 {
         s.execute("layer.newNull", json!({"name": format!("N{i}")})).unwrap();
@@ -330,6 +332,115 @@ fn frontend_commands_are_bindable_with_panel_scope() {
 // ---------------------------------------------------------------- auto-save / recovery
 
 #[test]
+fn background_autosave_only_promotes_successful_writes_and_retries_failure() {
+    let d = tmp("background-failure");
+    let mut s = session_with_comp();
+    s.execute("file.saveAs", json!({"path": d.join("Safe.ecproj").to_string_lossy()})).unwrap();
+    s.execute("layer.newNull", json!({"name": "First"})).unwrap();
+    let good = s.autosave_now().unwrap();
+    let revision = s.autosave.saved_revision;
+    s.execute("layer.newNull", json!({"name": "Second"})).unwrap();
+    s.autosave.pending = Some(autosave::PendingWrite::spawn(d.join("failed.ecproj"), s.revision, 2, || Err(std::io::Error::other("disk full"))).unwrap());
+    assert!(s.autosave_wait().is_err());
+    assert_eq!(s.autosave.saved_revision, revision);
+    assert_eq!(s.autosave.last_path.as_deref(), Some(good.as_str()));
+    assert_eq!(s.autosave.last_slot, Some(1));
+    s.autosave.background = true;
+    let next = s.autosave_now().unwrap();
+    assert_eq!(s.autosave.saved_revision, revision, "starting a write is not completion");
+    s.execute("layer.newNull", json!({"name": "During save"})).unwrap();
+    s.autosave_wait().unwrap();
+    assert_eq!(s.autosave.last_path.as_deref(), Some(next.as_str()));
+    assert_ne!(s.autosave.saved_revision, Some(s.revision), "edits made during the write still need saving");
+    let written = std::fs::read_to_string(next).unwrap();
+    assert!(written.contains("Second") && !written.contains("During save"));
+    let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
+fn autosave_timer_never_blocks_on_a_pending_write() {
+    let d = tmp("pending-tick");
+    let mut s = session_with_comp();
+    s.path = Some(d.join("T.ecproj").to_string_lossy().to_string());
+    s.autosave.last = Some(0.0);
+    let (release, wait) = std::sync::mpsc::channel();
+    s.autosave.pending = Some(
+        autosave::PendingWrite::spawn(d.join("T auto-save 1.ecproj"), s.revision, 1, move || {
+            let _ = wait.recv_timeout(std::time::Duration::from_secs(2));
+            Ok(())
+        })
+        .unwrap(),
+    );
+    let start = std::time::Instant::now();
+    assert!(s.autosave_tick(6000.0).is_none());
+    assert!(start.elapsed() < std::time::Duration::from_millis(200));
+    release.send(()).unwrap();
+    s.autosave_wait().unwrap();
+    let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
+fn smart_recovery_saves_history_and_seconds_interval() {
+    let d = tmp("smart-history");
+    let mut s = session_with_comp();
+    s.path = Some(d.join("T.ecproj").to_string_lossy().to_string());
+    assert!(s.autosave_tick(1000.0).is_none());
+    s.execute("layer.newNull", json!({"name": "Branch A"})).unwrap();
+    s.execute("layer.newNull", json!({"name": "Branch B"})).unwrap();
+    s.undo();
+    s.execute("layer.newNull", json!({"name": "Branch C"})).unwrap();
+    assert!(s.autosave_tick(1029.0).is_none());
+    let auto = s.autosave_tick(1030.0).unwrap().unwrap();
+    let expected = s.history_tree().len();
+    let mut recovered = Session::default();
+    recovered.execute("file.open", json!({"path": auto})).unwrap();
+    assert_eq!(recovered.history_tree().len(), expected);
+    assert_eq!(recovered.history.branches.len(), 1);
+    let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
+fn recovery_saves_undone_edits_when_document_matches_its_saved_pixels() {
+    let d = tmp("undone-history");
+    let mut s = session_with_comp();
+    s.execute("file.saveAs", json!({"path": d.join("History.ecproj").to_string_lossy()})).unwrap();
+    s.autosave_tick(1000.0);
+    s.execute("layer.newNull", json!({"name": "Undone but retained"})).unwrap();
+    s.undo();
+    assert!(!s.is_dirty() && s.needs_save());
+    let auto = s.autosave_tick(1030.0).unwrap().unwrap();
+    let mut recovered = Session::default();
+    recovered.execute("file.open", json!({"path": auto})).unwrap();
+    assert!(!recovered.needs_save());
+    assert!(recovered.redo());
+    assert_eq!(recovered.active_comp().unwrap().layers[0].name, "Undone but retained");
+    let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
+fn recovery_finds_a_checkpoint_that_landed_before_sentinel_update() {
+    let d = tmp("recovery-late-worker");
+    let store: Arc<dyn ConfigStore> = Arc::new(DirConfig::new(d.join("config")));
+    let mut s = session_with_comp();
+    s.config = Some(store.clone());
+    s.begin_recovery();
+    s.execute("file.saveAs", json!({"path": d.join("Worker.ecproj").to_string_lossy()})).unwrap();
+    s.execute("layer.newNull", json!({"name": "First"})).unwrap();
+    let first = s.autosave_now().unwrap();
+    s.execute("layer.newNull", json!({"name": "Newer"})).unwrap();
+    let plan = autosave::plan_in(s.file_ops(), &s.prefs, s.path.as_deref(), None, s.autosave.last_slot).unwrap();
+    plan.write(s.file_ops(), crate::history_file::encode(&s.project, &s.history, true).unwrap().as_bytes()).unwrap();
+    std::fs::OpenOptions::new().write(true).open(&first).unwrap().set_modified(std::time::SystemTime::UNIX_EPOCH).unwrap();
+    drop(s); // No UI collection of the completed write, and no clean exit.
+    let mut reopened = Session { config: Some(store), ..Default::default() };
+    let recovery = reopened.begin_recovery().unwrap();
+    assert_eq!(recovery.autosave.as_deref(), Some(plan.path.to_string_lossy().as_ref()));
+    reopened.execute("file.open", json!({"path": recovery.autosave.unwrap()})).unwrap();
+    assert_eq!(reopened.active_comp().unwrap().layers[0].name, "Newer");
+    let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
 fn atomic_write_survives_a_crash_mid_write() {
     let d = tmp("atomic");
     let f = d.join("p.ecproj");
@@ -394,7 +505,7 @@ fn autosave_tick_waits_for_the_interval_and_changes() {
     s.execute("file.saveAs", json!({"path": d.join("T.ecproj").to_string_lossy()})).unwrap();
     s.execute(
         "prefs.set",
-        json!({"values": {"autoSave.intervalMinutes": 1, "autoSave.location": "custom", "autoSave.folder": d.join("custom").to_string_lossy()}}),
+        json!({"values": {"autoSave.intervalSeconds": 0, "autoSave.intervalMinutes": 1, "autoSave.location": "custom", "autoSave.folder": d.join("custom").to_string_lossy()}}),
     )
     .unwrap();
     assert!(s.autosave_tick(1000.0).is_none(), "the first tick starts the clock");
@@ -462,6 +573,14 @@ fn open_recent_increment_and_revert() {
     assert!(!s.is_enabled("file.openRecent"));
     assert_eq!(std::path::PathBuf::from(autosave::increment_path("/x/Intro 9.ecproj", |_| false)), std::path::PathBuf::from("/x/Intro 10.ecproj"));
     assert_eq!(std::path::PathBuf::from(autosave::increment_path("/x/v1.ecproj", |p| p.ends_with("v1 2.ecproj"))), std::path::PathBuf::from("/x/v1 3.ecproj"));
+    assert_eq!(
+        std::path::PathBuf::from(autosave::increment_path("/x/Intro 4294967295.ecproj", |_| false)),
+        std::path::PathBuf::from("/x/Intro 4294967296.ecproj")
+    );
+    assert_eq!(
+        std::path::PathBuf::from(autosave::increment_path("/x/Intro 18446744073709551615.ecproj", |_| false)),
+        std::path::PathBuf::from("/x/Intro 18446744073709551615 2.ecproj")
+    );
     let _ = std::fs::remove_dir_all(d);
 }
 

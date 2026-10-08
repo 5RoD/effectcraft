@@ -6,6 +6,39 @@ use serde::{Deserialize, Serialize};
 
 pub type Uid = u64;
 
+/// A layer's property tree shared by immutable project snapshots. Mutating a tree detaches
+/// only that layer's properties; composition clones retain all other trees without copying.
+/// The transparent representation preserves the existing project JSON format.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PropertyTree(std::sync::Arc<PropGroup>);
+
+impl From<PropGroup> for PropertyTree {
+    fn from(group: PropGroup) -> Self {
+        Self(std::sync::Arc::new(group))
+    }
+}
+
+impl std::ops::Deref for PropertyTree {
+    type Target = PropGroup;
+
+    fn deref(&self) -> &PropGroup {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for PropertyTree {
+    fn deref_mut(&mut self) -> &mut PropGroup {
+        std::sync::Arc::make_mut(&mut self.0)
+    }
+}
+
+impl PartialEq for PropertyTree {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0
+    }
+}
+
 /// How a property is presented and edited.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]

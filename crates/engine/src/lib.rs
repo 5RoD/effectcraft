@@ -19,6 +19,7 @@ pub mod ease_presets;
 pub mod footage_check;
 pub mod guard;
 pub mod history;
+pub mod history_file;
 pub mod jobs;
 pub mod learn;
 pub mod links;
@@ -331,6 +332,10 @@ pub struct Session {
     /// The project as last opened or saved: the project is unmodified while it is this very
     /// snapshot, so undoing back to the saved state clears the modified mark.
     pub saved_project: Arc<Project>,
+    /// Last saved history topology. Returning to saved pixels can still leave a new future
+    /// that must be persisted before the project closes.
+    pub saved_history: History,
+    pub history_dirty: bool,
     pub path: Option<String>,
     pub state: EditorState,
     pub services: Arc<dyn Services>,
@@ -466,6 +471,8 @@ impl Default for Session {
         let project = Arc::new(Project::default());
         Session {
             saved_project: project.clone(),
+            saved_history: History::default(),
+            history_dirty: false,
             project,
             history: History::default(),
             revision: 0,
@@ -604,7 +611,7 @@ impl Session {
         let same = merge.is_some() && merge.map(str::to_string) == self.history.merge_key;
         if !same {
             // Undone steps aren't lost: they stay in the History panel as a branch.
-            let levels = self.prefs.general.undo_levels.max(1) as usize;
+            let levels = self.history_limit();
             self.history.record(label, before, levels);
         } else {
             self.history.abandon_redo(&before);
@@ -622,6 +629,7 @@ impl Session {
         if Arc::ptr_eq(&self.project, &self.saved_project) {
             self.saved_revision = self.revision;
         }
+        self.refresh_history_dirty();
         if self.disk_cache.is_some() {
             self.layer_cache.set_disk_salt(effectcraft_render::disk_cache::footage_salt(&self.project));
         }
@@ -675,10 +683,23 @@ impl Session {
         self.revision != self.saved_revision
     }
 
+    /// Document changes or edits/futures not yet present in its saved history.
+    pub fn needs_save(&self) -> bool {
+        self.is_dirty() || self.history_dirty
+    }
+
+    pub(crate) fn refresh_history_dirty(&mut self) {
+        // Most edits change the document; only compare the topology when returning to the
+        // saved document. Frontends can ask needs_save every frame in constant time.
+        self.history_dirty = self.is_dirty() || !self.history.same_records(&self.saved_history);
+    }
+
     /// The project as it is now is the saved one (after opening or saving it).
     pub fn mark_saved(&mut self) {
         self.saved_project = self.project.clone();
         self.saved_revision = self.revision;
+        self.saved_history = self.history.clone();
+        self.history_dirty = false;
     }
 
     /// The project has changes its file doesn't (a session restored with unsaved changes): it
@@ -929,8 +950,18 @@ impl Session {
 /// (renamed / regrouped / added parameters, reordered popups; see
 /// [`effectcraft_effects::migrate`]).
 pub fn upgrade_effects(p: &mut Project) {
+    upgrade_effects_cached(p, &mut Default::default());
+}
+
+// Saved history shares composition snapshots. Upgrade each unique composition once and
+// retain the original Arc when its controls already match the registry.
+pub(crate) fn upgrade_effects_cached(p: &mut Project, cache: &mut std::collections::HashMap<usize, (Arc<effectcraft_project::Comp>, u64)>) {
     let mut sizes = std::collections::HashMap::new();
-    for (cid, c) in p.comps() {
+    for (cid, item) in &p.items {
+        let effectcraft_project::ItemKind::Comp(c) = &item.kind else { continue };
+        if cache.contains_key(&(Arc::as_ptr(c) as usize)) {
+            continue;
+        }
         for l in &c.layers {
             let (w, h) = effectcraft_render::source_size(p, l);
             sizes.insert((*cid, l.id), if w == 0 { [c.width as f64, c.height as f64] } else { [w as f64, h as f64] });
@@ -939,17 +970,36 @@ pub fn upgrade_effects(p: &mut Project) {
     let mut next = p.next_id;
     for (cid, it) in p.items.iter_mut() {
         let effectcraft_project::ItemKind::Comp(c) = &mut it.kind else { continue };
-        for l in &mut std::sync::Arc::make_mut(c).layers {
+        let address = Arc::as_ptr(c) as usize;
+        if let Some((comp, required_next)) = cache.get(&address) {
+            *c = comp.clone();
+            next = next.max(*required_next);
+            continue;
+        }
+        let mut updated: Option<effectcraft_project::Comp> = None;
+        for (layer_index, l) in c.layers.iter().enumerate() {
             let size = sizes.get(&(*cid, l.id)).copied().unwrap_or([100.0, 100.0]);
-            let Some(fx) = l.props.sub_mut("effects") else { continue };
-            for n in &mut fx.children {
+            let Some(fx) = l.effects() else { continue };
+            for (effect_index, n) in fx.children.iter().enumerate() {
                 let effectcraft_project::Node::Group(g) = n else { continue };
                 let effectcraft_project::GroupKind::Effect { effect } = &g.kind else { continue };
                 if let Some(spec) = effectcraft_effects::find(effect) {
-                    effectcraft_effects::migrate::upgrade_instance(spec, g, &mut effectcraft_project::build::Ids(&mut next), size);
+                    let mut group = g.clone();
+                    if effectcraft_effects::migrate::upgrade_instance(spec, &mut group, &mut effectcraft_project::build::Ids(&mut next), size) {
+                        let comp = updated.get_or_insert_with(|| (**c).clone());
+                        if let Some(node) =
+                            comp.layers.get_mut(layer_index).and_then(|l| l.props.sub_mut("effects")).and_then(|fx| fx.children.get_mut(effect_index))
+                        {
+                            *node = effectcraft_project::Node::Group(group);
+                        }
+                    }
                 }
             }
         }
+        if let Some(comp) = updated {
+            *c = Arc::new(comp);
+        }
+        cache.insert(address, (c.clone(), next));
     }
     p.next_id = next;
 }

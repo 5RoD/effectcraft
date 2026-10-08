@@ -163,7 +163,7 @@ pub fn camera(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let mut d = app.dialog_state.camera.clone();
     let (mut ok, mut close) = (false, false);
     let mut rects = (egui::Rect::NOTHING, egui::Rect::NOTHING);
-    super::dialogs::modal(ctx, "Camera Settings", vec2(520.0, 420.0), t, |ui| {
+    super::dialogs::modal(ctx, "Camera Settings", vec2(520.0, 450.0), t, |ui| {
         egui::Grid::new("cam-grid").num_columns(2).spacing([14.0, 9.0]).show(ui, |ui| {
             ui.label("Type");
             egui::ComboBox::from_id_salt("cam-type").selected_text(if d.two_node { "Two-Node Camera" } else { "One-Node Camera" }).show_ui(ui, |ui| {
@@ -208,7 +208,18 @@ pub fn camera(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
             });
             ui.end_row();
             ui.label("Aperture");
-            ui.add(egui::DragValue::new(&mut d.aperture).range(0.0..=10000.0).speed(0.1).suffix(" px"));
+            let response = ui.add(egui::DragValue::new(&mut d.aperture).range(0.0..=10000.0).speed(0.1).suffix(" px"));
+            app.auto.add("dialog.camera.aperture", response.rect, "Aperture");
+            ui.end_row();
+            ui.label("F-Stop");
+            // Use the engine's focal/aperture conversion, so both linked controls round-trip.
+            let focal = focal_for_zoom(w, d.zoom);
+            let mut f_stop = if d.aperture > 0.0 { focal * w / (1920.0 * d.aperture) } else { 10000.0 };
+            let response = ui.add(egui::DragValue::new(&mut f_stop).range(0.01..=10000.0).speed(0.05).prefix("f/").max_decimals(2));
+            app.auto.add("dialog.camera.fStop", response.rect, "F-Stop");
+            if response.changed() {
+                d.aperture = focal / f_stop.max(0.01) * w / 1920.0;
+            }
             ui.end_row();
             ui.label("Blur Level");
             ui.add(egui::DragValue::new(&mut d.blur).range(0.0..=10000.0).suffix(" %"));

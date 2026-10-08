@@ -45,7 +45,7 @@ const TILE: egui::Vec2 = vec2(84.0, 64.0);
 const GAP: f32 = 6.0;
 const ROW: f32 = 30.0;
 /// Height of the controls under the graph (numbers, three button rows, status, "Presets").
-const CONTROLS: f32 = 154.0;
+const CONTROLS: f32 = 184.0;
 /// Panels at least this wide put the presets beside the graph and controls.
 const SIDE_BY_SIDE: f32 = 560.0;
 
@@ -122,6 +122,15 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             }
         }
         _ => {}
+    }
+    y += ROW;
+    for (x, id, label) in [(x0, "export", "Export Library"), (x0 + 126.0, "import", "Import Library")] {
+        if kit::button(app, ui, at(x, y, 120.0), &format!("easePresets.{id}"), label, false) {
+            let ctx = ui.ctx().clone();
+            if let Err(e) = crate::menus::invoke(app, &ctx, &format!("keys.easePreset.{id}"), json!({})) {
+                app.ui.status = e;
+            }
+        }
     }
     y += ROW;
     let msg = if pairs > 0 {

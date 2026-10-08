@@ -135,6 +135,28 @@ fn user_presets_save_rename_delete_and_persist() {
 }
 
 #[test]
+fn portable_ease_libraries_round_trip_and_import_atomically() {
+    let mut source = Session::default();
+    source.execute("keys.easePreset.save", json!({"name": "5RoD Snap", "curve": [0.12, 0.0, 0.2, 1.15]})).unwrap();
+    let library = source.execute("keys.easePreset.export", json!({})).unwrap();
+    let store = Arc::new(MemoryConfig::default());
+    let mut target = Session { config: Some(store.clone()), ..Default::default() };
+    target.execute("keys.easePreset.import", json!({"library": library})).unwrap();
+    assert_eq!(source.ease_presets, target.ease_presets);
+    let before = target.ease_presets.clone();
+    assert!(target.execute("keys.easePreset.import", json!({"library": library})).is_err());
+    assert_eq!(before, target.ease_presets);
+    target.execute("keys.easePreset.import", json!({"library": library, "replace": true})).unwrap();
+    let mut broken = library;
+    broken["presets"].as_array_mut().unwrap().push(json!({"name": "broken", "curve": [0.1, 0.2]}));
+    assert!(target.execute("keys.easePreset.import", json!({"library": broken, "replace": true})).is_err());
+    assert_eq!(before, target.ease_presets, "a bad entry must not partially overwrite a library");
+    let mut reopened = Session { config: Some(store), ..Default::default() };
+    reopened.load_settings();
+    assert_eq!(before, reopened.ease_presets);
+}
+
+#[test]
 fn a_corrupt_presets_file_loads_what_it_can() {
     let store = Arc::new(MemoryConfig::default());
     store.write(EASE_PRESETS_FILE, "{\"presets\": [ not json").unwrap();

@@ -18,7 +18,7 @@ var selectorValue = [100, 100, 100];
 
 // Request ops (must match runtime.rs).
 var __COMP = 0, __COMPNAME = 1, __LAYER = 2, __LINFO = 3, __CHILD = 4, __PINFO = 5, __VALUE = 6, __XFORM = 7, __RECT = 8, __MARKERS = 9, __DOC = 10;
-var __FOOT = 11, __FDATA = 12, __SAMPLE = 13, __PROJ = 14;
+var __FOOT = 11, __FDATA = 12, __SAMPLE = 13, __PROJ = 14, __TCOUNTER = 15;
 
 function __begin(t, v, c, l, path, uid, idx, fd, ti, tt, sv) {
   time = t;
@@ -1009,6 +1009,16 @@ __global('thisProperty', function () { return __S.prop || (__S.prop = __mkProp(_
 });
 
 function effect(k) { return thisLayer.effect(k); }
+
+// Original EffectCraft helper. A string result changes text while retaining Source Text style.
+// One host request evaluates the rig's controls; match ids remain stable when a layer is copied.
+function ecTextCounter(t) {
+  t = t === undefined ? time : Number(__v(t));
+  if (!Number.isFinite(t)) __err('ecTextCounter time must be finite');
+  var result = __h(__TCOUNTER, __S.c, __S.l, t);
+  if (result === null) __err('Add a Native Text Counter to this layer through Animation > Native Motion Tools');
+  return result;
+}
 function mask(k) { return thisLayer.mask(k); }
 function content(k) { return thisLayer.content(k); }
 function toComp(p, t) { return thisLayer.toComp(p, t); }

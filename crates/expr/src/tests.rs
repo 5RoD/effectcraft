@@ -801,6 +801,157 @@ fn numbers_to_source_text() {
     assert_eq!(f.text("12", 0.0), "12");
 }
 
+fn add_native_counter(f: &mut Fx, values: &[(&str, Value)]) {
+    let spec = effectcraft_effects::find(effectcraft_effects::controls::TEXT_COUNTER).unwrap();
+    let mut control = group_push(&mut f.p, |ids| effectcraft_effects::instantiate(spec, ids, "Native Text Counter", [200.0, 100.0]));
+    for (key, value) in values {
+        control.get_mut(key).unwrap().value = value.clone();
+    }
+    f.layer_mut(f.title).props.sub_mut("effects").unwrap().children.push(control.into());
+}
+
+#[test]
+fn native_text_counter_formats_real_text_and_preserves_font_style_keys() {
+    let mut f = fx();
+    add_native_counter(
+        &mut f,
+        &[
+            ("value", Value::Scalar(1234.5)),
+            ("decimals", Value::Scalar(2.0)),
+            ("grouping", Value::Enum(2)),
+            ("prefix", Value::Str("€".into())),
+            ("suffix", Value::Str("%".into())),
+        ],
+    );
+    let mut style = TextDoc {
+        text: "Styled".into(),
+        font: "Inter".into(),
+        style: "Bold".into(),
+        size: 36.0,
+        fill: [0.2, 0.6, 1.0, 1.0],
+        tracking: 12.0,
+        justify: effectcraft_keyframe::Justify::Right,
+        ..Default::default()
+    };
+    let mut later = style.clone();
+    later.style = "Regular".into();
+    later.size = 48.0;
+    let source = f.layer_mut(f.title).props.prop_mut("text/sourceText").unwrap();
+    source.value = Value::Text(Box::new(style.clone()));
+    source.keys =
+        vec![Keyframe::new(Tick::ZERO, Value::Text(Box::new(style.clone()))).hold(), Keyframe::new(secs(1.0), Value::Text(Box::new(later.clone()))).hold()];
+    style.text = "€1.234,50%".into();
+    later.text = style.text.clone();
+    assert_eq!(f.ev(f.title, "text/sourceText", "ecTextCounter()", 0.0).unwrap(), Value::Text(Box::new(style)));
+    assert_eq!(f.ev(f.title, "text/sourceText", "ecTextCounter()", 1.0).unwrap(), Value::Text(Box::new(later)));
+    // Text readers see the same expression result as the renderer.
+    f.set_expr(f.title, "text/sourceText", "ecTextCounter()");
+    assert_close!(f.num("thisComp.layer('Title').text.sourceText.length", 0.0), 10.0);
+}
+
+#[test]
+fn native_text_counter_uses_keyframes_expressions_and_stretched_layer_clock() {
+    let mut f = fx();
+    add_native_counter(
+        &mut f,
+        &[
+            ("type", Value::Enum(1)),
+            ("value", Value::Scalar(61.5)),
+            ("decimals", Value::Scalar(1.0)),
+            ("timeStyle", Value::Enum(1)),
+            ("currentTime", Value::Bool(true)),
+            ("countDown", Value::Bool(true)),
+            ("clockRate", Value::Scalar(2.0)),
+            ("clockStart", Value::Scalar(1.0)),
+        ],
+    );
+    let layer = f.layer_mut(f.title);
+    layer.start_time = secs(1.0);
+    layer.stretch = 200.0;
+    assert_eq!(f.text("ecTextCounter()", 5.0), "00:59.5");
+    assert_eq!(f.text("ecTextCounter(5)", 0.0), "00:59.5");
+    f.layer_mut(f.title).props.prop_mut("effects/#1/currentTime").unwrap().value = Value::Bool(false);
+    let value = f.layer_mut(f.title).props.prop_mut("effects/#1/value").unwrap();
+    value.keys = vec![Keyframe::new(Tick::ZERO, Value::Scalar(7.0)), Keyframe::new(secs(2.0), Value::Scalar(9.0))];
+    assert_eq!(f.text("ecTextCounter()", 3.0), "00:08.0");
+    f.set_expr(f.title, "effects/#1/value", "value + time * 2");
+    assert_eq!(f.text("ecTextCounter()", 3.0), "00:14.0");
+}
+
+#[test]
+fn native_text_counter_survives_renaming_reordering_and_layer_copy() {
+    let mut f = fx();
+    add_native_counter(&mut f, &[("value", Value::Scalar(-7.25)), ("decimals", Value::Scalar(2.0)), ("padding", Value::Scalar(5.0))]);
+    f.set_expr(f.title, "text/sourceText", "ecTextCounter()");
+    f.layer_mut(f.title).props.group_mut("effects/#1").unwrap().name = "My renamed controls".into();
+    let spec = effectcraft_effects::find("ec.control.slider").unwrap();
+    let other = group_push(&mut f.p, |ids| effectcraft_effects::instantiate(spec, ids, "Other controls", [200.0, 100.0]));
+    f.layer_mut(f.title).props.sub_mut("effects").unwrap().children.insert(0, other.into());
+    assert_eq!(f.text("ecTextCounter()", 0.0), "-00007.25");
+    let mut copied = f.layer_mut(f.title).clone();
+    let mut next = f.p.next_id;
+    copied.id = LayerId(next);
+    next += 1;
+    copied.props.reassign_uids(&mut next);
+    let copied_id = copied.id;
+    f.p.next_id = next;
+    f.p.comp_mut(f.cid).unwrap().layers.push(copied);
+    assert_eq!(eval_property(&f.p, f.cid, copied_id, "text/sourceText", 0.0).unwrap().as_text().unwrap().text, "-00007.25");
+}
+
+#[test]
+fn native_text_counter_bounds_hostile_formatting_and_reports_missing_controls() {
+    let mut f = fx();
+    assert!(f.ev(f.title, "text/sourceText", "ecTextCounter()", 0.0).unwrap_err().contains("Native Text Counter"));
+    add_native_counter(
+        &mut f,
+        &[
+            ("value", Value::Scalar(f64::INFINITY)),
+            ("decimals", Value::Scalar(f64::NAN)),
+            ("padding", Value::Scalar(f64::INFINITY)),
+            ("prefix", Value::Str("😀".repeat(10_000))),
+        ],
+    );
+    let text = f.text("ecTextCounter()", 0.0);
+    assert!(text.ends_with("Invalid"));
+    assert_eq!(text.chars().count(), 263);
+    f.layer_mut(f.title).props.prop_mut("effects/#1/value").unwrap().value = Value::Scalar(1e300);
+    f.layer_mut(f.title).props.prop_mut("effects/#1/decimals").unwrap().value = Value::Scalar(1e300);
+    f.layer_mut(f.title).props.prop_mut("effects/#1/padding").unwrap().value = Value::Scalar(1e300);
+    assert!(f.text("ecTextCounter()", 0.0).chars().count() < 600);
+    assert!(f.ev(f.title, "text/sourceText", "ecTextCounter(NaN)", 0.0).is_err());
+}
+
+#[test]
+fn native_text_counter_uses_ordinary_font_layout_and_text_animators() {
+    let mut f = fx();
+    add_native_counter(&mut f, &[("value", Value::Scalar(123.0))]);
+    f.set_expr(f.title, "text/sourceText", "ecTextCounter()");
+    let animator = group_push(&mut f.p, |ids| {
+        let mut props = build::text_anim_props(ids, "position", false);
+        props[0].value = Value::Vec3([0.0, -20.0, 0.0]);
+        build::text_animator(ids, "Move digits", props)
+    });
+    f.layer_mut(f.title).props.group_mut("text/animators").unwrap().children.push(animator.into());
+    let comp = f.p.comp(f.cid).unwrap();
+    let layer = comp.layer(f.title).unwrap();
+    let ctx = EvalCtx { expr: Some(&Expressions), ..EvalCtx::new(&f.p, f.cid, comp, Tick::ZERO) };
+    let generated = effectcraft_render::text::text_geom(&ctx, layer).unwrap();
+    let mut ordinary = layer.clone();
+    let source = ordinary.props.prop_mut("text/sourceText").unwrap();
+    source.expr = None;
+    source.value = Value::Text(Box::new(TextDoc { text: "123".into(), size: 40.0, ..Default::default() }));
+    let expected = effectcraft_render::text::text_geom(&ctx, &ordinary).unwrap();
+    assert_eq!(generated.doc, expected.doc);
+    assert!(!generated.glyphs.is_empty());
+    assert_eq!(generated.glyphs.len(), expected.glyphs.len());
+    for (actual, expected) in generated.glyphs.iter().zip(&expected.glyphs) {
+        assert_eq!(actual.local, expected.local);
+        assert_eq!(actual.m, expected.m);
+        assert_eq!(actual.fill, expected.fill);
+    }
+}
+
 // ---- space conversions ------------------------------------------------------------------------
 
 #[test]

@@ -149,14 +149,34 @@ pub fn glow_operation(ctx: &EffectCtx) -> effectcraft_color::BlendMode {
 
 /// Glow's Arbitrary Map: red, green and blue curves of the glow brightness, as Curves point
 /// lists `x,y …` separated by `|` (an empty or missing curve is the identity).
-fn glow_map(s: &str) -> Vec<Option<crate::Curve>> {
+fn glow_map(s: &str) -> [Option<crate::Curve>; 3] {
     let mut parts = s.split('|');
-    (0..3).map(|_| parts.next().and_then(crate::Curve::parse)).collect()
+    std::array::from_fn(|_| parts.next().and_then(crate::Curve::parse))
+}
+
+/// Glow's bounded blur and padding sizes, shared by CPU and GPU rendering.
+#[derive(Clone, Copy, Debug)]
+pub struct GlowPlan {
+    pub radius: f64,
+    pub sigma: f64,
+    pub pad: u32,
+}
+
+/// Bound evaluated radius to 0–1000 layer pixels and the scaled product to 4096 rendered
+/// pixels. This preserves the entire slider range at output scales through 4×. Non-finite
+/// radius/scale/product or negative scale uses zero radius, before any integer conversion.
+/// This bounds Glow's arithmetic; the renderer is responsible for total image budgets.
+pub fn glow_plan(ctx: &EffectCtx, scale: f64) -> GlowPlan {
+    let radius = ctx.params.f("radius");
+    let radius = if radius.is_finite() { radius.clamp(0.0, 1000.0) } else { 0.0 };
+    let scaled = if scale.is_finite() && scale >= 0.0 { radius * scale } else { 0.0 };
+    let radius = if scaled.is_finite() { scaled.clamp(0.0, 4096.0) } else { 0.0 };
+    GlowPlan { radius, sigma: (radius / 2.0).max(0.5), pad: (radius * 1.5).ceil() as u32 + 2 }
 }
 
 fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let thr = ctx.params.f("threshold") as f32 / 100.0;
-    let radius = ctx.params.f("radius") * b.scale;
+    let plan = glow_plan(ctx, b.scale);
     let intensity = ctx.params.f("intensity") as f32;
     let alpha_based = ctx.params.e("based") == 0;
     let use_colors = ctx.params.e("colors") == 1;
@@ -170,7 +190,7 @@ fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let cb = ctx.params.color("colorB");
     let (kx, ky) = dims_xy(ctx.params.e("glowDimensions"));
     if !ctx.adjustment {
-        b.pad((radius * 1.5).ceil() as u32 + 2);
+        b.pad(plan.pad);
     }
     // Bright pass.
     let mut bright = b.img.clone();
@@ -185,7 +205,7 @@ fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
         let k = ((l - thr) / (1.0 - thr).max(1e-3)).clamp(0.0, 1.0);
         if let Some(map) = &arbitrary {
             let t = glow_ab_t(l, looping, loops, phase, mid);
-            let c = map.iter().map(|cv| cv.as_ref().map_or(t, |cv| cv.eval(t))).collect::<Vec<f32>>();
+            let c = map.each_ref().map(|cv| cv.as_ref().map_or(t, |cv| cv.eval(t)));
             *px = [c[0] * k * a, c[1] * k * a, c[2] * k * a, k * a];
         } else if use_colors {
             let t = glow_ab_t(l, looping, loops, phase, mid);
@@ -195,8 +215,7 @@ fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
             *px = px.map(|v| v * k);
         }
     });
-    let s = (radius / 2.0).max(0.5);
-    let blurred = gaussian_blur(&bright, s * kx, s * ky, false);
+    let blurred = gaussian_blur(&bright, plan.sigma * kx, plan.sigma * ky, false);
     let mode = ctx.params.e("operation");
     b.img.data.par_iter_mut().zip(blurred.data.par_iter()).for_each(|(o, g)| {
         let g = g.map(|v| v * intensity);
@@ -747,6 +766,51 @@ mod tests {
             }
         }
         img
+    }
+
+    #[test]
+    fn glow_plan_bounds_hostile_values_before_size_arithmetic() {
+        for (input, scale, expected) in [
+            (f64::NAN, 1.0, 0.0),
+            (f64::INFINITY, 1.0, 0.0),
+            (f64::NEG_INFINITY, 1.0, 0.0),
+            (-1e300, 1.0, 0.0),
+            (1e300, 1.0, 1000.0),
+            (10.0, f64::NAN, 0.0),
+            (10.0, f64::INFINITY, 0.0),
+            (10.0, f64::NEG_INFINITY, 0.0),
+            (10.0, -1e300, 0.0),
+            (10.0, 1e300, 4096.0),
+            (1000.0, f64::MAX, 0.0),
+            (1000.0, 64.0, 4096.0),
+        ] {
+            let mut params = crate::Params::default();
+            params.values.insert("radius".into(), Value::Scalar(input));
+            let ctx = EffectCtx { params: &params, time: 0.0, layer_size: [1.0; 2], seed: 1, adjustment: false, env: Default::default() };
+            // The validated plan exercises Glow's previously overflow-prone sizing.
+            // No image is allocated and no enormous blur is run.
+            let plan = glow_plan(&ctx, scale);
+            assert_eq!(plan.radius, expected);
+            assert!(plan.pad <= 6146);
+            assert!(plan.radius.is_finite() && plan.sigma.is_finite());
+            assert_eq!(plan.pad, (expected * 1.5).ceil() as u32 + 2);
+        }
+    }
+
+    #[test]
+    fn glow_plan_preserves_normal_radius_and_scale() {
+        for input in [0.0, 0.1, 10.0, 64.0, 1000.0] {
+            let mut params = crate::Params::default();
+            params.values.insert("radius".into(), Value::Scalar(input));
+            let ctx = EffectCtx { params: &params, time: 0.0, layer_size: [1.0; 2], seed: 1, adjustment: false, env: Default::default() };
+            for scale in [0.0, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0] {
+                let expected = input * scale;
+                let plan = glow_plan(&ctx, scale);
+                assert_eq!(plan.radius, expected);
+                assert_eq!(plan.sigma, (expected / 2.0).max(0.5));
+                assert_eq!(plan.pad, (expected * 1.5).ceil() as u32 + 2);
+            }
+        }
     }
 
     #[test]

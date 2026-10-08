@@ -20,6 +20,26 @@ fn project_with_layer() -> (Project, crate::ItemId) {
 }
 
 #[test]
+fn editing_one_layer_detaches_only_its_property_tree_and_preserves_snapshots() {
+    let (mut project, cid) = project_with_layer();
+    let mut sibling = project.comp(cid).unwrap().layers[0].clone();
+    sibling.id = crate::LayerId(project.alloc());
+    project.comp_mut(cid).unwrap().layers.push(sibling);
+    let saved = project.clone();
+    let original = &saved.comp(cid).unwrap().layers;
+    assert!(std::ptr::eq(&*original[0].props, &*original[1].props));
+    project.comp_mut(cid).unwrap().layers[0].props.prop_mut("transform/opacity").unwrap().value = Value::Scalar(50.0);
+    let edited = &project.comp(cid).unwrap().layers;
+    assert!(!std::ptr::eq(&*original[0].props, &*edited[0].props));
+    assert!(std::ptr::eq(&*original[1].props, &*edited[1].props));
+    assert_eq!(original[0].props.prop("transform/opacity").unwrap().value, Value::Scalar(100.0));
+    assert_eq!(edited[0].props.prop("transform/opacity").unwrap().value, Value::Scalar(50.0));
+    assert_eq!(edited[1].props.prop("transform/opacity").unwrap().value, Value::Scalar(100.0));
+    let json = project.to_file_json().unwrap();
+    assert_eq!(Project::from_json(&json).unwrap(), project, "sharing does not change the on-disk project schema");
+}
+
+#[test]
 fn paths_resolve() {
     let (p, cid) = project_with_layer();
     let l = &p.comp(cid).unwrap().layers[0];

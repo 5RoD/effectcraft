@@ -546,25 +546,20 @@ pub fn color_popup(ui: &mut egui::Ui, id: egui::Id, pos: egui::Pos2, c: &mut [f3
     changed
 }
 
-/// The ArtCraft mark as supplied in `docs/brand` (the README's and getartcraft.com's logo; used
-/// unmodified, see `docs/brand/LICENSE-brand.txt`).
-static ARTCRAFT_MARK: &[u8] = include_bytes!("../../../docs/brand/artcraft-mark.png");
-
-/// The ArtCraft mark in `r` (decoded once into a mipmapped texture, so it stays crisp from the
-/// 24 px Tools bar to the About dialog). Nothing is drawn if it can't be decoded.
+/// Original EffectCraft monogram, drawn with geometry under the project licence.
 pub fn paint_logo(p: &egui::Painter, r: Rect) {
-    let ctx = p.ctx();
-    let id = egui::Id::new("artcraft-mark");
-    let tex = ctx.data(|d| d.get_temp::<Option<egui::TextureHandle>>(id)).unwrap_or_else(|| {
-        let tex = image::load_from_memory_with_format(ARTCRAFT_MARK, image::ImageFormat::Png).ok().map(|img| {
-            let img = img.to_rgba8();
-            let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
-            ctx.load_texture("artcraft-mark", ci, egui::TextureOptions::LINEAR.with_mipmap_mode(Some(egui::TextureFilter::Linear)))
-        });
-        ctx.data_mut(|d| d.insert_temp(id, tex.clone()));
-        tex
-    });
-    if let Some(t) = tex {
-        p.image(t.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+    let side = r.width().min(r.height());
+    let r = Rect::from_center_size(r.center(), vec2(side, side)).shrink(side * 0.12);
+    let red = Color32::from_rgb(0xf0, 0x43, 0x64);
+    let cyan = Color32::from_rgb(0x42, 0xcf, 0xf5);
+    let stroke = egui::Stroke::new(side * 0.10, Color32::WHITE);
+    p.rect_stroke(r, side * 0.13, egui::Stroke::new(side * 0.07, red), egui::StrokeKind::Inside);
+    let x = r.left() + r.width() * 0.30;
+    let y0 = r.top() + r.height() * 0.25;
+    let y1 = r.bottom() - r.height() * 0.25;
+    p.line_segment([pos2(x, y0), pos2(x, y1)], stroke);
+    for y in [y0, r.center().y, y1] {
+        p.line_segment([pos2(x, y), pos2(r.right() - r.width() * 0.24, y)], stroke);
     }
+    p.circle_filled(r.right_bottom(), side * 0.065, cyan);
 }

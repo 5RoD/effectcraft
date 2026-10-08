@@ -189,6 +189,18 @@ impl Arena {
 }
 
 impl History {
+    /// Save state includes abandoned futures and the undo/redo cursor. Compare identities,
+    /// rather than project contents; snapshots are immutable while history retains them.
+    pub(crate) fn same_records(&self, other: &History) -> bool {
+        let same = |a: &[(String, Arc<Project>)], b: &[(String, Arc<Project>)]| {
+            a.len() == b.len() && a.iter().zip(b).all(|((al, ap), (bl, bp))| al == bl && Arc::ptr_eq(ap, bp))
+        };
+        same(&self.undo, &other.undo)
+            && same(&self.redo, &other.redo)
+            && self.branches.len() == other.branches.len()
+            && self.branches.iter().zip(&other.branches).all(|(a, b)| Arc::ptr_eq(&a.parent, &b.parent) && same(&a.steps, &b.steps))
+    }
+
     /// Record a new step made from `before`: the redo line (if any) is kept as a branch.
     pub fn record(&mut self, label: &str, before: Arc<Project>, levels: usize) {
         self.abandon_redo(&before);
@@ -209,6 +221,9 @@ impl History {
     /// Apply the undo-levels limit: drop the oldest working-line states, the branches that grew
     /// from them, and the oldest branches when branches hold more states than `levels`.
     pub fn trim(&mut self, levels: usize, current: &Arc<Project>) {
+        if levels == 0 {
+            return;
+        }
         let levels = levels.max(1);
         if self.undo.len() > levels {
             let extra = self.undo.len() - levels;
@@ -264,6 +279,10 @@ impl History {
 }
 
 impl Session {
+    /// Zero keeps the entire project history. Limited undo remains an explicit preference.
+    pub(crate) fn history_limit(&self) -> usize {
+        if self.prefs.general.keep_all_history { 0 } else { self.prefs.general.undo_levels.max(1) as usize }
+    }
     /// The undo history as a tree (the History panel, `edit.history.list`).
     pub fn history_tree(&self) -> Vec<HistoryNode> {
         self.history.tree(&self.project)

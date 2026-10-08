@@ -284,24 +284,24 @@ fn glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
         return None;
     }
     let thr = ctx.params.f("threshold") as f32 / 100.0;
-    let radius = ctx.params.f("radius") * b.scale;
+    let plan = effectcraft_effects::glow_plan(ctx, b.scale);
     let intensity = ctx.params.f("intensity") as f32;
     let use_colors = ctx.params.e("colors") == 1;
     let ca = ctx.params.color("colorA");
     let cb = ctx.params.color("colorB");
     let (kx, ky) = dims_xy(ctx.params.e("glowDimensions"));
     if !ctx.adjustment {
-        b.pad(e, (radius * 1.5).ceil() as u32 + 2)?;
+        b.pad(e, plan.pad)?;
     }
     let mut p = Params::default();
     p.u[0] = [use_colors as u32, (ctx.params.e("based") == 0) as u32, ctx.params.e("colorLooping"), 0];
     p.f[0] = [thr, ctx.params.f("colorLoops") as f32, (ctx.params.f("colorPhase") / 360.0) as f32, ctx.params.f("abMidpoint") as f32 / 100.0];
     p.f[1] = ca;
     p.f[2] = cb;
-    let bright = e.image(b.img.width, b.img.height);
+    // glow_bright writes every in-bounds texel, including transparent pixels.
+    let bright = e.scratch(b.img.width, b.img.height);
     e.pixels("glow_bright", &p, &b.img, None, &bright, None);
-    let s = (radius / 2.0).max(0.5);
-    let blurred = gaussian_blur(e, &bright, s * kx, s * ky, false);
+    let blurred = gaussian_blur(e, &bright, plan.sigma * kx, plan.sigma * ky, false);
     let mut p = Params::default();
     p.u[0][0] = ctx.params.e("operation").min(2);
     p.f[0][0] = intensity;

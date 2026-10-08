@@ -39,9 +39,13 @@ impl Session {
             self.events.push(crate::Event::PurgeCaches);
         }
         // Fewer undo levels apply right away.
-        let levels = self.prefs.general.undo_levels.max(1) as usize;
+        let levels = self.history_limit();
         let current = self.project.clone();
+        let retained = (self.history.undo.len(), self.history.redo.len(), self.history.branch_states());
         self.history.trim(levels, &current);
+        if retained != (self.history.undo.len(), self.history.redo.len(), self.history.branch_states()) {
+            self.bump();
+        }
         // Settings ▸ Roto Brush / Face Tracking: load (or drop) the chosen trained models.
         self.apply_models();
         self.prefs_revision += 1;
@@ -182,7 +186,7 @@ impl Session {
         if let Some(c) = &self.config
             && self.autosave.sentinel
         {
-            let s = Sentinel { pid: autosave::pid(), project: self.path.clone(), autosave: self.autosave.last_path.clone(), dirty: self.is_dirty() };
+            let s = Sentinel { pid: autosave::pid(), project: self.path.clone(), autosave: self.autosave.last_path.clone(), dirty: self.needs_save() };
             autosave::update(c.as_ref(), &s);
         }
     }
@@ -213,10 +217,11 @@ impl Session {
         let plan = autosave::plan_in(self.file_ops(), &self.prefs, self.path.as_deref(), root.as_deref(), self.autosave.last_slot).map_err(fail)?;
         if self.autosave.background && !cfg!(target_arch = "wasm32") {
             let project = self.project.clone();
+            let history = self.history.clone();
             let config = self.config.clone();
             let job = plan.clone();
-            let pending = autosave::PendingWrite::spawn(plan.path.clone(), move || {
-                let json = project.to_json_compact();
+            let pending = autosave::PendingWrite::spawn(plan.path.clone(), self.revision, plan.slot, move || {
+                let json = crate::history_file::encode(&project, &history, true).map_err(std::io::Error::other)?;
                 match &config {
                     Some(c) => job.write(c.files(), json.as_bytes()),
                     None => job.write(&crate::config::StdFiles, json.as_bytes()),
@@ -225,22 +230,29 @@ impl Session {
             .map_err(fail)?;
             self.autosave.pending = Some(pending);
         } else {
-            let json = self.project.to_json_compact();
+            let json = crate::history_file::encode(&self.project, &self.history, true)?;
             plan.write(self.file_ops(), json.as_bytes()).map_err(fail)?;
+            self.autosave_completed(&plan.path, plan.slot, self.revision);
         }
-        let (path, slot) = (plan.path, plan.slot);
-        let p = path.to_string_lossy().to_string();
+        Ok(plan.path.to_string_lossy().to_string())
+    }
+
+    fn autosave_completed(&mut self, path: &Path, slot: u32, revision: u64) {
         self.autosave.last_slot = Some(slot);
-        self.autosave.saved_revision = Some(self.revision);
-        self.autosave.last_path = Some(p.clone());
+        self.autosave.saved_revision = Some(revision);
+        self.autosave.last_path = Some(path.to_string_lossy().to_string());
         self.update_sentinel();
-        Ok(p)
+        self.toast(format!("Auto-saved {}", path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()));
     }
 
     /// Wait for a background auto-save ([`autosave::AutoSaveState::background`]) to land.
     pub fn autosave_wait(&mut self) -> Result<()> {
         match self.autosave.pending.take() {
-            Some(w) => w.join().map_err(|e| EngineError::Other(format!("auto-save failed: {e}"))),
+            Some(w) => {
+                w.join().map_err(|e| EngineError::Other(format!("auto-save failed: {e}")))?;
+                self.autosave_completed(&w.path, w.slot, w.revision);
+                Ok(())
+            }
             None => Ok(()),
         }
     }
@@ -253,28 +265,28 @@ impl Session {
         {
             return Some(Err(e));
         }
+        // A timer tick must never join an unfinished writer on the UI thread.
+        if self.autosave.pending.is_some() {
+            return None;
+        }
         let a = &self.prefs.auto_save;
         if !a.enabled {
             self.autosave.last = Some(now);
             return None;
         }
-        let interval = a.interval_minutes.max(1) as f64 * 60.0;
+        let interval = if a.interval_seconds > 0 { a.interval_seconds as f64 } else { a.interval_minutes.max(1) as f64 * 60.0 };
         let last = *self.autosave.last.get_or_insert(now);
         if now - last < interval {
             return None;
         }
         self.autosave.last = Some(now);
-        if !self.is_dirty() || self.autosave.saved_revision == Some(self.revision) || self.render_job.is_some() {
+        if !self.needs_save() || self.autosave.saved_revision == Some(self.revision) {
             return None;
         }
         if self.path.is_none() && self.prefs.auto_save.location != "custom" && self.default_autosave_root().is_none() {
             return None;
         }
-        let r = self.autosave_now();
-        if let Ok(p) = &r {
-            self.toast(format!("Auto-saved {}", Path::new(p).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()));
-        }
-        Some(r)
+        Some(self.autosave_now())
     }
 
     /// At launch: start crash recovery. Returns the previous run's state when it didn't exit
@@ -289,6 +301,10 @@ impl Session {
 
     /// Clean exit: remove the crash-recovery sentinel.
     pub fn end_recovery(&mut self) {
+        if let Err(e) = self.autosave_wait() {
+            self.toast(e.to_string());
+            return;
+        }
         if let Some(c) = &self.config
             && self.autosave.sentinel
         {

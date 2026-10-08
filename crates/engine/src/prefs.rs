@@ -68,6 +68,8 @@ page!(General {
     language: String = "system".into(),
     /// Levels of Undo (1–99).
     undo_levels: u32 = 32,
+    /// Preserve every committed edit and alternative branch in project/recovery files.
+    keep_all_history: bool = true,
     /// Path Point and Handle Size (px).
     path_point_size: u32 = 5,
     show_tool_tips: bool = true,
@@ -106,6 +108,8 @@ page!(ProjectPrefs {
 page!(AutoSave {
     enabled: bool = true,
     interval_minutes: u32 = 20,
+    /// Fast recovery checkpoints; zero uses the minute-based interval instead.
+    interval_seconds: u32 = 30,
     max_versions: u32 = 5,
     /// `nextToProject` (an "EffectCraft Auto-Save" folder beside the project) or `custom`.
     location: String = "nextToProject".into(),
@@ -137,7 +141,7 @@ page!(Previews {
 
 page!(Appearance {
     /// `dark`, `darker` or `light`.
-    theme: String = "dark".into(),
+    theme: String = "5rod".into(),
     /// User interface brightness, -1 (darker) … 1 (lighter).
     brightness: f64 = 0.0,
     use_label_color_for_handles: bool = true,
@@ -452,6 +456,7 @@ impl Prefs {
         g.recent_items = g.recent_items.clamp(1, 30);
         let a = &mut self.auto_save;
         a.interval_minutes = a.interval_minutes.clamp(1, 240);
+        a.interval_seconds = a.interval_seconds.min(3600);
         a.max_versions = a.max_versions.clamp(1, 99);
         self.appearance.brightness = self.appearance.brightness.clamp(-1.0, 1.0);
         let defaults = default_labels();
@@ -917,6 +922,7 @@ pub fn pages() -> Vec<Page> {
             items: vec![
                 s("general.language", "Language", Kind::Choice(LANGUAGES), true),
                 s("general.undoLevels", "Levels of Undo", Kind::Int(1, 99, ""), true),
+                s("general.keepAllHistory", "Keep All Project History", Kind::Bool, true),
                 s("general.pathPointSize", "Path Point and Handle Size", Kind::Int(3, 20, "px"), true),
                 s("general.recentItems", "Recent Projects Shown", Kind::Int(1, 30, ""), true),
                 Section("Options"),
@@ -959,6 +965,7 @@ pub fn pages() -> Vec<Page> {
                 Section("Auto-Save"),
                 s("autoSave.enabled", "Automatically Save Projects", B, true),
                 s("autoSave.intervalMinutes", "Save Every", Kind::Int(1, 240, "Minutes"), true),
+                s("autoSave.intervalSeconds", "Recovery Checkpoints", Kind::Int(0, 3600, "Seconds (0 uses Save Every)"), true),
                 s("autoSave.maxVersions", "Maximum Project Versions", Kind::Int(1, 99, ""), true),
                 s("autoSave.location", "Auto-Save Location", Kind::Choice(&[("Next to Project", "nextToProject"), ("Custom Location", "custom")]), true),
                 s("autoSave.folder", "Custom Location", Kind::Path, true),
@@ -1007,7 +1014,7 @@ pub fn pages() -> Vec<Page> {
             id: "appearance",
             title: "Appearance",
             items: vec![
-                s("appearance.theme", "Theme", Kind::Choice(&[("Dark", "dark"), ("Darker", "darker"), ("Light", "light")]), true),
+                s("appearance.theme", "Theme", Kind::Choice(&[("5RoD", "5rod"), ("Dark", "dark"), ("Darker", "darker"), ("Light", "light")]), true),
                 s("appearance.brightness", "Brightness", Kind::Slider(-1.0, 1.0), true),
                 Section("Labels and Colors"),
                 s("appearance.useLabelColorForHandles", "Use Label Color for Layer Handles and Paths", B, true),

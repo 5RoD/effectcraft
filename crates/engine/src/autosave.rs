@@ -47,6 +47,8 @@ pub struct AutoSaveState {
 #[derive(Clone)]
 pub struct PendingWrite {
     pub path: PathBuf,
+    pub revision: u64,
+    pub slot: u32,
     handle: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<std::io::Result<()>>>>>,
 }
 
@@ -57,16 +59,16 @@ impl std::fmt::Debug for PendingWrite {
 }
 
 impl PendingWrite {
-    pub fn spawn(path: PathBuf, work: impl FnOnce() -> std::io::Result<()> + Send + 'static) -> std::io::Result<PendingWrite> {
+    pub fn spawn(path: PathBuf, revision: u64, slot: u32, work: impl FnOnce() -> std::io::Result<()> + Send + 'static) -> std::io::Result<PendingWrite> {
         let h = std::thread::Builder::new().name("autosave".into()).spawn(work)?;
-        Ok(PendingWrite { path, handle: std::sync::Arc::new(std::sync::Mutex::new(Some(h))) })
+        Ok(PendingWrite { path, revision, slot, handle: std::sync::Arc::new(std::sync::Mutex::new(Some(h))) })
     }
     pub fn is_finished(&self) -> bool {
-        self.handle.lock().map(|h| h.as_ref().is_none_or(|h| h.is_finished())).unwrap_or(true)
+        self.handle.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().is_none_or(|h| h.is_finished())
     }
     /// Wait for the write; its result (`Ok` if already collected).
     pub fn join(&self) -> std::io::Result<()> {
-        let h = self.handle.lock().ok().and_then(|mut h| h.take());
+        let h = self.handle.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         match h {
             Some(h) => h.join().unwrap_or_else(|_| Err(std::io::Error::other("auto-save thread panicked"))),
             None => Ok(()),
@@ -218,11 +220,11 @@ pub fn begin(store: &dyn ConfigStore, prefs: &Prefs) -> Option<Recovery> {
     let _ = store.write(SENTINEL, &serde_json::to_string(&Sentinel { pid: pid(), ..Default::default() }).unwrap_or_default());
     let s = found?;
     let fallback = store.dir();
-    let autosave = s
-        .autosave
-        .clone()
-        .filter(|p| store.files().is_file(Path::new(p)))
-        .or_else(|| latest_in(store.files(), prefs, s.project.as_deref(), fallback.as_deref()).map(|p| p.to_string_lossy().to_string()));
+    // The worker can finish an atomic checkpoint immediately before the process dies, before
+    // the UI has updated the sentinel. Prefer the latest complete slot on disk in that case.
+    let autosave = latest_in(store.files(), prefs, s.project.as_deref(), fallback.as_deref())
+        .map(|p| p.to_string_lossy().to_string())
+        .or_else(|| s.autosave.clone().filter(|p| store.files().is_file(Path::new(p))));
     Some(Recovery { project: s.project, autosave, dirty: s.dirty })
 }
 
@@ -250,8 +252,11 @@ pub fn increment_path(path: &str, exists: impl Fn(&str) -> bool) -> String {
     let p = Path::new(path);
     let stem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     let ext = p.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_else(|| EXT.to_string());
-    let (base, mut n) = match stem.rsplit_once(' ') {
-        Some((b, n)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => (b.to_string(), n.parse::<u32>().unwrap_or(1) + 1),
+    let (mut base, mut n) = match stem.rsplit_once(' ') {
+        Some((b, n)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => match n.parse::<u64>().ok().and_then(|n| n.checked_add(1)) {
+            Some(next) => (b.to_string(), next),
+            None => (stem.clone(), 2),
+        },
         _ => (stem.clone(), 2),
     };
     loop {
@@ -259,6 +264,11 @@ pub fn increment_path(path: &str, exists: impl Fn(&str) -> bool) -> String {
         if !exists(&cand) {
             return cand;
         }
-        n += 1;
+        if let Some(next) = n.checked_add(1) {
+            n = next;
+        } else {
+            base = format!("{base} {n}");
+            n = 2;
+        }
     }
 }

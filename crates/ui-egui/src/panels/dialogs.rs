@@ -149,6 +149,14 @@ pub fn route_layer_settings(app: &mut EffectcraftApp, id: &str, params: &Value) 
 }
 
 pub(crate) fn modal(ctx: &egui::Context, title: &str, size: egui::Vec2, t: &Tokens, body: impl FnOnce(&mut egui::Ui)) {
+    let available = (ctx.content_rect().height() - 132.0).max(40.0);
+    modal_no_scroll(ctx, title, size, t, |ui| {
+        egui::ScrollArea::both().max_height(available).auto_shrink([false, true]).show(ui, body);
+    });
+}
+
+/// Modal frame for content with its own scrolling and a fixed footer.
+pub(crate) fn modal_no_scroll(ctx: &egui::Context, title: &str, size: egui::Vec2, t: &Tokens, body: impl FnOnce(&mut egui::Ui)) -> egui::Rect {
     let available = (ctx.content_rect().size() - vec2(48.0, 48.0)).max(vec2(120.0, 80.0));
     let size = size.min(available);
     egui::Modal::new(egui::Id::new(("modal", title)))
@@ -159,8 +167,10 @@ pub(crate) fn modal(ctx: &egui::Context, title: &str, size: egui::Vec2, t: &Toke
             ui.set_min_height(size.y - 36.0);
             ui.label(egui::RichText::new(title).font(Tokens::semibold(15.0)).color(t.tab_text_active));
             ui.add_space(10.0);
-            egui::ScrollArea::both().max_height((available.y - 84.0).max(40.0)).auto_shrink([false, true]).show(ui, body);
-        });
+            body(ui);
+        })
+        .response
+        .rect
 }
 
 pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context) {

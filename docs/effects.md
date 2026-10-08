@@ -3,11 +3,11 @@
 <!-- Generated from the effect registry (crates/effects/src/catalog.rs); do not edit by hand.
      Regenerate: UPDATE_DOCS=1 cargo test -p effectcraft-effects --lib effects_doc_is_current -->
 
-EffectCraft ships 306 effects with 3009 parameters in total, grouped into the same categories as the Effects & Presets panel. Every effect is our own implementation, written from public behaviour descriptions and standard image-processing literature. Parameter names, order, popup options, units, defaults and ranges follow the reference application so that projects, expressions and muscle memory carry over.
+EffectCraft ships 307 effects with 3031 parameters in total, grouped into the same categories as the Effects & Presets panel. Every effect is our own implementation, written from public behaviour descriptions and standard image-processing literature. Parameter names, order, popup options, units, defaults and ranges follow the reference application so that projects, expressions and muscle memory carry over.
 
-- **GPU**: 280 effects also run on the GPU compositor with identical results.
-- **32**: 306 effects process 32-bit float (HDR, overbright) pixels without clamping.
-- **Status**: 306 implemented in full, 0 partial (what is missing is listed).
+- **GPU**: 281 effects also run on the GPU compositor with identical results.
+- **32**: 307 effects process 32-bit float (HDR, overbright) pixels without clamping.
+- **Status**: 307 implemented in full, 0 partial (what is missing is listed).
 
 Effects are addressed by id (`ec.<category>.<name>`) or display name in commands, scripts and the control channel, and every parameter by its id (`effects/#1/blurriness`).
 
@@ -180,6 +180,7 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 | Color Control | `ec.control.color` | 1 | GPU | 32 | Implemented |
 | Dropdown Menu Control | `ec.control.dropdown` | 1 | GPU | 32 | Implemented |
 | Layer Control | `ec.control.layer` | 1 | GPU | 32 | Implemented |
+| Native Text Counter | `ec.control.textCounter` | 12 | GPU | 32 | Implemented |
 | Point Control | `ec.control.point` | 1 | GPU | 32 | Implemented |
 | Slider Control | `ec.control.slider` | 1 | GPU | 32 | Implemented |
 | Stereo 3D Controls | `ec.control.stereo3d` | 5 | GPU | 32 | Implemented |
@@ -370,7 +371,7 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 
 | Effect | Id | Params | GPU | 32 | Status |
 |---|---|---:|:-:|:-:|---|
-| Numbers | `ec.text.numbers` | 14 | GPU | 32 | Implemented |
+| Numbers | `ec.text.numbers` | 24 | GPU | 32 | Implemented |
 | Timecode | `ec.text.timecode` | 12 | GPU | 32 | Implemented |
 
 ## Time

@@ -443,17 +443,24 @@ fn dust_scratches(ctx: &EffectCtx, mut b: Buf) -> Buf {
     if r == 0 {
         return b;
     }
-    let thr = ctx.params.f("threshold") as f32 / 255.0;
+    let thr = dust_threshold_units(ctx.params.f("threshold") as f32 / 255.0) + 1.0;
     let on_alpha = ctx.params.b("operateOnAlpha");
     let m = median_image(&b.img, r);
     b.img.data.par_iter_mut().zip(m.data.par_iter()).for_each(|(o, &mv)| {
         let cand = median_px(*o, mv, on_alpha);
         let diff = (0..4).map(|c| (cand[c] - o[c]).abs()).fold(0.0f32, f32::max);
-        if diff > thr {
+        if dust_threshold_units(diff) > thr {
             *o = cand;
         }
     });
     b
+}
+
+// A strict threshold must not turn sub-ULP CPU/GPU rounding differences into a visibly
+// different pixel. Compare on a shared 20-bit grid with a one-unit boundary margin
+// (at most 1.5/1048576 normalized contrast, less than 1/2000 of an 8-bit step).
+fn dust_threshold_units(value: f32) -> f32 {
+    (value * 1_048_576.0).round()
 }
 
 /// Remove Grain's Viewing Mode options.
@@ -892,6 +899,18 @@ mod tests {
         assert!((keep.img.get(6, 6)[0] - 0.56).abs() < 1e-6);
         let rm = run("ec.noise.dustscratches", &[("radius", num(1.0)), ("threshold", num(5.0))], img, 0.0);
         assert!((rm.img.get(6, 6)[0] - 0.5).abs() < 2.0 / 511.0);
+    }
+
+    #[test]
+    fn dust_threshold_ignores_sub_ulp_boundary_noise() {
+        for level in 1..255 {
+            let threshold = level as f32 / 255.0;
+            let units = dust_threshold_units(threshold);
+            for bits in threshold.to_bits() - 1..=threshold.to_bits() + 1 {
+                assert!(dust_threshold_units(f32::from_bits(bits)) <= units + 1.0, "level {level}");
+            }
+            assert!(dust_threshold_units(threshold + 0.001) > units);
+        }
     }
 
     #[test]

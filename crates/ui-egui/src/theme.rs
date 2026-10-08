@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThemeKind {
     #[default]
+    FiveRod,
     Dark,
     Darker,
     Light,
@@ -20,6 +21,7 @@ pub enum ThemeKind {
 impl ThemeKind {
     pub fn from_name(s: &str) -> Option<ThemeKind> {
         match s.to_ascii_lowercase().as_str() {
+            "5rod" => Some(ThemeKind::FiveRod),
             "dark" | "default" => Some(ThemeKind::Dark),
             "darker" | "darkest" => Some(ThemeKind::Darker),
             "light" => Some(ThemeKind::Light),
@@ -149,6 +151,26 @@ impl Tokens {
             gradients: true,
         };
         match kind {
+            ThemeKind::FiveRod => Tokens {
+                app_bg: Color32::from_rgb(0x0c, 0x10, 0x16),
+                header_bg: Color32::from_rgb(0x14, 0x1a, 0x23),
+                panel_bg: Color32::from_rgb(0x1b, 0x22, 0x2c),
+                row: Color32::from_rgb(0x1b, 0x22, 0x2c),
+                row_alt: Color32::from_rgb(0x1e, 0x27, 0x32),
+                row_selected: Color32::from_rgb(0x38, 0x30, 0x40),
+                tl_bg: Color32::from_rgb(0x13, 0x1a, 0x23),
+                tl_ruler_bg: Color32::from_rgb(0x1b, 0x22, 0x2c),
+                accent: Color32::from_rgb(0xf0, 0x43, 0x64),
+                accent_hover: Color32::from_rgb(0xff, 0x6b, 0x83),
+                keyframe_selected: Color32::from_rgb(0xff, 0x6b, 0x83),
+                focus: Color32::from_rgb(0x42, 0xcf, 0xf5),
+                cti: Color32::from_rgb(0x42, 0xcf, 0xf5),
+                timecode: Color32::from_rgb(0x42, 0xcf, 0xf5),
+                hot_text: Color32::from_rgb(0x67, 0xd9, 0xf8),
+                text: Color32::from_rgb(0xe7, 0xed, 0xf4),
+                tab_text_active: Color32::WHITE,
+                ..dark
+            },
             ThemeKind::Dark => dark,
             ThemeKind::Darker => Tokens {
                 app_bg: Color32::from_rgb(0x08, 0x08, 0x08),

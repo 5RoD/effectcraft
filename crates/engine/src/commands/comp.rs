@@ -182,12 +182,18 @@ fn work_area(s: &mut Session, p: &Value) -> Result<Value> {
     let begin = f_p(p, "start").map(Tick::from_seconds_f64);
     let end = f_p(p, "end").map(Tick::from_seconds_f64);
     let which = str_p(p, "set");
-    s.edit("Work Area", super::merge_p(p), |proj, _| {
+    s.edit("Work Area", super::merge_p(p), |proj, st| {
         let c = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
         let fd = c.frame_duration();
         match which {
             Some("begin") => c.work_area.0 = t.min(c.work_area.1 - fd),
             Some("end") => c.work_area.1 = (t + fd).max(c.work_area.0 + fd).min(c.duration),
+            Some("selectedLayers") => {
+                let selected: Vec<_> = c.layers.iter().filter(|l| st.selected_layers.contains(&l.id)).collect();
+                let start = selected.iter().map(|l| l.in_point).min().unwrap_or(Tick::ZERO).clamp(Tick::ZERO, c.duration - fd);
+                let end = selected.iter().map(|l| l.out_point).max().unwrap_or(c.duration).clamp(start + fd, c.duration);
+                c.work_area = (start, end);
+            }
             _ => {}
         }
         if let Some(b) = begin {
@@ -285,7 +291,7 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("comp.trimToWorkArea", "Trim Comp to Work Area", ["Composition"], Some("Cmd+Shift+X"), "{comp?}", has_comp, trim_to_wa),
         cmd!("comp.open", "Open Composition", [], None, "{comp: id|name}", always, open),
         cmd!("comp.close", "Close Composition", [], None, "{comp?}", has_comp, close),
-        cmd!("comp.workArea", "Set Work Area", [], None, "{start?, end?, set?: begin|end (at CTI)}", has_comp, work_area),
+        cmd!("comp.workArea", "Set Work Area", [], None, "{start?, end?, set?: begin|end (at CTI)|selectedLayers}", has_comp, work_area),
         cmd!("comp.setSwitch", "Composition Switch", [], None, "{switch: hideShy|motionBlur|frameBlending|draft3d, value?}", has_comp, comp_switch),
         cmd!("comp.addMarker", "Add Marker", [], Some("Num*"), "{time?, comment?}", has_comp, add_marker),
     ]

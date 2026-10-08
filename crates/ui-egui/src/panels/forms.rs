@@ -79,10 +79,23 @@ pub struct Form {
 }
 
 impl Form {
+    fn native_action(&self) -> Option<&str> {
+        if self.command != "anim.nativeAction" {
+            return None;
+        }
+        self.fields.iter().find(|f| f.key == "action").and_then(|f| match &f.kind {
+            FieldKind::Choice { options, sel } => options.get(*sel).and_then(|o| o.1.as_str()),
+            _ => None,
+        })
+    }
+
     /// The command parameters: `base` plus every field.
     pub fn params(&self) -> Value {
         let mut m: Map<String, Value> = self.base.as_object().cloned().unwrap_or_default();
         for f in &self.fields {
+            if !action_field_enabled(self.native_action(), &f.key) {
+                continue;
+            }
             let v = match &f.kind {
                 FieldKind::Number { value, .. } => json!(value),
                 FieldKind::Text(s) | FieldKind::Path { value: s, .. } | FieldKind::SavePath(s) => json!(s),
@@ -107,6 +120,17 @@ impl Form {
             }
         }
         Value::Object(m)
+    }
+}
+
+fn action_field_enabled(action: Option<&str>, key: &str) -> bool {
+    let Some(action) = action else { return true };
+    match key {
+        "axis" | "distance" => action.starts_with("slide"),
+        "scalePercent" => action.starts_with("scale"),
+        "angle" => action.starts_with("rotate"),
+        "overshoot" => !action.starts_with("fade"),
+        _ => true,
     }
 }
 
@@ -148,6 +172,9 @@ fn is_pdf(p: &Value) -> bool {
 }
 
 pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
+    if super::native_motion::open_form(app, id, p) || super::native_text_counter::open_form(app, id, p) {
+        return true;
+    }
     let s = &app.session;
     let comp = s.active_comp();
     let layer = comp.and_then(|c| s.state.selected_layers.first().and_then(|l| c.layer(*l)));
@@ -668,61 +695,80 @@ pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
 pub fn show_form(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let mut f = app.dialog_state.form.clone();
     let (mut ok, mut close) = (false, false);
-    let h = 120.0 + f.fields.len() as f32 * 30.0;
+    let h = 160.0 + f.fields.len() as f32 * 34.0;
     let mut regs: Vec<(String, egui::Rect, String)> = vec![];
     let mut browse: Option<usize> = None;
-    super::dialogs::modal(ctx, &f.title.clone(), vec2(440.0, h), t, |ui| {
-        egui::Grid::new("form-grid").num_columns(2).spacing([14.0, 10.0]).show(ui, |ui| {
-            for (i, fl) in f.fields.iter_mut().enumerate() {
-                ui.label(&fl.label);
-                let r = match &mut fl.kind {
-                    FieldKind::Number { value, speed } => {
-                        let dec = if *speed < 0.01 { 5 } else { 3 };
-                        ui.add(egui::DragValue::new(value).speed(*speed).max_decimals(dec)).rect
+    let action = f.native_action().map(str::to_string);
+    let bounds = super::dialogs::modal_no_scroll(ctx, &f.title.clone(), vec2(600.0, h), t, |ui| {
+        let field_height = (h.min((ctx.content_rect().height() - 48.0).max(80.0)) - 120.0).max(40.0);
+        let control_width = (ui.available_width() - 214.0).clamp(60.0, 240.0);
+        egui::ScrollArea::vertical().id_salt("form-fields").max_height(field_height).auto_shrink([false, true]).show(ui, |ui| {
+            egui::Grid::new("form-grid").num_columns(2).spacing([14.0, 10.0]).show(ui, |ui| {
+                for (i, fl) in f.fields.iter_mut().enumerate() {
+                    if matches!(fl.kind, FieldKind::Note(_)) {
+                        continue;
                     }
-                    FieldKind::Text(s) => ui.add(egui::TextEdit::singleline(s).desired_width(220.0)).rect,
-                    FieldKind::Path { value, .. } => {
-                        ui.horizontal(|ui| {
-                            let r = ui.add(egui::TextEdit::singleline(value).desired_width(150.0)).rect;
-                            let b = ui.button("Browse…");
-                            regs.push((format!("form.field.{}.browse", fl.key), b.rect, "Browse…".into()));
-                            if b.clicked() {
-                                browse = Some(i);
+                    let enabled = action_field_enabled(action.as_deref(), &fl.key);
+                    let label = egui::RichText::new(&fl.label);
+                    ui.label(if enabled { label } else { label.weak() });
+                    let r = ui
+                        .add_enabled_ui(enabled, |ui| match &mut fl.kind {
+                            FieldKind::Number { value, speed } => {
+                                let dec = if *speed < 0.01 { 5 } else { 3 };
+                                ui.add(egui::DragValue::new(value).speed(*speed).max_decimals(dec)).rect
                             }
-                            r
-                        })
-                        .inner
-                    }
-                    FieldKind::SavePath(value) => {
-                        ui.horizontal(|ui| {
-                            let r = ui.add(egui::TextEdit::singleline(value).desired_width(150.0)).rect;
-                            let b = ui.button("Browse…");
-                            regs.push((format!("form.field.{}.browse", fl.key), b.rect, "Browse…".into()));
-                            if b.clicked() {
-                                browse = Some(i);
+                            FieldKind::Text(s) => ui.add(egui::TextEdit::singleline(s).desired_width(control_width)).rect,
+                            FieldKind::Path { value, .. } => {
+                                ui.horizontal(|ui| {
+                                    let r = ui.add(egui::TextEdit::singleline(value).desired_width(150.0)).rect;
+                                    let b = ui.button("Browse…");
+                                    regs.push((format!("form.field.{}.browse", fl.key), b.rect, "Browse…".into()));
+                                    if b.clicked() {
+                                        browse = Some(i);
+                                    }
+                                    r
+                                })
+                                .inner
                             }
-                            r
+                            FieldKind::SavePath(value) => {
+                                ui.horizontal(|ui| {
+                                    let r = ui.add(egui::TextEdit::singleline(value).desired_width(150.0)).rect;
+                                    let b = ui.button("Browse…");
+                                    regs.push((format!("form.field.{}.browse", fl.key), b.rect, "Browse…".into()));
+                                    if b.clicked() {
+                                        browse = Some(i);
+                                    }
+                                    r
+                                })
+                                .inner
+                            }
+                            FieldKind::Note(text) => ui.add(egui::Label::new(egui::RichText::new(text.as_str()).small()).wrap()).rect,
+                            FieldKind::Bool(b) => ui.checkbox(b, "").rect,
+                            FieldKind::Choice { options, sel } => {
+                                let cur = options.get(*sel).map(|o| o.0.clone()).unwrap_or_default();
+                                egui::ComboBox::from_id_salt(("form", fl.key.as_str()))
+                                    .selected_text(cur)
+                                    .width(control_width)
+                                    .show_ui(ui, |ui| {
+                                        for (i, (l, _)) in options.iter().enumerate() {
+                                            ui.selectable_value(sel, i, l);
+                                        }
+                                    })
+                                    .response
+                                    .rect
+                            }
                         })
-                        .inner
-                    }
-                    FieldKind::Note(text) => ui.add(egui::Label::new(egui::RichText::new(text.as_str()).small()).wrap()).rect,
-                    FieldKind::Bool(b) => ui.checkbox(b, "").rect,
-                    FieldKind::Choice { options, sel } => {
-                        let cur = options.get(*sel).map(|o| o.0.clone()).unwrap_or_default();
-                        egui::ComboBox::from_id_salt(("form", fl.key.as_str()))
-                            .selected_text(cur)
-                            .width(240.0)
-                            .show_ui(ui, |ui| {
-                                for (i, (l, _)) in options.iter().enumerate() {
-                                    ui.selectable_value(sel, i, l);
-                                }
-                            })
-                            .response
-                            .rect
-                    }
-                };
-                regs.push((format!("form.field.{}", fl.key), r, fl.label.clone()));
-                ui.end_row();
+                        .inner;
+                    regs.push((format!("form.field.{}", fl.key), r, fl.label.clone()));
+                    ui.end_row();
+                }
+            });
+            for fl in &f.fields {
+                if let FieldKind::Note(text) = &fl.kind {
+                    ui.add_space(10.0);
+                    let r = ui.add(egui::Label::new(egui::RichText::new(text).small()).wrap());
+                    regs.push((format!("form.field.{}", fl.key), r.rect, fl.label.clone()));
+                }
             }
         });
         ui.add_space(14.0);
@@ -739,6 +785,7 @@ pub fn show_form(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
             }
         });
     });
+    app.auto.add("form.dialog", bounds, &f.title);
     for (id, r, l) in regs {
         app.auto.add(&id, r, &l);
     }

@@ -58,6 +58,7 @@ fn camera_and_light_dialogs_create_layers() {
     h.step();
     let ok = h.state().auto.elements.iter().chain(h.state().auto.previous.iter()).find(|e| e.id == "dialog.camera.ok").map(|e| e.rect);
     assert!(ok.is_some(), "camera dialog OK registered");
+    assert!(h.state().auto.find("dialog.camera.fStop").is_some(), "linked F-Stop control is available");
     // OK through the dialog state (Enter).
     h.key_press(egui::Key::Enter);
     h.step();

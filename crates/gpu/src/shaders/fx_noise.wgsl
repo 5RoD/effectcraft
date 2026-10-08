@@ -173,7 +173,11 @@ fn fxn_median_out(@builtin(global_invocation_id) gid: vec3<u32>) {
         case 1u: {
             let cand = fxn_median_px(o, m, on_alpha);
             let d = abs(cand - o);
-            if (max(max(d.x, d.y), max(d.z, d.w)) > P.f[0].x) {
+            // Match noise::dust_threshold_units: strict decisions share a 20-bit grid,
+            // so a CPU/GPU rounding difference cannot switch an entire pixel.
+            let diff_units = round_away(max(max(d.x, d.y), max(d.z, d.w)) * 1048576.0);
+            let threshold_units = round_away(P.f[0].x * 1048576.0) + 1.0;
+            if (diff_units > threshold_units) {
                 r = cand;
             }
         }

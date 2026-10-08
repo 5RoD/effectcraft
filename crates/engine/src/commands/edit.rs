@@ -666,6 +666,7 @@ fn edit_original(s: &mut Session, _: &Value) -> Result<Value> {
 
 fn purge(s: &mut Session, _: &Value) -> Result<Value> {
     s.history.clear();
+    s.bump();
     s.toast("Purged undo history");
     Ok(Value::Null)
 }

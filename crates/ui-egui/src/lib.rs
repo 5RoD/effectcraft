@@ -374,6 +374,7 @@ impl EffectcraftApp {
 
     pub fn set_theme(&mut self, ctx: &egui::Context, k: theme::ThemeKind) {
         let name = match k {
+            theme::ThemeKind::FiveRod => "5rod",
             theme::ThemeKind::Dark => "dark",
             theme::ThemeKind::Darker => "darker",
             theme::ThemeKind::Light => "light",

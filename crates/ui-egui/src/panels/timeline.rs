@@ -744,7 +744,7 @@ fn reveal_rows(app: &EffectcraftApp, l: &Layer, kinds: &[String], rows: &mut Vec
     for kind in kinds {
         let Some((group, ids)) = reveal_targets(kind) else { continue };
         let root = match group {
-            "" => Some(&l.props),
+            "" => Some(&*l.props),
             "masks" => l.masks(),
             g => l.props.sub(g),
         };
@@ -1124,7 +1124,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
     let sr = Rect::from_min_size(pos2(tc_rect.max.x + 14.0, top + 12.0), vec2((left_w - 420.0).clamp(120.0, 220.0), 22.0));
     let mut search = app.ui.timeline.search.clone();
-    widgets::search_field(ui, sr, &mut search, "Search", &t);
+    let response = widgets::search_field(ui, sr, &mut search, "Search", &t);
+    if ui.data_mut(|d| d.remove_temp::<bool>(egui::Id::new("focus-timeline-search"))).unwrap_or(false) {
+        response.request_focus();
+        widgets::select_all(ui.ctx(), response.id, &search);
+    }
     app.ui.timeline.search = search;
     app.auto.add("timeline.search", sr, "Search");
     let mut bx = rect.min.x + left_w - 10.0;

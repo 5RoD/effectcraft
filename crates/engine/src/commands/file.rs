@@ -44,9 +44,15 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
     let text = if crate::xml_project::is_xml(&text) { crate::xml_project::from_xml(&text).map_err(EngineError::Other)? } else { text };
     let proj = Project::from_json(&text).map_err(|e| EngineError::Other(format!("{path} is not a project EffectCraft can open: {e}")))?;
     s.replace_project(proj, Some(path.to_string()));
+    let (saved_by, history) = crate::history_file::read_metadata(&text, &s.project);
+    match history {
+        Ok(Some(history)) => s.history = history,
+        Ok(None) => {}
+        Err(e) => s.toast(format!("Project opened, but its saved edit history could not be restored: {e}")),
+    }
+    s.mark_saved();
     s.note_project_path(path);
     // Written by a newer EffectCraft: what this version doesn't know would be lost on saving.
-    let saved_by = effectcraft_project::saved_by(&text);
     if let Some(v) = saved_by.as_deref().filter(|v| effectcraft_project::is_newer_version(v, effectcraft_project::APP_VERSION)) {
         s.toast(format!(
             "This project was saved by EffectCraft {v}, newer than this version ({}). Settings this version doesn't know are lost if you save it.",
@@ -65,7 +71,7 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
 /// project opened from an XML copy saves as XML again). Fails, writing nothing, when the project
 /// wouldn't read back.
 pub(crate) fn file_text(s: &Session, path: &str) -> Result<String> {
-    let json = s.project.to_file_json()?;
+    let json = crate::history_file::encode(&s.project, &s.history, false)?;
     if crate::xml_project::is_xml_path(path) { crate::xml_project::to_xml(&json).map_err(EngineError::Other) } else { Ok(json) }
 }
 

@@ -102,12 +102,30 @@ fn auto_backend_moves_light_comps_to_the_cpu() {
 
 #[test]
 fn auto_backend_keeps_fast_accelerators() {
-    // As fast as the CPU (ties stay on the accelerator): every frame but the CPU warm-up and
-    // re-probes.
+    // Verify the renderer follows a warmed, faster accelerator. A zero-delay mock's measured
+    // speed relative to a tiny CPU frame depends on scheduling during concurrent tests.
     let (p, cid) = project();
     let fast = TimedAccel::new(0, true);
+    let key = AutoKey::new(cid, 1.0, false);
+    for _ in 0..AutoPick::WARMUP {
+        fast.pick.record(key, false, 1000.0);
+        fast.pick.record(key, true, 0.1);
+    }
     let asked = frames(&p, cid, &fast, Backend::Auto, 40);
-    assert!(asked >= 36, "asked {asked} of 40");
+    assert_eq!(asked, 40);
+}
+
+#[test]
+fn auto_pick_keeps_fast_accelerators_after_warmup() {
+    let pick = AutoPick::default();
+    let key = AutoKey::new(ItemId(7), 1.0, false);
+    let mut asked = 0;
+    for _ in 0..40 {
+        let gpu = pick.choose(key);
+        asked += usize::from(gpu);
+        pick.record(key, gpu, if gpu { 1.0 } else { 5.0 });
+    }
+    assert_eq!(asked, 40 - AutoPick::WARMUP as usize);
 }
 
 #[test]

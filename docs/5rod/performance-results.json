@@ -1,0 +1,680 @@
+{
+  "localDate": "2026-10-09",
+  "baselineCommit": "d60cb71e297a4bb76851b27b48c0014b56ccab69",
+  "host": {
+    "cpu": "Intel Core i9-10900F",
+    "ramGiB": 32,
+    "gpu": "NVIDIA GeForce RTX 3050",
+    "gpuBackend": "Vulkan",
+    "driver": "32.0.16.1714",
+    "rayonThreads": 20,
+    "gpuVramGiB": 8
+  },
+  "profile": {
+    "rust": "1.99.0",
+    "target": "x86_64-pc-windows-msvc",
+    "lto": "thin",
+    "codegenUnits": 1,
+    "pairOrder": [
+      "baseline/improved",
+      "improved/baseline",
+      "baseline/improved"
+    ]
+  },
+  "binarySha256": {
+    "baselineCli": "82906C69A5BF941B05FF1A77F42978751FA93877AC47EC6AB1AB236EBDE4551A",
+    "developmentCli": "DC3C2FF9C09939419C30EAEB7F3B3836AB6EA39BD6C921DAB62D7CDAA0FE0294",
+    "developmentDesktop": "1198147C918078C84237ED5B9C71D61B36CB01FF21BCBF850266EE03F179596E"
+  },
+  "operationsSpec": "LargeSpec { comps: 12, main_layers: 1000, comp_layers: 4, footage: 30, sequence_frames: 24, nest_depth: 5, expression_every: 3, media_dir: \"/nonexistent/effectcraft-bench-media\" }",
+  "summary": {
+    "operations": [
+      {
+        "name": "smallEdit",
+        "baseline": 5.147,
+        "improved": 0.226
+      },
+      {
+        "name": "largeEdit",
+        "baseline": 6.992,
+        "improved": 0.618
+      },
+      {
+        "name": "open",
+        "baseline": 97.776,
+        "improved": 98.776
+      },
+      {
+        "name": "firstFrame",
+        "baseline": 25.653,
+        "improved": 26.76
+      }
+    ],
+    "styles": [
+      {
+        "resolution": "1080p",
+        "name": "uncachedMedianMs",
+        "baseline": 71.45,
+        "improved": 63.74
+      },
+      {
+        "resolution": "1080p",
+        "name": "playNoCacheMedianMs",
+        "baseline": 77.57,
+        "improved": 61.11
+      },
+      {
+        "resolution": "1080p",
+        "name": "playCachedMedianMs",
+        "baseline": 20.06,
+        "improved": 6.55
+      },
+      {
+        "resolution": "4k",
+        "name": "uncachedMedianMs",
+        "baseline": 129.3,
+        "improved": 70.39
+      },
+      {
+        "resolution": "4k",
+        "name": "playNoCacheMedianMs",
+        "baseline": 129.65,
+        "improved": 71.54
+      },
+      {
+        "resolution": "4k",
+        "name": "playCachedMedianMs",
+        "baseline": 74.77,
+        "improved": 15.44
+      }
+    ],
+    "glow": [
+      {
+        "comp": "1080p Original",
+        "resolution": "Full",
+        "name": "cpuCold",
+        "baseline": 52.77,
+        "improved": 48.5
+      },
+      {
+        "comp": "1080p Original",
+        "resolution": "Full",
+        "name": "gpuCold",
+        "baseline": 58.28,
+        "improved": 57.33
+      },
+      {
+        "comp": "1080p Original",
+        "resolution": "Full",
+        "name": "cpuWarm",
+        "baseline": 4.87,
+        "improved": 4.91
+      },
+      {
+        "comp": "1080p Original",
+        "resolution": "Full",
+        "name": "gpuWarm",
+        "baseline": 24.2,
+        "improved": 24.52
+      },
+      {
+        "comp": "1080p Original",
+        "resolution": "Full",
+        "name": "gpuView",
+        "baseline": 0.84,
+        "improved": 0.8
+      },
+      {
+        "comp": "1080p Original",
+        "resolution": "Half",
+        "name": "cpuCold",
+        "baseline": 10.73,
+        "improved": 10.13
+      },
+      {
+        "comp": "1080p Original",
+        "resolution": "Half",
+        "name": "gpuCold",
+        "baseline": 15.67,
+        "improved": 15.72
+      },
+      {
+        "comp": "1080p Original",
+        "resolution": "Half",
+        "name": "cpuWarm",
+        "baseline": 1.23,
+        "improved": 1.22
+      },
+      {
+        "comp": "1080p Original",
+        "resolution": "Half",
+        "name": "gpuWarm",
+        "baseline": 6.01,
+        "improved": 6.31
+      },
+      {
+        "comp": "1080p Original",
+        "resolution": "Half",
+        "name": "gpuView",
+        "baseline": 0.42,
+        "improved": 0.42
+      },
+      {
+        "comp": "1080p Arbitrary",
+        "resolution": "Full",
+        "name": "cpuCold",
+        "baseline": 66.78,
+        "improved": 49.34
+      },
+      {
+        "comp": "1080p Arbitrary",
+        "resolution": "Full",
+        "name": "gpuCold",
+        "baseline": 58.28,
+        "improved": 56.51
+      },
+      {
+        "comp": "1080p Arbitrary",
+        "resolution": "Full",
+        "name": "cpuWarm",
+        "baseline": 4.84,
+        "improved": 4.47
+      },
+      {
+        "comp": "1080p Arbitrary",
+        "resolution": "Full",
+        "name": "gpuWarm",
+        "baseline": 23.39,
+        "improved": 24.41
+      },
+      {
+        "comp": "1080p Arbitrary",
+        "resolution": "Full",
+        "name": "gpuView",
+        "baseline": 0.86,
+        "improved": 0.85
+      },
+      {
+        "comp": "1080p Arbitrary",
+        "resolution": "Half",
+        "name": "cpuCold",
+        "baseline": 13.94,
+        "improved": 10.93
+      },
+      {
+        "comp": "1080p Arbitrary",
+        "resolution": "Half",
+        "name": "gpuCold",
+        "baseline": 15.44,
+        "improved": 15.74
+      },
+      {
+        "comp": "1080p Arbitrary",
+        "resolution": "Half",
+        "name": "cpuWarm",
+        "baseline": 1.26,
+        "improved": 1.26
+      },
+      {
+        "comp": "1080p Arbitrary",
+        "resolution": "Half",
+        "name": "gpuWarm",
+        "baseline": 6.47,
+        "improved": 5.79
+      },
+      {
+        "comp": "1080p Arbitrary",
+        "resolution": "Half",
+        "name": "gpuView",
+        "baseline": 0.44,
+        "improved": 0.43
+      },
+      {
+        "comp": "4K Original",
+        "resolution": "Full",
+        "name": "cpuCold",
+        "baseline": 193.76,
+        "improved": 193.58
+      },
+      {
+        "comp": "4K Original",
+        "resolution": "Full",
+        "name": "gpuCold",
+        "baseline": 226.33,
+        "improved": 225.02
+      },
+      {
+        "comp": "4K Original",
+        "resolution": "Full",
+        "name": "cpuWarm",
+        "baseline": 16.06,
+        "improved": 17.04
+      },
+      {
+        "comp": "4K Original",
+        "resolution": "Full",
+        "name": "gpuWarm",
+        "baseline": 98.12,
+        "improved": 96.88
+      },
+      {
+        "comp": "4K Original",
+        "resolution": "Full",
+        "name": "gpuView",
+        "baseline": 21.45,
+        "improved": 21.83
+      },
+      {
+        "comp": "4K Original",
+        "resolution": "Half",
+        "name": "cpuCold",
+        "baseline": 46.86,
+        "improved": 48.95
+      },
+      {
+        "comp": "4K Original",
+        "resolution": "Half",
+        "name": "gpuCold",
+        "baseline": 58.63,
+        "improved": 61.44
+      },
+      {
+        "comp": "4K Original",
+        "resolution": "Half",
+        "name": "cpuWarm",
+        "baseline": 4.18,
+        "improved": 4.21
+      },
+      {
+        "comp": "4K Original",
+        "resolution": "Half",
+        "name": "gpuWarm",
+        "baseline": 24.72,
+        "improved": 24.93
+      },
+      {
+        "comp": "4K Original",
+        "resolution": "Half",
+        "name": "gpuView",
+        "baseline": 1.31,
+        "improved": 1.66
+      },
+      {
+        "comp": "4K Arbitrary",
+        "resolution": "Full",
+        "name": "cpuCold",
+        "baseline": 257.24,
+        "improved": 199.09
+      },
+      {
+        "comp": "4K Arbitrary",
+        "resolution": "Full",
+        "name": "gpuCold",
+        "baseline": 225.05,
+        "improved": 231.54
+      },
+      {
+        "comp": "4K Arbitrary",
+        "resolution": "Full",
+        "name": "cpuWarm",
+        "baseline": 17.08,
+        "improved": 17.09
+      },
+      {
+        "comp": "4K Arbitrary",
+        "resolution": "Full",
+        "name": "gpuWarm",
+        "baseline": 98.29,
+        "improved": 98.18
+      },
+      {
+        "comp": "4K Arbitrary",
+        "resolution": "Full",
+        "name": "gpuView",
+        "baseline": 20.86,
+        "improved": 21.37
+      },
+      {
+        "comp": "4K Arbitrary",
+        "resolution": "Half",
+        "name": "cpuCold",
+        "baseline": 60.38,
+        "improved": 49.08
+      },
+      {
+        "comp": "4K Arbitrary",
+        "resolution": "Half",
+        "name": "gpuCold",
+        "baseline": 59.89,
+        "improved": 58.91
+      },
+      {
+        "comp": "4K Arbitrary",
+        "resolution": "Half",
+        "name": "cpuWarm",
+        "baseline": 4.31,
+        "improved": 4.23
+      },
+      {
+        "comp": "4K Arbitrary",
+        "resolution": "Half",
+        "name": "gpuWarm",
+        "baseline": 23.76,
+        "improved": 23.72
+      },
+      {
+        "comp": "4K Arbitrary",
+        "resolution": "Half",
+        "name": "gpuView",
+        "baseline": 1.72,
+        "improved": 1.33
+      }
+    ]
+  },
+  "operationRuns": [
+    {
+      "variant": "baseline",
+      "iteration": 1,
+      "measures": [
+        {
+          "ms": 99.546,
+          "name": "open",
+          "note": "active comp Some(1)"
+        },
+        {
+          "ms": 24.43,
+          "name": "firstFrame",
+          "note": "Main at 1/4, cold"
+        },
+        {
+          "ms": 4.954,
+          "name": "smallEdit",
+          "note": "prop.set on one layer of Main"
+        },
+        {
+          "ms": 7.002,
+          "name": "largeEdit",
+          "note": "shy switch on 1000 layers"
+        }
+      ]
+    },
+    {
+      "variant": "improved",
+      "iteration": 1,
+      "measures": [
+        {
+          "ms": 101.509,
+          "name": "open",
+          "note": "active comp Some(1)"
+        },
+        {
+          "ms": 28.366,
+          "name": "firstFrame",
+          "note": "Main at 1/4, cold"
+        },
+        {
+          "ms": 0.238,
+          "name": "smallEdit",
+          "note": "prop.set on one layer of Main"
+        },
+        {
+          "ms": 0.635,
+          "name": "largeEdit",
+          "note": "shy switch on 1000 layers"
+        }
+      ]
+    },
+    {
+      "variant": "improved",
+      "iteration": 2,
+      "measures": [
+        {
+          "ms": 98.517,
+          "name": "open",
+          "note": "active comp Some(1)"
+        },
+        {
+          "ms": 26.76,
+          "name": "firstFrame",
+          "note": "Main at 1/4, cold"
+        },
+        {
+          "ms": 0.223,
+          "name": "smallEdit",
+          "note": "prop.set on one layer of Main"
+        },
+        {
+          "ms": 0.604,
+          "name": "largeEdit",
+          "note": "shy switch on 1000 layers"
+        }
+      ]
+    },
+    {
+      "variant": "baseline",
+      "iteration": 2,
+      "measures": [
+        {
+          "ms": 97.776,
+          "name": "open",
+          "note": "active comp Some(1)"
+        },
+        {
+          "ms": 25.653,
+          "name": "firstFrame",
+          "note": "Main at 1/4, cold"
+        },
+        {
+          "ms": 5.376,
+          "name": "smallEdit",
+          "note": "prop.set on one layer of Main"
+        },
+        {
+          "ms": 6.992,
+          "name": "largeEdit",
+          "note": "shy switch on 1000 layers"
+        }
+      ]
+    },
+    {
+      "variant": "baseline",
+      "iteration": 3,
+      "measures": [
+        {
+          "ms": 97.676,
+          "name": "open",
+          "note": "active comp Some(1)"
+        },
+        {
+          "ms": 25.784,
+          "name": "firstFrame",
+          "note": "Main at 1/4, cold"
+        },
+        {
+          "ms": 5.147,
+          "name": "smallEdit",
+          "note": "prop.set on one layer of Main"
+        },
+        {
+          "ms": 6.932,
+          "name": "largeEdit",
+          "note": "shy switch on 1000 layers"
+        }
+      ]
+    },
+    {
+      "variant": "improved",
+      "iteration": 3,
+      "measures": [
+        {
+          "ms": 98.776,
+          "name": "open",
+          "note": "active comp Some(1)"
+        },
+        {
+          "ms": 25.895,
+          "name": "firstFrame",
+          "note": "Main at 1/4, cold"
+        },
+        {
+          "ms": 0.226,
+          "name": "smallEdit",
+          "note": "prop.set on one layer of Main"
+        },
+        {
+          "ms": 0.618,
+          "name": "largeEdit",
+          "note": "shy switch on 1000 layers"
+        }
+      ]
+    }
+  ],
+  "styledRuns": [
+    {
+      "resolution": "1080p",
+      "playNoCacheMedianMs": 77.57,
+      "variant": "baseline",
+      "iteration": 1,
+      "uncachedMedianMs": 71.45,
+      "playCachedMedianMs": 20.06
+    },
+    {
+      "resolution": "1080p",
+      "playNoCacheMedianMs": 61.11,
+      "variant": "improved",
+      "iteration": 1,
+      "uncachedMedianMs": 64.52,
+      "playCachedMedianMs": 6.55
+    },
+    {
+      "resolution": "1080p",
+      "playNoCacheMedianMs": 63.83,
+      "variant": "improved",
+      "iteration": 2,
+      "uncachedMedianMs": 63.74,
+      "playCachedMedianMs": 6.55
+    },
+    {
+      "resolution": "1080p",
+      "playNoCacheMedianMs": 77.14,
+      "variant": "baseline",
+      "iteration": 2,
+      "uncachedMedianMs": 69.51,
+      "playCachedMedianMs": 19.9
+    },
+    {
+      "resolution": "1080p",
+      "playNoCacheMedianMs": 77.98,
+      "variant": "baseline",
+      "iteration": 3,
+      "uncachedMedianMs": 79.05,
+      "playCachedMedianMs": 21.47
+    },
+    {
+      "resolution": "1080p",
+      "playNoCacheMedianMs": 60.62,
+      "variant": "improved",
+      "iteration": 3,
+      "uncachedMedianMs": 63.71,
+      "playCachedMedianMs": 7.25
+    },
+    {
+      "resolution": "4k",
+      "playNoCacheMedianMs": 129.65,
+      "variant": "baseline",
+      "iteration": 1,
+      "uncachedMedianMs": 131.6,
+      "playCachedMedianMs": 74.77
+    },
+    {
+      "resolution": "4k",
+      "playNoCacheMedianMs": 71.54,
+      "variant": "improved",
+      "iteration": 1,
+      "uncachedMedianMs": 71.82,
+      "playCachedMedianMs": 15.44
+    },
+    {
+      "resolution": "4k",
+      "playNoCacheMedianMs": 70.86,
+      "variant": "improved",
+      "iteration": 2,
+      "uncachedMedianMs": 70.39,
+      "playCachedMedianMs": 16.28
+    },
+    {
+      "resolution": "4k",
+      "playNoCacheMedianMs": 127.09,
+      "variant": "baseline",
+      "iteration": 2,
+      "uncachedMedianMs": 129.3,
+      "playCachedMedianMs": 75.62
+    },
+    {
+      "resolution": "4k",
+      "playNoCacheMedianMs": 130.24,
+      "variant": "baseline",
+      "iteration": 3,
+      "uncachedMedianMs": 124.48,
+      "playCachedMedianMs": 74.54
+    },
+    {
+      "resolution": "4k",
+      "playNoCacheMedianMs": 71.54,
+      "variant": "improved",
+      "iteration": 3,
+      "uncachedMedianMs": 70.15,
+      "playCachedMedianMs": 15.14
+    }
+  ],
+  "longHistory": {
+    "edits": 5000,
+    "layers": 100,
+    "editMs": 263,
+    "meanEditMs": 0.0526,
+    "saveMs": 514,
+    "openMs": 645,
+    "fileBytes": 14527527,
+    "nodesBefore": 5103,
+    "nodesAfter": 5103,
+    "peakWorkingSetBytes": 284291072
+  },
+  "renderPixels": [
+    {
+      "improved": "5DC93DB58E2D9E463FDD1479F1DB2B9F447AF48317FE8BC26742FD6422EBEE0D",
+      "baseline": "5DC93DB58E2D9E463FDD1479F1DB2B9F447AF48317FE8BC26742FD6422EBEE0D",
+      "byteIdentical": true,
+      "scene": "styled-1080p"
+    },
+    {
+      "improved": "5AF0BE24B7B9AF040CB611DF302107761792D0C0113F3C88E0836CCD46242888",
+      "baseline": "5AF0BE24B7B9AF040CB611DF302107761792D0C0113F3C88E0836CCD46242888",
+      "byteIdentical": true,
+      "scene": "styled-4k"
+    },
+    {
+      "improved": "ECD7B812B251CCC573AB653DD3EBC0AD39EB755BD43BBF38E76D9E0BD1CE2E6C",
+      "baseline": "ECD7B812B251CCC573AB653DD3EBC0AD39EB755BD43BBF38E76D9E0BD1CE2E6C",
+      "byteIdentical": true,
+      "scene": "glow-1080p-original"
+    },
+    {
+      "improved": "FAD27453468D5AE9E1D7922BFD27D1043D2C0571C845F50FBBA468B3723EBD86",
+      "baseline": "FAD27453468D5AE9E1D7922BFD27D1043D2C0571C845F50FBBA468B3723EBD86",
+      "byteIdentical": true,
+      "scene": "glow-1080p-arbitrary"
+    },
+    {
+      "improved": "95C5A5125C7212F8500ED8C6E74EFA4BA319A62B0807662485FA3ABC46EED716",
+      "baseline": "95C5A5125C7212F8500ED8C6E74EFA4BA319A62B0807662485FA3ABC46EED716",
+      "byteIdentical": true,
+      "scene": "glow-4k-original"
+    },
+    {
+      "improved": "F686FBBF3A3A9FA4E3BEC1D69684E92916DA548612D6CFAB144DC7B693ADC00D",
+      "baseline": "F686FBBF3A3A9FA4E3BEC1D69684E92916DA548612D6CFAB144DC7B693ADC00D",
+      "byteIdentical": true,
+      "scene": "glow-4k-arbitrary"
+    }
+  ]
+}

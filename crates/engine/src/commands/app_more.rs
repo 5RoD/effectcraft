@@ -15,22 +15,19 @@ use crate::{EngineError, Event, Result, Session, cmd, query};
 pub(crate) fn grouped<T>(s: &mut Session, label: &str, f: impl FnOnce(&mut Session) -> Result<T>) -> Result<T> {
     // The steps `f` records go to an empty stack (so the undo limit can't drop the snapshot
     // taken before them), then become one step on the real one.
-    let saved = std::mem::take(&mut s.history.undo);
+    let saved = std::mem::take(&mut s.history);
     let before = s.project.clone();
     let r = f(s);
     let changed = !s.history.undo.is_empty();
-    s.history.undo = saved;
+    s.history = saved;
     s.history.merge_key = None;
     match r {
         Ok(v) => {
             if changed {
-                s.history.undo.push((label.to_string(), before));
-                let levels = s.prefs.general.undo_levels.max(1) as usize;
-                if s.history.undo.len() > levels {
-                    let extra = s.history.undo.len() - levels;
-                    s.history.undo.drain(..extra);
-                }
+                let levels = s.history_limit();
+                s.history.record(label, before, levels);
             }
+            s.refresh_history_dirty();
             Ok(v)
         }
         Err(e) => {
@@ -128,7 +125,7 @@ fn clear_recent_presets(s: &mut Session, _: &Value) -> Result<Value> {
 
 fn save_copy_xml(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad("file.saveCopyAsXml", "missing `path` (.ecprojx)"))?;
-    let xml = crate::xml_project::to_xml(&s.project.to_file_json()?).map_err(EngineError::Other)?;
+    let xml = crate::xml_project::to_xml(&crate::history_file::encode(&s.project, &s.history, false)?).map_err(EngineError::Other)?;
     s.services.write_file(path, xml.as_bytes()).map_err(|e| EngineError::Other(format!("cannot write {path}: {e}")))?;
     s.toast(format!("Saved an XML copy to {path}"));
     Ok(json!({"path": path, "bytes": xml.len()}))

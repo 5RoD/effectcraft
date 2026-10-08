@@ -36,7 +36,7 @@ pub fn guard(app: &mut EffectcraftApp, id: &str, params: &Value) -> bool {
 }
 
 fn ask(app: &mut EffectcraftApp, id: &str, params: &Value) -> bool {
-    if !app.session.is_dirty() {
+    if !app.session.needs_save() {
         return false;
     }
     app.dialog_state.unsaved.command = Some((id.to_string(), params.clone()));
@@ -69,7 +69,7 @@ pub fn project_name(app: &EffectcraftApp) -> String {
 /// The window title: the project's path (or name) and `*` while it has unsaved changes.
 pub fn window_title(app: &EffectcraftApp) -> String {
     let doc = app.session.path.clone().unwrap_or_else(|| project_name(app));
-    format!("EffectCraft - {doc}{}", if app.session.is_dirty() { " *" } else { "" })
+    format!("EffectCraft - {doc}{}", if app.session.needs_save() { " *" } else { "" })
 }
 
 enum Answer {
@@ -96,7 +96,7 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
         ui.label(egui::RichText::new(text).color(t.tab_text_active));
         if !revert {
             ui.add_space(4.0);
-            ui.label(egui::RichText::new("Your changes will be lost if you don't save them.").color(t.text_dim).size(11.0));
+            ui.label(egui::RichText::new("Unsaved changes and edit history will be lost if you don't save.").color(t.text_dim).size(11.0));
         }
         ui.add_space(18.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -141,7 +141,7 @@ fn answer_with(app: &mut EffectcraftApp, ctx: &egui::Context, a: Answer) {
                 app.ui.status = e;
                 return;
             }
-            if app.session.is_dirty() {
+            if app.session.needs_save() {
                 return;
             }
         }
@@ -263,11 +263,16 @@ mod tests {
         answer_with(&mut app, &ctx, Answer::Discard);
         assert!(app.dialog_state.unsaved.quitting);
         assert!(!frame(&mut app, &ctx, true), "Don't Save lets the window close");
-        // Undoing back to the saved state needs no prompt.
+        // Returning to saved pixels still needs to preserve the newly created redo future.
         let (mut app, ctx) = self::app();
         modified(&mut app);
         app.session.execute("edit.undo", json!({})).unwrap();
         assert!(!app.session.is_dirty());
-        assert!(!frame(&mut app, &ctx, true));
+        assert!(app.session.needs_save());
+        assert!(frame(&mut app, &ctx, true));
+        assert_eq!(app.dialog, Some(Dialog::UnsavedChanges));
+        answer_with(&mut app, &ctx, Answer::Cancel);
+        assert!(app.session.redo());
+        assert_eq!(app.session.project.comps().count(), 1);
     }
 }

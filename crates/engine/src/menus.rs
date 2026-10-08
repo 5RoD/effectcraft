@@ -965,6 +965,10 @@ Animation
     ---
     Clear Recent Presets | anim.clearRecentPresets
   Browse Presets... | anim.browsePresets
+  Native Motion Tools
+    Animation Action... | anim.nativeAction
+    Seeded Shake... | anim.nativeShake
+    Text Counter... | text.nativeCounter
   Text Animation Presets
     Typewriter | layer.applyTextPreset {"preset":"typewriter"}
     Fade Up Characters | layer.applyTextPreset {"preset":"fadeUpCharacters"}

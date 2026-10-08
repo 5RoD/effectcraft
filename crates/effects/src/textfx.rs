@@ -291,7 +291,7 @@ const DAYS: [&str; 7] = ["Saturday", "Sunday", "Monday", "Tuesday", "Wednesday",
 /// Proleptic Gregorian date from a day count since 2000-01-01 (a Saturday).
 fn date_from_days(days: i64) -> (i64, u32, u32, usize) {
     // Days since 0000-03-01 based civil calendar conversion.
-    let z = days + 730_425; // 2000-01-01 relative to 0000-03-01
+    let z = days as i128 + 730_425; // Wide intermediates also cover i64::MAX day counts.
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
@@ -301,13 +301,13 @@ fn date_from_days(days: i64) -> (i64, u32, u32, usize) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d, days.rem_euclid(7) as usize)
+    (y as i64, m, d, days.rem_euclid(7) as usize)
 }
 
 fn timecode(frames: i64, fps: f64) -> String {
-    let fr = fps.round().max(1.0) as i64;
+    let fr = if fps.is_finite() { fps.round().clamp(1.0, 1_000_000.0) as u64 } else { 30 };
     let neg = frames < 0;
-    let f = frames.abs();
+    let f = frames.unsigned_abs();
     let s = format!("{:02}:{:02}:{:02}:{:02}", f / (fr * 3600), (f / (fr * 60)) % 60, (f / fr) % 60, f % fr);
     if neg { format!("-{s}") } else { s }
 }
@@ -338,36 +338,33 @@ fn numbers_text(ctx: &EffectCtx) -> String {
         v = hash1(frame, 17, ctx.seed) as f64 * pr.f("value");
     }
     let cur = pr.b("currentTimeDate");
-    let t = if cur { ctx.time + v } else { v };
-    match kind {
-        1 => {
-            let s = format!("{:.*}", dp, v.abs());
-            let (ip, fp) = s.split_once('.').map(|(a, b)| (a.to_string(), format!(".{b}"))).unwrap_or((s.clone(), String::new()));
-            format!("{}{:0>5}{}", if v < 0.0 { "-" } else { "" }, ip, fp)
-        }
+    let rate = pr.get("clockRate").map(Value::as_f64).unwrap_or(1.0);
+    let elapsed = (ctx.time - pr.f("clockStart")) * rate;
+    let t = if cur { v + elapsed * if pr.b("countDown") { -1.0 } else { 1.0 } } else { v };
+    let v = if cur { t } else { v };
+    let pad = pr.f("minimumDigits").round().clamp(0.0, 32.0) as usize;
+    let text = match kind {
+        1 => crate::counter::number(v, dp, pad.max(5), pr.e("digitGrouping")),
         2..=4 => {
-            let fps = [30.0, 25.0, 24.0][(kind - 2) as usize];
+            let fps = [30.0, 25.0, 24.0].get((kind - 2) as usize).copied().unwrap_or(30.0);
             timecode((t * fps + 1e-6).floor() as i64, fps)
         }
-        5 => {
-            let s = t.floor() as i64;
-            let a = s.abs();
-            format!("{}{:02}:{:02}:{:02}", if s < 0 { "-" } else { "" }, a / 3600, (a / 60) % 60, a % 60)
-        }
+        5 => crate::counter::clock(t, if pr.b("timeDecimals") { dp } else { 0 }, pr.e("timeStyle")),
         6..=8 => {
             let (y, m, d, wd) = date_from_days(v.floor() as i64);
             match kind {
                 6 => format!("{:02}/{:02}/{:02}", m, d, y.rem_euclid(100)),
-                7 => format!("{} {}, {}", &MONTHS[m as usize - 1][..3], d, y),
-                _ => format!("{}, {} {}, {}", DAYS[wd], MONTHS[m as usize - 1], d, y),
+                7 => format!("{} {}, {}", MONTHS.get((m as usize).saturating_sub(1)).and_then(|s| s.get(..3)).unwrap_or("Jan"), d, y),
+                _ => format!("{}, {} {}, {}", DAYS.get(wd).unwrap_or(&"Saturday"), MONTHS.get((m as usize).saturating_sub(1)).unwrap_or(&"January"), d, y),
             }
         }
         9 => {
             let i = v.round() as i64;
-            if i < 0 { format!("-{:X}", -i) } else { format!("{i:X}") }
+            if i < 0 { format!("-{:X}", i.unsigned_abs()) } else { format!("{i:X}") }
         }
-        _ => format!("{:.*}", dp, if cur { t } else { v }),
-    }
+        _ => crate::counter::number(v, dp, pad, pr.e("digitGrouping")),
+    };
+    crate::counter::affixes(text, pr.s("prefix"), pr.s("suffix"))
 }
 
 /// What Numbers or Timecode draws: glyph polylines, stroke radius and look, whether the layer
@@ -392,7 +389,12 @@ fn numbers_plan(ctx: &EffectCtx, b: &Buf) -> TextPlan {
     let pos = b.to_px(pr.v2("position"));
     let wdt = line_width(&text, size, tracking, prop);
     let mut polys = Vec::new();
-    layout_line(&text, [pos.0 - wdt * 0.5, pos.1 + unit(size) * 3.0], size, tracking, prop, &mut polys);
+    let x = match pr.e("alignment") {
+        1 => pos.0,
+        2 => pos.0 - wdt,
+        _ => pos.0 - wdt * 0.5,
+    };
+    layout_line(&text, [x, pos.1 + unit(size) * 3.0], size, tracking, prop, &mut polys);
     let mut look = look_from(ctx, b, "compositeOnOriginal");
     let keep = look.on_original;
     look.on_original = true;
@@ -472,10 +474,11 @@ pub fn text_layer(id: &str, ctx: &EffectCtx, b: &Buf) -> Option<TextLayer> {
 
 /// SMPTE drop-frame label for nominal 30/60 fps rates.
 fn drop_frame(frames: i64, nominal: i64) -> String {
+    let nominal = nominal.clamp(30, 60) as i128;
     let drop = nominal / 15; // 2 at 30, 4 at 60
     let per_min = nominal * 60 - drop;
     let per_10 = per_min * 10 + drop;
-    let f = frames.max(0);
+    let f = frames.max(0) as i128;
     let d = f / per_10;
     let m = f % per_10;
     let adj = if m > drop { f + drop * 9 * d + drop * ((m - drop) / per_min) } else { f + drop * 9 * d };
@@ -492,7 +495,7 @@ fn timecode_plan(ctx: &EffectCtx, b: &Buf) -> TextPlan {
     };
     let mut frame = (t * fps + 1e-6).floor() as i64;
     if src == 2 {
-        frame += pr.f("startingFrame").round() as i64;
+        frame = frame.saturating_add(pr.f("startingFrame").round() as i64);
     }
     let nominal = fps.round() as i64;
     let text = match pr.e("displayFormat") {
@@ -932,6 +935,15 @@ pub fn specs() -> Vec<EffectSpec> {
                 p("format/value", "Value/Offset/Random Max", num(0.0), slider(-30000.0, 30000.0, -1000.0, 1000.0, 3)),
                 p("format/decimalPlaces", "Decimal Places", num(2.0), slider(0.0, 10.0, 0.0, 10.0, 0)),
                 check("format/currentTimeDate", "Current Time/Date", false),
+                check("format/countDown", "Count Down", false),
+                p("format/clockRate", "Clock Rate", num(1.0), slider(-100.0, 100.0, -5.0, 5.0, 3)),
+                p("format/clockStart", "Clock Start (layer seconds)", num(0.0), slider(-1_000_000.0, 1_000_000.0, 0.0, 10.0, 3)),
+                p("format/minimumDigits", "Minimum Integer Digits", num(0.0), slider(0.0, 32.0, 0.0, 12.0, 0)),
+                p("format/digitGrouping", "Digit Separators", Value::Enum(0), popup(&["None (decimal point)", "1,234.56", "1.234,56", "1 234.56"])),
+                p("format/prefix", "Prefix", Value::Str(String::new()), ParamUi::Text),
+                p("format/suffix", "Suffix", Value::Str(String::new()), ParamUi::Text),
+                p("format/timeStyle", "Time Display", Value::Enum(0), popup(&["HH:MM:SS", "MM:SS", "Seconds"])),
+                check("format/timeDecimals", "Fractional Time", false),
                 p("fillAndStroke/position", "Position", pt(0.5, 0.5), ParamUi::Point),
                 p("fillAndStroke/displayOptions", "Display Options", Value::Enum(0), display()),
                 p("fillAndStroke/fillColor", "Fill Color", col(1.0, 0.0, 0.0), ParamUi::Color),
@@ -939,6 +951,7 @@ pub fn specs() -> Vec<EffectSpec> {
                 p("fillAndStroke/strokeWidth", "Stroke Width", num(2.0), slider(0.0, 50.0, 0.0, 50.0, 1)),
                 p("size", "Size", num(36.0), size()),
                 p("tracking", "Tracking", num(0.0), slider(-100.0, 100.0, -20.0, 50.0, 1)),
+                p("alignment", "Alignment", Value::Enum(0), popup(&["Center", "Left", "Right"])),
                 check("proportionalSpacing", "Proportional Spacing", true),
                 check("compositeOnOriginal", "Composite On Original", true),
             ],
@@ -1128,6 +1141,38 @@ mod tests {
             txt(&[("value", num(100.0)), ("randomValues", Value::Bool(true))], 0.0),
             txt(&[("value", num(100.0)), ("randomValues", Value::Bool(true))], 1.0)
         );
+        assert_eq!(
+            txt(
+                &[("value", num(-1234.5)), ("digitGrouping", Value::Enum(2)), ("prefix", Value::Str("USD ".into())), ("suffix", Value::Str(" total".into()))],
+                0.0
+            ),
+            "USD -1.234,50 total"
+        );
+        assert_eq!(
+            txt(
+                &[
+                    ("value", num(65.5)),
+                    ("type", Value::Enum(5)),
+                    ("currentTimeDate", Value::Bool(true)),
+                    ("countDown", Value::Bool(true)),
+                    ("clockStart", num(1.0)),
+                    ("clockRate", num(2.0)),
+                    ("timeDecimals", Value::Bool(true))
+                ],
+                3.0
+            ),
+            "00:01:01.50"
+        );
+        assert_eq!(txt(&[("value", num(7.0)), ("minimumDigits", num(6.0)), ("decimalPlaces", num(0.0))], 0.0), "000007");
+        // Fixed-width digits and padding prevent digit-width jitter; left/right anchors are available.
+        assert_eq!(line_width("000001", 36.0, 0.0, false), line_width("888888", 36.0, 0.0, false));
+        // These hostile date, time and hex values used to overflow in non-test render code.
+        for kind in [2, 5, 6, 7, 8, 9] {
+            assert!(!txt(&[("value", num(-1e300)), ("type", Value::Enum(kind))], 0.0).is_empty());
+            assert!(!txt(&[("value", num(1e300)), ("type", Value::Enum(kind))], 0.0).is_empty());
+        }
+        assert!(!drop_frame(i64::MAX, 30).is_empty());
+        assert!(!timecode(i64::MIN, f64::NAN).is_empty());
     }
 
     #[test]

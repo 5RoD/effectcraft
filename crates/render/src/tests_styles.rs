@@ -57,6 +57,41 @@ fn near(a: f32, b: f32, tol: f32) -> bool {
 }
 
 #[test]
+fn full_opacity_styled_fast_path_matches_isolated_stack_in_hdr() {
+    let (p, cid) = scene([3.0, 1.2, 0.2], Some([0.2, 0.4, 1.5]), |p, c, l| {
+        add(p, c, l, "dropShadow");
+        add(p, c, l, "outerGlow");
+        add(p, c, l, "stroke");
+        l.blend_mode = effectcraft_color::BlendMode::Screen;
+    });
+    let r = Renderer::new(&p, &NoFootage, RenderOpts::default());
+    let ctx = r.eval_ctx(cid, Tick::ZERO).unwrap();
+    let layer = &p.comp(cid).unwrap().layers[0];
+    let styled = r.styled_layer(&ctx, layer).unwrap();
+    let mut below = Image::new(200, 100);
+    below.data.fill([0.2, 0.4, 1.5, 0.8]);
+    let mut expected = below.clone();
+    for (buf, mode) in &styled.passes {
+        r.place(&ctx, layer, buf, &mut expected, *mode, 1.0);
+    }
+    r.place(&ctx, layer, &styled.body, &mut expected, layer.blend_mode, 1.0);
+    let mut actual = below.clone();
+    r.composite_styled(&ctx, layer, &styled, &mut actual, 1.0);
+    for (a, b) in actual.data.iter().zip(&expected.data) {
+        for i in 0..4 {
+            assert!(near(a[i], b[i], 1e-6), "{a:?} != {b:?}");
+        }
+    }
+    // Partial opacity still fades the whole styled stack against the original background.
+    r.composite_styled(&ctx, layer, &styled, &mut below, 0.4);
+    for (a, b) in below.data.iter().zip(&expected.data) {
+        for i in 0..4 {
+            assert!(near(a[i], [0.2, 0.4, 1.5, 0.8][i] * 0.6 + b[i] * 0.4, 1e-5));
+        }
+    }
+}
+
+#[test]
 fn drop_shadow_offset_colour_and_opacity() {
     let (p, cid) = scene([1.0; 3], Some([0.5; 3]), |p, c, l| {
         add(p, c, l, "dropShadow");

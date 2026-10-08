@@ -583,6 +583,14 @@ fn registry_badges_match_the_gpu_implementation() {
 }
 
 #[test]
+fn native_text_counter_controls_pass_pixels_through() {
+    let id = effectcraft_effects::controls::TEXT_COUNTER;
+    assert!(effectcraft_effects::find(id).unwrap().gpu);
+    assert!(crate::effects::supports(id));
+    effect_case(id, &[("value", n(1234.5)), ("decimals", n(2.0)), ("prefix", Value::Str("€".into())), ("currentTime", Value::Bool(true))]);
+}
+
+#[test]
 fn quantization_preserves_cpu_levels_and_half_step_neighbors() {
     let Some(g) = gpu() else { return };
     for levels in [255.0_f32, 32768.0] {

@@ -1,14 +1,11 @@
-<p align="center">
-  <a href="https://getartcraft.com/">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/brand/artcraft-logo-white.svg">
-      <img alt="ArtCraft" src="docs/brand/artcraft-logo.svg" width="200">
-    </picture>
-  </a>
-</p>
-
-
 <h1 align="center">EffectCraft</h1>
+
+5RoD's development fork of [storytold/effectcraft](https://github.com/storytold/effectcraft).
+Includes persistent branching edit history, 30-second recovery checkpoints, a red/white/cyan
+theme, and targeted performance and shortcut improvements. This fork is under development;
+it does not offer complete After Effects parity or load commercial Adobe plug-ins.
+See [development status and remaining acceptance work](docs/5rod/README.md),
+[the parity audit](docs/5rod/after-effects-parity.md), and [requested plug-in workflows](docs/5rod/plugin-parity.md).
 
 <p align="center">
   <b>Motion graphics and visual effects; an open-source, clean-room reimplementation of Adobe After Effects, rebuilt in pure Rust.</b>
@@ -16,7 +13,7 @@
 
 <p align="center">
   A free, open-source compositor in the spirit of After Effects: compositions, layers,
-  keyframes, 306 effects, layer styles, expressions, 3D cameras and lights, and a render queue, native on macOS,
+  keyframes, 307 registered effects, layer styles, expressions, 3D cameras and lights, and a render queue, native on macOS,
   Windows and Linux, and in the browser. Young, moving fast, and already usable.
 </p>
 
@@ -118,8 +115,7 @@ or into the Timeline, between layers and at the time you point to.
 
 ## Effects
 
-306 effects (every one of After Effects' 298, and more) across its categories, each with its parameter names, order and
-defaults: blur and sharpen, channel, color correction (Curves, Levels, Hue/Saturation, Lumetri
+307 registered effects across its categories: blur and sharpen, channel, color correction (Curves, Levels, Hue/Saturation, Lumetri
 Color…), distort (Warp, Bulge, Turbulent Displace, CC Power Pin…), generate (Fractal Noise,
 Gradient Ramp, Stroke, Write-on, Audio Spectrum…), keying, matte, noise and grain, perspective,
 **simulation** (CC Particle World, CC Rainfall, Shatter, Card Dance, Caustics, Wave World…),
@@ -129,7 +125,7 @@ controls. All nine **Layer Styles** (Drop Shadow, Inner/Outer Glow, Bevel and Em
 overlays, Stroke) with Global Light. Preview plays audio in sync, with meters and waveforms.
 
 <p align="center">
-  <img src="docs/images/effectcraft-effects.png" alt="A CC Particle World burst with Glow, and the Effect Controls panel listing the particle system's parameters" width="100%">
+  <img src="docs/images/effectcraft-effects.png" alt="Glow on the animated EffectCraft title, with its editable settings in the Effect Controls panel and the 5RoD theme" width="100%">
 </p>
 
 ## 3D
@@ -330,16 +326,13 @@ Copyright (c) 2026 ArtCraft Team and the EffectCraft contributors. Required noti
 Bundled fonts, icons, images and other assets keep their own open licenses; each one is listed
 with its author, source and license in [ATTRIBUTION.md](ATTRIBUTION.md).
 
-The ArtCraft name, wordmark and logos in [`docs/brand/`](docs/brand/) are trademarks of the
-ArtCraft Team and are not covered by this license. They may be used only unmodified, and only as
-part of this repository and EffectCraft, under [`docs/brand/LICENSE-brand.txt`](docs/brand/LICENSE-brand.txt).
-Forks and modified versions must remove them.
+The upstream ArtCraft brand marks have been removed from this modified fork, as required by
+their brand terms. The original code's copyright and licence notices remain in place.
 
 <sub>Adobe, Photoshop, Illustrator, Premiere Pro, Lightroom, Acrobat, After Effects and InDesign are trademarks or registered trademarks of Adobe Inc. in the United States and/or other countries. EffectCraft is an independent, open-source project and is not affiliated with, sponsored by or endorsed by Adobe Inc.; these names are used only to describe the workflows it is compatible with.</sub>
 
 <p align="center">
-  <a href="https://getartcraft.com/"><img alt="ArtCraft" src="docs/brand/artcraft-mark.svg" width="28"></a><br>
-  <sub>Made by the <a href="https://getartcraft.com/">ArtCraft</a> team and community.</sub>
+  <sub>Based on EffectCraft by the ArtCraft team and community. Customised for 5RoD.</sub>
 </p>
 
 ## Star history

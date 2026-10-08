@@ -899,17 +899,18 @@ fn dims_xy(dim: u32) -> (f64, f64) {
 /// misc::glow with any Glow Operation and the Arbitrary Map.
 pub(crate) fn glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let thr = ctx.params.f("threshold") as f32 / 100.0;
-    let radius = ctx.params.f("radius") * b.scale;
+    let plan = effectcraft_effects::glow_plan(ctx, b.scale);
     let intensity = ctx.params.f("intensity") as f32;
     let colors = ctx.params.e("colors");
     let (kx, ky) = dims_xy(ctx.params.e("glowDimensions"));
     if !ctx.adjustment {
-        b.pad(e, (radius * 1.5).ceil() as u32 + 2)?;
+        b.pad(e, plan.pad)?;
     }
     let mut p = Params::default();
     p.u[0] = [(colors == 1) as u32, (ctx.params.e("based") == 0) as u32, ctx.params.e("colorLooping"), 0];
     p.f[0] = [thr, ctx.params.f("colorLoops") as f32, (ctx.params.f("colorPhase") / 360.0) as f32, ctx.params.f("abMidpoint") as f32 / 100.0];
-    let bright = e.image(b.img.width, b.img.height);
+    // glow_bright and fxs_glow_map write every in-bounds texel, including transparent pixels.
+    let bright = e.scratch(b.img.width, b.img.height);
     if colors == 2 {
         // Arbitrary Map: Curves tables per channel (see effects::curves).
         let mut parts = ctx.params.s("arbitraryMap").split('|');
@@ -934,8 +935,7 @@ pub(crate) fn glow(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
         p.f[2] = ctx.params.color("colorB");
         e.pixels("glow_bright", &p, &b.img, None, &bright, None);
     }
-    let s = (radius / 2.0).max(0.5);
-    let blurred = gaussian_blur(e, &bright, s * kx, s * ky, false);
+    let blurred = gaussian_blur(e, &bright, plan.sigma * kx, plan.sigma * ky, false);
     let operation = ctx.params.e("operation");
     let glow_op = effectcraft_effects::glow_operation(ctx);
     let mut p = Params::default();

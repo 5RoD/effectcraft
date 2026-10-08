@@ -63,6 +63,8 @@ pub enum Req {
     Sample { comp: u64, layer: u64, x: Secs, y: Secs, rx: Secs, ry: Secs, post: bool, t: Secs },
     /// `thisProject`: `[bitsPerChannel, linearBlending, workingSpace]`.
     Project,
+    /// Original ordinary-text counter rig: all evaluated controls in one memoized request.
+    TextCounter { comp: u64, layer: u64, t: Secs },
 }
 
 /// Parse CSV/TSV text (RFC 4180 quoting) into rows of cells.
@@ -400,6 +402,14 @@ impl<'a> Resolver<'a> {
                     _ => Resp::Null,
                 }
             }
+            Req::TextCounter { comp, layer, t } => {
+                let l = self.layer(*comp, *layer)?;
+                let ctx = self.ctx_at(*comp, f64::from_bits(*t))?;
+                // Match ids survive layer duplication, effect renaming and reordering. The
+                // installer enforces one rig per layer; no user-controlled name is executed.
+                let g = l.effects()?.groups().find(|g| g.match_id == effectcraft_effects::controls::TEXT_COUNTER)?;
+                Resp::Str(text_counter(&ctx, l, g))
+            }
             Req::Xform { comp, layer, t } => {
                 let l = self.layer(*comp, *layer)?;
                 let ctx = self.ctx_at(*comp, f64::from_bits(*t))?;
@@ -498,4 +508,37 @@ impl<'a> Resolver<'a> {
             }
         })
     }
+}
+
+/// Format counter values without allocating a second glyph layout or repeatedly restarting JS
+/// for each control. Property reads retain the normal keyframe/expression evaluation semantics.
+fn text_counter(ctx: &EvalCtx, layer: &Layer, group: &PropGroup) -> String {
+    use effectcraft_effects::counter;
+
+    let bounded_integer = |id: &str, max: usize| {
+        let n = ctx.f(layer, group, id, 0.0);
+        if n.is_finite() { n.round().clamp(0.0, max as f64) as usize } else { 0 }
+    };
+    let mut value = ctx.f(layer, group, "value", 0.0);
+    if ctx.b(layer, group, "currentTime") {
+        let elapsed = (layer.layer_time(ctx.time).seconds() - ctx.f(layer, group, "clockStart", 0.0)) * ctx.f(layer, group, "clockRate", 1.0);
+        value += elapsed * if ctx.b(layer, group, "countDown") { -1.0 } else { 1.0 };
+    }
+    let decimals = bounded_integer("decimals", 10);
+    let formatted = if ctx.e(layer, group, "type") == 1 {
+        counter::clock(value, decimals, ctx.e(layer, group, "timeStyle"))
+    } else {
+        counter::number(value, decimals, bounded_integer("padding", 32), ctx.e(layer, group, "grouping"))
+    };
+    let prefix = ctx.group_value(layer, group, "prefix");
+    let suffix = ctx.group_value(layer, group, "suffix");
+    let prefix = match &prefix {
+        Some(Value::Str(s)) => s.as_str(),
+        _ => "",
+    };
+    let suffix = match &suffix {
+        Some(Value::Str(s)) => s.as_str(),
+        _ => "",
+    };
+    counter::affixes(formatted, prefix, suffix)
 }

@@ -5,6 +5,7 @@ use effectcraft_engine::Session;
 use effectcraft_ui_egui::EffectcraftApp;
 use egui_kittest::Harness;
 use serde_json::json;
+use std::sync::Arc;
 
 fn settle(h: &mut Harness<'_, EffectcraftApp>) {
     for _ in 0..600 {
@@ -32,13 +33,26 @@ fn viewer_draws_gpu_frames_that_match_the_cpu() {
     let mut s = Session::default();
     s.execute("file.openDemoProject", json!({})).unwrap();
     s.execute("time.set", json!({"time": 2.0})).unwrap();
-    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|_| EffectcraftApp::new(s));
+    // Match the desktop device setup. kittest's default explicitly prefers software
+    // adapters, so a successful hardware probe could otherwise exercise a different driver.
+    let mut setup = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    setup.device_descriptor = Arc::new(|adapter| {
+        eprintln!("viewer device adapter: {:?}", adapter.get_info());
+        let limits = adapter.limits();
+        eframe::wgpu::DeviceDescriptor {
+            label: Some("EffectCraft viewer test"),
+            required_limits: eframe::wgpu::Limits { max_texture_dimension_2d: limits.max_texture_dimension_2d.min(16384), ..limits },
+            ..Default::default()
+        }
+    });
+    let mut h =
+        Harness::builder().with_size(egui::vec2(1400.0, 900.0)).with_pixels_per_point(1.0).wgpu_setup(setup.into()).build_eframe(|_| EffectcraftApp::new(s));
     settle(&mut h);
     if gl && h.state().gpu_adapter().is_none() {
         eprintln!("egui-wgpu's GL device has WebGL2 limits: the viewer stays on the CPU, skipping");
         return;
     }
-    assert!(h.state().gpu_adapter().is_some(), "GPU compositor on egui-wgpu's device");
+    assert!(h.state().gpu_adapter().is_some(), "GPU compositor on egui-wgpu's device: {:?}", h.state().session.accel_note);
     eprintln!("viewer compositor adapter: {:?}", h.state().gpu_adapter());
     let gpu_px = h.state_mut().viewer_pixels().expect("read back the GPU frame");
     let gpu_shot = h.render().expect("render");

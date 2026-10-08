@@ -77,6 +77,7 @@ pub(crate) fn submenu(app: &EffectcraftApp, source: &str, shown: String) -> Stri
 }
 
 const JAPANESE: &[(&str, &str, &str)] = &[
+    ("text.nativeCounter", "Text Counter...", "テキストカウンター..."),
     ("", "EffectCraft", "EffectCraft"),
     ("app.about", "About EffectCraft...", "EffectCraftについて..."),
     ("", "Settings...", "設定..."),
@@ -487,6 +488,9 @@ const JAPANESE: &[(&str, &str, &str)] = &[
     ("effect.plugins.load", "Load Effect Plug-in...", "エフェクトプラグインを読み込み..."),
     ("", "Animation", "アニメーション"),
     ("anim.savePreset", "Save Animation Preset...", "アニメーションプリセットを保存..."),
+    ("", "Native Motion Tools", "ネイティブモーションツール"),
+    ("anim.nativeAction", "Animation Action...", "アニメーションアクション..."),
+    ("anim.nativeShake", "Seeded Shake...", "シード付きシェイク..."),
     ("anim.applyPreset", "Apply Animation Preset...", "アニメーションプリセットを適用..."),
     ("", "Recent Animation Presets", "最近使用したアニメーションプリセット"),
     ("anim.clearRecentPresets", "Clear Recent Presets", "最近使用したプリセットを消去"),

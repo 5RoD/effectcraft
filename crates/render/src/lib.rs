@@ -1646,6 +1646,15 @@ impl<'a> Renderer<'a> {
             self.composite_iso(ctx, layer, iso, canvas, opacity);
             return;
         }
+        // At full opacity the finished stack is the destination. Drawing directly avoids a
+        // full-frame copy and interpolation pass (126 MiB per styled 4K layer).
+        if opacity == 1.0 && bl.knockout == 0 && bl.channels.iter().all(|&enabled| enabled) {
+            for (b, m) in &st.passes {
+                self.place(ctx, layer, b, canvas, *m, 1.0);
+            }
+            self.place(ctx, layer, &st.body, canvas, layer.blend_mode, 1.0);
+            return;
+        }
         let mut tmp = canvas.clone();
         if bl.knockout > 0 {
             let mut k = Image::new(canvas.width, canvas.height);
