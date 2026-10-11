@@ -7,9 +7,17 @@ use egui_kittest::Harness;
 use serde_json::json;
 
 fn settle(h: &mut Harness<'_, EffectcraftApp>) {
-    for _ in 0..600 {
+    let mut quiet = 0;
+    for step in 0..600 {
         h.step();
         if h.state().frames.inflight() == 0 && h.state().frames.last_ms.lock().map(|v| *v > 0.0).unwrap_or(false) {
+            quiet += 1;
+        } else {
+            quiet = 0;
+        }
+        // Paused prefetch starts after the edit-quiet interval; the first idle instant can
+        // precede that work. Drain its nearby-frame window before sampling repaint transfers.
+        if step >= 40 && quiet >= 4 {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -42,6 +50,7 @@ fn same_adapter(name: String) -> eframe::egui_wgpu::WgpuSetup {
 #[test]
 fn viewer_draws_gpu_frames_that_match_the_cpu() {
     let Some(probe) = effectcraft_gpu::Gpu::headless() else {
+        assert!(std::env::var_os("EFFECTCRAFT_REQUIRE_GPU").is_none(), "this validation run requires a GPU adapter");
         eprintln!("no GPU adapter: skipping");
         return;
     };
@@ -51,6 +60,9 @@ fn viewer_draws_gpu_frames_that_match_the_cpu() {
     let gl = adapter.ends_with("(Gl)");
     drop(probe);
     let mut s = Session::default();
+    // Measure a settled viewer repaint, independently of idle prefetch and its effects'
+    // intermediate readbacks. The streaming cache has separate coverage.
+    s.prefs.previews.cache_frames_when_idle = false;
     s.execute("file.openDemoProject", json!({})).unwrap();
     s.execute("time.set", json!({"time": 2.0})).unwrap();
     let mut h = Harness::builder()
@@ -60,13 +72,20 @@ fn viewer_draws_gpu_frames_that_match_the_cpu() {
         .build_eframe(|_| EffectcraftApp::new(s));
     settle(&mut h);
     if gl && h.state().gpu_adapter().is_none() {
+        assert!(std::env::var_os("EFFECTCRAFT_REQUIRE_GPU").is_none(), "this validation run requires the GPU compositor");
         eprintln!("egui-wgpu's GL device has WebGL2 limits: the viewer stays on the CPU, skipping");
         return;
     }
     assert!(h.state().gpu_adapter().is_some(), "GPU compositor on egui-wgpu's device: {:?}", h.state().session.accel_note);
+    assert!(h.state().viewer_on_gpu(), "the desktop viewer must display the compositor's native texture");
     eprintln!("viewer compositor adapter: {:?}", h.state().gpu_adapter());
-    let gpu_px = h.state_mut().viewer_pixels().expect("read back the GPU frame");
+    let gpu = h.state().render_source().gpu.expect("compositor");
+    assert_eq!(h.state().frames.inflight(), 0, "the repaint fixture has no background work");
+    let before = gpu.context().transfer_stats();
+    h.run_steps(4);
     let gpu_shot = h.render().expect("render");
+    assert_eq!(gpu.context().transfer_stats().readback_bytes, before.readback_bytes, "plain viewer repaint must not read pixels back");
+    let gpu_px = h.state_mut().viewer_pixels().expect("read back the GPU frame");
     // Mercury Software Only: the same frame from the CPU.
     h.state_mut().session.execute("render.backend", json!({"backend": "cpu"})).unwrap();
     settle(&mut h);

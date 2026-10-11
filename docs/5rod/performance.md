@@ -1,5 +1,29 @@
 # Measured development-build performance
 
+## Current desktop preview and benchmark checks
+
+The 0.8 development work enables the existing native GPU texture display path for ordinary RGB
+views with identity display conversion. Channel/exposure/region and nonidentity monitor-color
+processing remain eligible for the existing converted path. A focused RTX 3050 Vulkan UI check
+requires an actual native viewer texture, verifies zero additional compositor readback bytes
+across settled plain repaints, and compares its pixels with the CPU viewer. Its fixture drains
+paused prefetch before sampling transfer counters; background effect rendering has separate
+readbacks and must not be confused with viewer-display transfers.
+
+Preview capacity uses the actual RGBA8 texture mip chain and the smaller of the RAM and GPU
+cache budgets, with 10% headroom. A 2560x1440 full-mip texture accounts for 19,660,652 bytes;
+the default 1 GiB GPU budget therefore plans at most 49 such frames, before additional memory
+used by the compositor, driver or other applications. CPU display frames use their actual pixel
+storage. This is allocation accounting and a correctness bound, not measured process VRAM or
+proof of 120 fps playback.
+
+CLI benchmarks now propagate checked render failures, require completed GPU display output,
+and bound measured sample counts. The new checks do not retroactively establish moving-video
+throughput for the historical results below. Actual timeline draw cadence, decoding, audio and
+whole-export speed still require the generated 1440p120/60 footage acceptance runs.
+
+## Historical 0.6 development measurements
+
 Measured on 2026-10-09 (local date) on the user's Windows machine: i9-10900F,
 32 GiB RAM, RTX 3050 with 8 GiB VRAM, Vulkan, driver 32.0.16.1714. Both binaries
 were built with Rust 1.99.0 for x86_64-pc-windows-msvc using normal release

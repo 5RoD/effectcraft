@@ -601,17 +601,15 @@ impl EffectcraftApp {
         }
     }
 
-    /// Keep GPU-composited viewer frames on the GPU (drawn from their texture). The browser can't
-    /// read frames back (its thread can't wait for the GPU), so there the viewer shows GPU frames
-    /// directly whenever it draws them plainly (RGB, no exposure, no region of interest); the
-    /// desktop reads them back (see [`frames::RenderSource::gpu_display`]).
+    /// Draw eligible GPU-composited viewer frames from their texture on native and web. Views
+    /// needing CPU display transforms retain the existing pixel path.
     fn gpu_display(&self) -> bool {
         let v = &self.session.state.viewer;
-        cfg!(target_arch = "wasm32")
-            && v.channel == effectcraft_engine::viewer::Channel::Rgb
+        v.channel == effectcraft_engine::viewer::Channel::Rgb
             && v.exposure == 0.0
             && self.session.state.region_of_interest.is_none()
             && self.ui.viewer.extended.is_none()
+            && effectcraft_engine::viewer::DisplayColor::of(&self.session).is_none()
     }
 
     /// The UI draws its panels and handles input such as dropped files. Until the fonts are
@@ -1371,8 +1369,8 @@ impl EffectcraftApp {
         }
     }
 
-    /// How many viewer frames of `comp` at `scale` the RAM preview budget holds (90 % of it,
-    /// at least one).
+    /// How many viewer frames of `comp` at `scale` the active display budget holds (90 % of it,
+    /// at least one), including the GPU texture's mip chain when eligible.
     /// The frames of `plan` from `cur` to its end, or as many as fit in the RAM preview, are
     /// cached: sound can play from `cur` in real time.
     fn cached_ahead(&self, plan: &effectcraft_engine::preview::PreviewPlan, series: &FrameKey, cur: i64, fit: i64) -> bool {
@@ -1381,9 +1379,12 @@ impl EffectcraftApp {
     }
 
     fn frames_that_fit(&self, comp: &effectcraft_engine::project::Comp, scale: f64) -> i64 {
-        let side = |n: u32| (n as f64 * scale).ceil().max(1.0);
-        let frame = side(comp.width) * side(comp.height) * 4.0;
-        ((self.frames.budget() as f64 * 0.9 / frame) as i64).max(1)
+        if !scale.is_finite() || scale <= 0.0 {
+            return 1;
+        }
+        let side = |n: u32| (n as f64 * scale).ceil().clamp(1.0, u32::MAX as f64) as u32;
+        let gpu = self.gpu.is_some() && self.session.project.settings.gpu_acceleration && self.gpu_display();
+        self.frames.preview_capacity(side(comp.width), side(comp.height), gpu)
     }
 
     fn frames_parallelism(&self) -> usize {
@@ -1899,6 +1900,38 @@ fn fit_window(ctx: &egui::Context) {
 fn overflows_screen(size: egui::Vec2, monitor: egui::Vec2) -> bool {
     const TASKBAR: f32 = 64.0;
     size.x > monitor.x || size.y > monitor.y - TASKBAR
+}
+
+#[cfg(test)]
+mod gpu_display_tests {
+    use super::*;
+    use effectcraft_engine::color::ColorSpace;
+    use effectcraft_engine::viewer::Channel;
+
+    #[test]
+    fn native_texture_display_keeps_channel_exposure_roi_and_color_transforms() {
+        let mut app = EffectcraftApp::new(Session::default());
+        assert!(app.gpu_display(), "the ordinary desktop view is eligible");
+        app.session.state.viewer.channel = Channel::Red;
+        assert!(!app.gpu_display());
+        app.session.state.viewer.channel = Channel::Rgb;
+        app.session.state.viewer.exposure = 1.0;
+        assert!(!app.gpu_display());
+        app.session.state.viewer.exposure = 0.0;
+        app.session.state.region_of_interest = Some([0.0, 0.0, 10.0, 10.0]);
+        assert!(!app.gpu_display());
+        app.session.state.region_of_interest = None;
+        app.ui.viewer.extended = Some([-10.0, -10.0, 100.0, 100.0]);
+        assert!(!app.gpu_display());
+        app.ui.viewer.extended = None;
+        Arc::make_mut(&mut app.session.project).settings.working_space = Some(ColorSpace::Srgb);
+        app.session.state.viewer.display_color_management = false;
+        assert!(!app.gpu_display(), "working-space display conversion must still run");
+        app.session.state.viewer.display_color_management = true;
+        assert!(app.gpu_display(), "identity sRGB conversion can use the texture directly");
+        app.session.prefs.previews.display_profile = ColorSpace::DisplayP3.id().into();
+        assert!(!app.gpu_display(), "a nonidentity monitor conversion must still run");
+    }
 }
 
 #[cfg(test)]

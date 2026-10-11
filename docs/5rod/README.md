@@ -9,6 +9,15 @@ application and Desktop shortcut have not been removed or replaced.
 - The upstream 0.8.0 integration retains this fork's journal, branching history, native tools and
   theme alongside the newer camera/3D, color, docking, relinking and bounded frame-queue work.
   Those features still need representative footage and workflow acceptance before installation.
+- Eligible desktop previews now retain the compositor's native texture through viewer drawing.
+  Channel, exposure, region and nonidentity display-color conversions retain their existing
+  processing. Cache planning includes every display mip and both RAM and GPU budgets, so
+  Cache Before Playback cannot wait for a range larger than its GPU cache can retain.
+- Grouped commands catch escaped panics inside their transaction and restore the existing
+  project, undo/redo and abandoned history. Navigating deeply branched history uses an iterative
+  walk; recursive command callbacks fail at a checked 64-level limit.
+- CLI render benchmarks reject failed frames and declined GPU display renders, instead of
+  timing placeholder pixels. Sample counts must be finite whole numbers from 1 through 10,000.
 - Native and WebAssembly plug-ins render into provisional frames. Invalid geometry, parameters,
   transfer bounds and trapped execution return checked errors; failed frames cannot become valid
   previews or replace an existing export. Time-dependent API 1 plug-ins keep their layer clock in
@@ -102,16 +111,19 @@ and the inherited [gap assessment](../gaps.md).
 ## Validation
 
 The complete repository gate is `cargo xtask ci`: formatting, clippy, workspace tests, dependency
-layering, licensed assets and WebAssembly checks. The 0.8.0 integration passed on 2026-10-11 (local date):
-2,955 tests passed, 27 explicitly optional tests were ignored, all 31 assets were attributed,
+layering, licensed assets and WebAssembly checks. The integrated preview/history increment passed
+on 2026-10-12 (local date): 2,963 tests passed, 27 explicitly optional tests were ignored, all 31 assets were attributed,
 dependency layering passed, and 32 crates passed the WebAssembly check. Formatting and native
 clippy with warnings denied also passed. The WebAssembly check reports an inherited dead-code
 warning for the native shortcut-suspension state.
 
-The run found and corrected a duplicate shortcut, missing Japanese menu entries, an assumption
-about variable-font advances, and timing-dependent test expectations. The viewer GPU test now
-uses the desktop application's device policy instead of preferring software adapters; it passes
-on the RTX 3050 Vulkan device and compares viewer output with the CPU renderer.
+Earlier integration checks corrected a duplicate shortcut, missing Japanese menu entries, an
+assumption about variable-font advances, and timing-dependent test expectations. The viewer GPU
+test uses the desktop application's device policy instead of preferring software adapters. It
+requires a native texture on the RTX 3050 Vulkan device, drains paused prefetch, checks settled
+repaints for additional compositor readbacks, and compares pixels with the CPU viewer. The new
+history regressions preserve the old project/history after a synthetic grouped-operation panic
+and exercise 10,000 nested abandoned branches without recursive repacking.
 
 Windows validation uses release optimization with Thin LTO disabled for the large test suite;
 the production build and comparable performance measurements use the repository's normal release

@@ -412,7 +412,7 @@ pub(crate) fn draw_frame(app: &mut EffectcraftApp, ctx: &egui::Context, painter:
         painter.text(comp_rect.left_top() + vec2(6.0, 6.0), Align2::LEFT_TOP, crate::i18n::tr("Snapshot"), Tokens::ui(11.0), SNAP_COLOR);
         return;
     }
-    // A GPU frame (the web viewer): drawn straight from its texture; Show Channel / exposure
+    // A GPU frame: drawn straight from its texture; Show Channel / exposure
     // read it back first (asynchronously in the browser: from the next frame on).
     let gpu = matches!((&app.viewer_shown, &app.viewer_native), (Some(s), Some(n)) if s.0 == n.0 && s.1 == n.1 && n.1.comp == cid.0);
     let rect = if gpu {

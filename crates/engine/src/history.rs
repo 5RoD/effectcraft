@@ -334,19 +334,22 @@ impl Session {
         // Every state off the new line goes into branches: a chain per first child, the other
         // children starting branches of their own.
         fn chain(a: &Arena, start: usize, parent: usize, in_new: &[bool], out: &mut Vec<Branch>) {
-            let mut steps = vec![];
-            let mut n = start;
-            let mut extra: Vec<(usize, usize)> = vec![];
-            loop {
-                steps.push((a.label[n].clone(), a.state[n].clone()));
-                let kids: Vec<usize> = a.children[n].iter().copied().filter(|&c| !in_new[c]).collect();
-                let Some((&first, rest)) = kids.split_first() else { break };
-                extra.extend(rest.iter().map(|&c| (c, n)));
-                n = first;
-            }
-            out.push(Branch { parent: a.state[parent].clone(), steps });
-            for (c, p) in extra {
-                chain(a, c, p, in_new, out);
+            let mut pending = vec![(start, parent)];
+            while let Some((start, parent)) = pending.pop() {
+                let mut steps = vec![];
+                let mut n = start;
+                let mut extra = vec![];
+                loop {
+                    steps.push((a.label[n].clone(), a.state[n].clone()));
+                    let kids: Vec<usize> = a.children[n].iter().copied().filter(|&c| !in_new[c]).collect();
+                    let Some((&first, rest)) = kids.split_first() else { break };
+                    extra.extend(rest.iter().map(|&c| (c, n)));
+                    n = first;
+                }
+                out.push(Branch { parent: a.state[parent].clone(), steps });
+                // Reverse push preserves the old depth-first creation order without making
+                // the native call stack grow with the user's abandoned history branches.
+                pending.extend(extra.into_iter().rev());
             }
         }
         let mut branches = vec![];

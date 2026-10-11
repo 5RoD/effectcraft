@@ -17,7 +17,9 @@ pub(crate) fn grouped<T>(s: &mut Session, label: &str, f: impl FnOnce(&mut Sessi
     // taken before them), then become one step on the real one.
     let saved = std::mem::take(&mut s.history);
     let before = s.project.clone();
-    let r = f(s);
+    // Catch inside the transaction, while its saved history/project still exist. An outer
+    // command guard alone would catch the panic only after these snapshots had been dropped.
+    let r = crate::guard::guarded(&format!("command group `{label}`"), || f(s));
     let changed = !s.history.undo.is_empty();
     s.history = saved;
     s.history.merge_key = None;
@@ -610,4 +612,33 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("comp.vr.extractCubemap", "Extract Cubemap...", ["Composition", "VR"], None, "{comp?, faceSize?}", has_comp, extract_cubemap),
         query!("help.systemInfo", "System Information", "{}", |s, _| Ok(system_report(s))),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Result;
+    #[test]
+    fn a_panicking_command_group_keeps_the_project_and_existing_history() {
+        use serde_json::json;
+        let mut s = crate::Session::default();
+        s.execute("comp.new", json!({"width": 4, "height": 4})).unwrap();
+        s.execute("layer.newSolid", json!({"name": "Kept"})).unwrap();
+        s.execute("layer.newSolid", json!({"name": "Alternative future"})).unwrap();
+        s.undo();
+        let before = s.project.clone();
+        let history = s.history.clone();
+        let tree = s.history_tree();
+        let r: Result<()> = crate::guard::guarded("outer command", || {
+            super::grouped(&mut s, "Broken group", |s| {
+                s.execute("layer.newSolid", json!({"name": "Partial operation"}))?;
+                panic!("synthetic error after a successful inner edit")
+            })
+        });
+        assert!(r.unwrap_err().to_string().contains("synthetic error"));
+        assert!(std::sync::Arc::ptr_eq(&before, &s.project));
+        assert!(history.same_records(&s.history), "undo, redo and abandoned states survive the unwind");
+        assert_eq!(tree, s.history_tree());
+        assert!(s.redo(), "the old future remains usable");
+        assert_eq!(s.active_comp().unwrap().layers[0].name, "Alternative future");
+    }
 }

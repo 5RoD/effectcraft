@@ -812,6 +812,8 @@ fn bench_cmd(args: &Args) -> Result<(), Failure> {
     if args.flag("--ops") {
         return bench_ops(args);
     }
+    let n = benchmark_count(args.num("--n")?.unwrap_or(10.0), "--n")?;
+    let play = args.num("--play")?.map(|n| benchmark_count(n, "--play")).transpose()?;
     let mut s = effectcraft_host::session();
     match &args.project {
         Some(p) => s.execute("file.open", json!({"path": p})),
@@ -827,9 +829,9 @@ fn bench_cmd(args: &Args) -> Result<(), Failure> {
     let cid = s.active_comp_id().ok_or_else(|| Failure::Error("no composition".into()))?;
     let t = Tick::from_seconds_f64(args.num("--time")?.unwrap_or(3.0));
     let opts = RenderOpts { scale: args.num("--scale")?.unwrap_or(1.0), ..Default::default() };
-    bench(&s, cid, t, opts, args.num("--n")?.unwrap_or(10.0).max(1.0) as usize);
-    if let Some(n) = args.num("--play")? {
-        bench_play(&s, cid, t, opts, n.max(1.0) as usize);
+    bench(&s, cid, t, opts, n)?;
+    if let Some(n) = play {
+        bench_play(&s, cid, t, opts, n)?;
     }
     Ok(())
 }
@@ -900,7 +902,7 @@ fn cpu_ms() -> f64 {
 }
 
 /// One frame: (wall ms, CPU ms, per-layer timings).
-fn render_timed(s: &Session, cid: ItemId, t: Tick, opts: RenderOpts, cache: Option<&LayerCache>) -> (f64, f64, Vec<LayerTiming>) {
+fn render_timed(s: &Session, cid: ItemId, t: Tick, opts: RenderOpts, cache: Option<&LayerCache>) -> Result<(f64, f64, Vec<LayerTiming>), Failure> {
     let prof = std::sync::Mutex::new(Vec::<LayerTiming>::new());
     let mut r = Renderer::new(&s.project, s.footage.as_ref(), opts);
     r.expr = s.expr.as_deref();
@@ -908,23 +910,31 @@ fn render_timed(s: &Session, cid: ItemId, t: Tick, opts: RenderOpts, cache: Opti
     r.profile = Some(&prof);
     let c0 = cpu_ms();
     let t0 = std::time::Instant::now();
-    let img = r.comp_frame(cid, t);
+    let img = r.comp_frame_checked(cid, t).map_err(|e| Failure::Error(e.to_string()))?;
     let ms = t0.elapsed().as_secs_f64() * 1e3;
     let cpu = cpu_ms() - c0;
     std::hint::black_box(&img);
-    (ms, cpu, prof.into_inner().unwrap_or_default())
+    Ok((ms, cpu, prof.into_inner().unwrap_or_default()))
+}
+
+/// Bound CLI-sized sample storage and work before integer conversion/allocation.
+fn benchmark_count(n: f64, flag: &str) -> Result<usize, Failure> {
+    if !n.is_finite() || !(1.0..=10_000.0).contains(&n) || n.fract() != 0.0 {
+        return usage_err(&format!("{flag}: expected a whole sample count from 1 to 10000"));
+    }
+    Ok(n as usize)
 }
 
 type LayerRow = (usize, String, Vec<f64>, Vec<f64>, Vec<(String, Vec<f64>)>);
 
 /// `frame --bench N`: render the same frame N times without the layer cache (the full cost of a
 /// frame) and print min/median frame time plus min per-layer and per-effect times.
-fn bench(s: &Session, cid: ItemId, t: Tick, opts: RenderOpts, n: usize) {
+fn bench(s: &Session, cid: ItemId, t: Tick, opts: RenderOpts, n: usize) -> Result<(), Failure> {
     let mut totals = Vec::with_capacity(n);
     let mut cpus = Vec::with_capacity(n);
     let mut per_layer: Vec<LayerRow> = Vec::new();
     for _ in 0..n {
-        let (ms, cpu, prof) = render_timed(s, cid, t, opts, None);
+        let (ms, cpu, prof) = render_timed(s, cid, t, opts, None)?;
         totals.push(ms);
         cpus.push(cpu);
         for (i, lt) in prof.into_iter().enumerate() {
@@ -955,21 +965,24 @@ fn bench(s: &Session, cid: ItemId, t: Tick, opts: RenderOpts, n: usize) {
             note!("  {:indent$}  fx {id:<30} {:8.2} ms", "", min(&v), indent = d * 2);
         }
     }
+    Ok(())
 }
 
 /// `frame --bench-play N`: render N consecutive frames from `t` as playback does, without and
 /// with the layer cache, and print per-frame times.
-fn bench_play(s: &Session, cid: ItemId, t: Tick, opts: RenderOpts, n: usize) {
-    let Some(comp) = s.project.comp(cid) else { return };
+fn bench_play(s: &Session, cid: ItemId, t: Tick, opts: RenderOpts, n: usize) -> Result<(), Failure> {
+    let comp = s.project.comp(cid).ok_or_else(|| Failure::Error("no composition".into()))?;
     let f0 = comp.frame_rate.frame_at(t);
     let cache = LayerCache::default();
     for (label, c) in [("no cache", None), ("layer cache", Some(&cache))] {
-        let runs: Vec<(f64, f64)> = (0..n as i64)
+        let runs: Vec<(f64, f64)> = (0..n)
             .map(|i| {
-                let (ms, cpu, _) = render_timed(s, cid, comp.frame_rate.tick_of(f0 + i), opts, c);
-                (ms, cpu)
+                let offset = i64::try_from(i).map_err(|_| Failure::Usage("--play: sample count exceeds timeline range".into()))?;
+                let frame = f0.checked_add(offset).ok_or_else(|| Failure::Usage("--play: frame exceeds timeline range".into()))?;
+                let (ms, cpu, _) = render_timed(s, cid, comp.frame_rate.tick_of(frame), opts, c)?;
+                Ok((ms, cpu))
             })
-            .collect();
+            .collect::<Result<_, Failure>>()?;
         let mut v: Vec<f64> = runs.iter().map(|r| r.0).collect();
         let mean = v.iter().sum::<f64>() / n as f64;
         let cpu = runs.iter().map(|r| r.1).sum::<f64>() / n as f64;
@@ -982,19 +995,20 @@ fn bench_play(s: &Session, cid: ItemId, t: Tick, opts: RenderOpts, n: usize) {
     }
     let st = cache.stats();
     note!("  layer cache: {} hits, {} misses, {} entries, {:.1} MB", st.hits, st.misses, st.entries, st.bytes as f64 / 1e6);
+    Ok(())
 }
 
 /// Median wall time (ms) of `n` runs of `f` after one warm-up run.
-fn time_ms(n: usize, mut f: impl FnMut()) -> f64 {
-    f();
+fn time_ms(n: usize, mut f: impl FnMut() -> Result<(), Failure>) -> Result<f64, Failure> {
+    f()?;
     let mut v: Vec<f64> = (0..n)
         .map(|_| {
             let t0 = std::time::Instant::now();
-            f();
-            t0.elapsed().as_secs_f64() * 1e3
+            f()?;
+            Ok(t0.elapsed().as_secs_f64() * 1e3)
         })
-        .collect();
-    median(&mut v)
+        .collect::<Result<_, Failure>>()?;
+    Ok(median(&mut v))
 }
 
 /// `bench --gpu`'s adjustment-layer comp: a copy of the first comp with a full-frame adjustment
@@ -1145,7 +1159,7 @@ fn adv3d_bench_comp(p: &mut effectcraft_engine::project::Project) -> Option<Item
 fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
     use effectcraft_render::Backend;
     let gpu = effectcraft_gpu::Gpu::try_headless().map_err(|e| Failure::Error(format!("--gpu: no usable GPU adapter ({e})")))?;
-    let n = args.num("--n")?.unwrap_or(10.0).max(1.0) as usize;
+    let n = benchmark_count(args.num("--n")?.unwrap_or(10.0), "--n")?;
     // Every comp, plus an adjustment-layer comp built for the benchmark (the main comp under a
     // full-frame adjustment layer with a GPU effect stack) and an Advanced 3D comp (`--adv3d`:
     // that one only).
@@ -1188,47 +1202,69 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
                 r.expr = s.expr.as_deref();
                 r.cache = cache;
                 r.accel = Some(&gpu);
-                r.comp_frame(cid, t)
+                let checked = if backend == Backend::Cpu {
+                    r.comp_frame_checked(cid, t)
+                } else {
+                    gpu.within_memory(|| r.comp_frame_checked(cid, t)).map_err(Failure::Error)?
+                };
+                checked.map_err(|e| Failure::Error(e.to_string()))
             };
             let cpu_cold = time_ms(n, || {
-                std::hint::black_box(mk(Backend::Cpu, None));
-            });
+                std::hint::black_box(mk(Backend::Cpu, None)?);
+                Ok(())
+            })?;
             let gpu_cold = time_ms(n, || {
-                std::hint::black_box(mk(Backend::Gpu, None));
-            });
+                std::hint::black_box(mk(Backend::Gpu, None)?);
+                Ok(())
+            })?;
             let cache = LayerCache::default();
             let cpu_warm = time_ms(n, || {
-                std::hint::black_box(mk(Backend::Cpu, Some(&cache)));
-            });
+                std::hint::black_box(mk(Backend::Cpu, Some(&cache))?);
+                Ok(())
+            })?;
             let gcache = LayerCache::default();
             // Traffic in steady state: after the frame that fills the layer cache.
-            std::hint::black_box(mk(Backend::Gpu, Some(&gcache)));
+            std::hint::black_box(mk(Backend::Gpu, Some(&gcache))?);
             let t0 = gpu.context().transfer_stats();
             let gpu_warm = time_ms(n, || {
-                std::hint::black_box(mk(Backend::Gpu, Some(&gcache)));
-            });
+                std::hint::black_box(mk(Backend::Gpu, Some(&gcache))?);
+                Ok(())
+            })?;
             let t1 = gpu.context().transfer_stats();
             let per = |b: u64| b as f64 / (n + 1) as f64 / (1u64 << 20) as f64;
             let traffic = format!("{:.1}/{:.1}", per(t1.upload_bytes - t0.upload_bytes), per(t1.readback_bytes - t0.readback_bytes));
             // Auto: warm-up frames on both sides, then the measured choice.
             for _ in 0..2 * effectcraft_render::AutoPick::WARMUP {
-                std::hint::black_box(mk(Backend::Auto, Some(&gcache)));
+                std::hint::black_box(mk(Backend::Auto, Some(&gcache))?);
             }
             let auto = time_ms(n, || {
-                std::hint::black_box(mk(Backend::Auto, Some(&gcache)));
-            });
+                std::hint::black_box(mk(Backend::Auto, Some(&gcache))?);
+                Ok(())
+            })?;
             let view = time_ms(n, || {
+                let diagnostics = effectcraft_render::FrameDiagnostics::default();
                 let mut r = Renderer::new(project, s.footage.as_ref(), RenderOpts { scale, backend: Backend::Gpu, ..Default::default() });
+                r.diagnostics = Some(&diagnostics);
                 r.expr = s.expr.as_deref();
                 r.cache = Some(&gcache);
                 r.accel = Some(&gpu);
-                std::hint::black_box(gpu.render_display(&r, cid, t));
+                let frame = gpu.within_memory(|| gpu.render_display(&r, cid, t)).map_err(Failure::Error)?;
+                let frame = diagnostics
+                    .result(frame)
+                    .map_err(|e| Failure::Error(e.to_string()))?
+                    .ok_or_else(|| Failure::Error(format!("{name}: the GPU declined the viewer frame")))?;
+                std::hint::black_box(frame);
                 gpu.wait();
-            });
+                gpu.context().check_health().map_err(Failure::Error)?;
+                Ok(())
+            })?;
             let size = format!("{}x{}", (comp.width as f64 * scale).round(), (comp.height as f64 * scale).round());
             // Agreement: share of pixels where the GPU frame differs from the CPU reference by
             // more than 1/255 on any channel.
-            let (a, b) = (mk(Backend::Cpu, Some(&cache)), mk(Backend::Gpu, Some(&gcache)));
+            let (a, b) = (mk(Backend::Cpu, Some(&cache))?, mk(Backend::Gpu, Some(&gcache))?);
+            if (a.width, a.height, a.data.len()) != (b.width, b.height, b.data.len()) {
+                return Err(Failure::Error(format!("{name}: GPU/CPU frame dimensions differ")));
+            }
             let off = a
                 .data
                 .iter()
@@ -1253,6 +1289,42 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn benchmark_sample_counts_reject_nonfinite_fractional_and_unbounded_work() {
+        assert!(matches!(benchmark_count(1.0, "--n"), Ok(1)));
+        assert!(matches!(benchmark_count(10_000.0, "--play"), Ok(10_000)));
+        for n in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0, 1.5, 10_001.0, 1e100] {
+            assert!(matches!(benchmark_count(n, "--n"), Err(Failure::Usage(_))), "{n}");
+        }
+    }
+
+    #[test]
+    fn render_timing_rejects_failed_frames_instead_of_timing_a_fallback_pixel() {
+        let mut s = Session::default();
+        let comp = s.execute("comp.new", json!({"width": 4, "height": 4, "duration": 1})).unwrap()["comp"].as_u64().unwrap();
+        let opts = RenderOpts { scale: f64::NAN, ..Default::default() };
+        assert!(matches!(render_timed(&s, ItemId(comp), Tick::ZERO, opts, None), Err(Failure::Error(_))));
+        assert!(render_timed(&s, ItemId(comp), Tick::ZERO, RenderOpts::default(), None).is_ok());
+    }
+
+    #[test]
+    fn benchmark_timing_stops_on_warmup_and_sample_errors() {
+        let mut calls = 0;
+        let result = time_ms(10, || {
+            calls += 1;
+            Err(Failure::Error("warmup failed".into()))
+        });
+        assert!(matches!(result, Err(Failure::Error(e)) if e == "warmup failed"));
+        assert_eq!(calls, 1);
+        calls = 0;
+        let result = time_ms(10, || {
+            calls += 1;
+            if calls == 3 { Err(Failure::Error("sample failed".into())) } else { Ok(()) }
+        });
+        assert!(matches!(result, Err(Failure::Error(e)) if e == "sample failed"));
+        assert_eq!(calls, 3);
+    }
 
     fn parse(args: &[&str]) -> Result<Args, String> {
         Args::parse(args.iter().map(|a| a.to_string()).collect())

@@ -62,4 +62,23 @@ mod tests {
         .unwrap();
         assert_eq!(s.project.next_id, next + 1);
     }
+
+    #[test]
+    fn nested_command_limit_keeps_the_document_and_does_not_wrap_the_journal_counter() {
+        use serde_json::json;
+        let mut s = crate::Session::default();
+        let project = s.project.clone();
+        for depth in [64, usize::MAX] {
+            s.recovery_journal.depth = depth;
+            let error = s.execute("comp.new", json!({"width": 4, "height": 4})).unwrap_err().to_string();
+            assert!(error.contains("nesting limit"), "{error}");
+            assert_eq!(s.recovery_journal.depth, depth);
+            assert!(std::sync::Arc::ptr_eq(&project, &s.project));
+            assert!(s.history.undo.is_empty());
+        }
+        s.recovery_journal.depth = 0;
+        s.execute("comp.new", json!({"width": 4, "height": 4})).unwrap();
+        assert_eq!(s.recovery_journal.depth, 0);
+        assert!(s.active_comp().is_some());
+    }
 }

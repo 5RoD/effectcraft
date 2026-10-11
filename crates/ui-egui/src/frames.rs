@@ -58,11 +58,29 @@ impl FrameImage {
         }
     }
     fn bytes(&self) -> usize {
-        self.size()[0] * self.size()[1] * 4
+        match self {
+            FrameImage::Cpu(c) => c.pixels.len().saturating_mul(std::mem::size_of::<egui::Color32>()),
+            FrameImage::Gpu(f) => rgba8_texture_bytes(f.texture.width(), f.texture.height(), f.texture.mip_level_count()),
+        }
     }
     fn is_gpu(&self) -> bool {
         matches!(self, FrameImage::Gpu(_))
     }
+}
+
+/// Storage of RGBA8 texture levels, including narrow/non-power-of-two mip chains. Saturation
+/// keeps malformed dimensions safe on both native and wasm32; no allocation is performed here.
+fn rgba8_texture_bytes(mut width: u32, mut height: u32, levels: u32) -> usize {
+    if width == 0 || height == 0 {
+        return 0;
+    }
+    let mut bytes = 0usize;
+    for _ in 0..levels.min(u32::BITS) {
+        bytes = bytes.saturating_add((width as usize).saturating_mul(height as usize).saturating_mul(4));
+        width = (width / 2).max(1);
+        height = (height / 2).max(1);
+    }
+    bytes
 }
 
 /// A viewer frame: its comp's content, the frame, scale, view and render options. `revision` is
@@ -128,9 +146,9 @@ impl Cache {
         } else {
             self.order.push_back(k);
         }
-        self.bytes += sz;
+        self.bytes = self.bytes.saturating_add(sz);
         if gpu {
-            self.gpu_bytes += sz;
+            self.gpu_bytes = self.gpu_bytes.saturating_add(sz);
         }
         while self.bytes > self.budget {
             let Some(old) = self.order.pop_front() else { break };
@@ -153,9 +171,9 @@ impl Cache {
         self.evict_gpu();
     }
     fn forget(&mut self, img: &FrameImage) {
-        self.bytes -= img.bytes();
+        self.bytes = self.bytes.saturating_sub(img.bytes());
         if img.is_gpu() {
-            self.gpu_bytes -= img.bytes();
+            self.gpu_bytes = self.gpu_bytes.saturating_sub(img.bytes());
         }
     }
     fn remove(&mut self, k: &FrameKey) {
@@ -196,10 +214,8 @@ pub struct RenderSource {
     pub layer_cache: Arc<LayerCache>,
     /// GPU compositor on the viewer's device (Mercury GPU Acceleration), if available.
     pub gpu: Option<Gpu>,
-    /// Keep GPU frames on the GPU for the viewer (native egui-wgpu textures). Off on the
-    /// desktop: Show Channel / exposure / region-of-interest drawing read the CPU frame texture,
-    /// so GPU frames are read back (the compositing still runs on the GPU). On in the browser
-    /// while the viewer draws plainly, because there frames can't be read back synchronously
+    /// Keep eligible GPU frames on the GPU for the viewer's native egui-wgpu textures.
+    /// Channel, exposure, color conversion and region-of-interest views use CPU display pixels
     /// (`EffectcraftApp::gpu_display`).
     pub gpu_display: bool,
     /// The persistent disk cache, when enabled.
@@ -694,6 +710,17 @@ impl Frames {
 
     pub fn budget(&self) -> usize {
         self.cache.lock().map(|c| c.budget).unwrap_or(0)
+    }
+
+    /// Frames that fit in the active display cache, with 10% headroom. A GPU preview is bounded
+    /// by both budgets and includes every display mip; otherwise cache-before-playback could
+    /// wait forever for a range larger than the cache can retain.
+    pub(crate) fn preview_capacity(&self, width: u32, height: u32, gpu: bool) -> i64 {
+        let levels = if gpu { u32::BITS - width.max(height).max(1).leading_zeros() } else { 1 };
+        let bytes = rgba8_texture_bytes(width, height, levels).max(1);
+        let c = self.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let budget = if gpu { c.budget.min(c.gpu_budget) } else { c.budget };
+        i64::try_from(budget.saturating_sub(budget / 10) / bytes).unwrap_or(i64::MAX).max(1)
     }
 
     /// A terminal render failure for this exact content/time/options. Edits naturally select
@@ -1221,6 +1248,25 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_capacity_includes_mips_and_the_gpu_budget() {
+        let f = Frames::default();
+        assert_eq!(rgba8_texture_bytes(2560, 1440, 12), 19_660_652);
+        assert_eq!(rgba8_texture_bytes(1, 8, 4), 60);
+        assert_eq!(rgba8_texture_bytes(5, 3, 3), 72);
+        assert_eq!(rgba8_texture_bytes(0, 10, 32), 0);
+        assert!(rgba8_texture_bytes(u32::MAX, u32::MAX, u32::MAX) >= 4);
+        assert_eq!(f.preview_capacity(2560, 1440, true), 49);
+        assert_eq!(f.preview_capacity(2560, 1440, false), 196);
+        f.cache.lock().unwrap().gpu_out_of_memory();
+        assert_eq!(f.preview_capacity(2560, 1440, true), 24, "OOM backoff also changes the playback wait range");
+        f.set_budget(120);
+        assert_eq!(f.preview_capacity(1, 8, true), 1);
+        assert_eq!(f.preview_capacity(1, 8, false), 3);
+        f.set_budget(0);
+        assert_eq!(f.preview_capacity(u32::MAX, u32::MAX, true), 1);
+    }
 
     /// Frames larger than the texture limit are averaged down by a whole factor (#201: an
     /// 11000×2200 comp at Full resolution against an 8192 limit).

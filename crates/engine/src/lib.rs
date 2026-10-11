@@ -602,6 +602,11 @@ impl Session {
 
     /// Run a command by id.
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value> {
+        // Indirect script/command callbacks must fail before exhausting the call stack or
+        // wrapping the outer-command journal counter. Ordinary grouped commands stay shallow.
+        if self.recovery_journal.depth >= 64 {
+            return Err(EngineError::Other(format!("command `{id}` exceeds the 64-level nesting limit; reduce recursive command or script calls")));
+        }
         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         if let Err(why) = (spec.enabled)(self) {
             // Explicit targets (agents, scripts) don't need a UI selection.
@@ -614,9 +619,9 @@ impl Session {
             }
         }
         // Last-resort guard: a panicking command reports an error instead of crashing the app.
-        self.recovery_journal.depth += 1;
+        self.recovery_journal.depth = self.recovery_journal.depth.saturating_add(1);
         let result = guard::guarded(&format!("command `{id}`"), || (spec.run)(self, &params));
-        self.recovery_journal.depth -= 1;
+        self.recovery_journal.depth = self.recovery_journal.depth.saturating_sub(1);
         self.commit_edit_recovery();
         let r = result?;
         self.learn_observe(id, &params);

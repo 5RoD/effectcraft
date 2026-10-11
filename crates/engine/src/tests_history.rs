@@ -26,6 +26,31 @@ fn index_of(states: &[Value], label: &str, nth: usize) -> u64 {
 }
 
 #[test]
+fn deeply_nested_abandoned_branches_keep_their_order_without_call_stack_recursion() {
+    let root = Arc::new(Project::default());
+    let current = Arc::new(Project { next_id: 30_000, ..Default::default() });
+    let mut history = History { undo: vec![("Working line".into(), root.clone())], ..Default::default() };
+    let mut parent = root.clone();
+    for i in 0..10_000u64 {
+        let leaf = Arc::new(Project { next_id: i * 2 + 1, ..Default::default() });
+        let side = Arc::new(Project { next_id: i * 2 + 2, ..Default::default() });
+        history.branches.push(Branch { parent: parent.clone(), steps: vec![(format!("Leaf {i}"), leaf)] });
+        history.branches.push(Branch { parent, steps: vec![(format!("Side {i}"), side.clone())] });
+        parent = side;
+    }
+    let mut s = Session { project: current, history, ..Default::default() };
+    let before = s.history_tree();
+    assert_eq!(before.len(), 20_002);
+    assert!(s.goto_history(&crate::history::state_id(&root)));
+    assert!(Arc::ptr_eq(&s.project, &root));
+    let after = s.history_tree();
+    for (a, b) in before.iter().zip(&after) {
+        assert_eq!((&a.id, &a.label, a.parent, a.depth), (&b.id, &b.label, b.parent, b.depth));
+    }
+    assert_eq!(before.len(), after.len(), "every abandoned state remains navigable");
+}
+
+#[test]
 fn saved_history_restores_branches_redo_and_all_edits() {
     use std::sync::Arc;
     let mut s = Session::default();
