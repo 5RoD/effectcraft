@@ -78,13 +78,7 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let sizes: Vec<_> = {
         let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
-        ids.iter()
-            .filter_map(|id| comp.layer(*id))
-            .map(|l| {
-                let (w, h) = effectcraft_render::source_size(&s.project, l);
-                (l.id, if w == 0 { [comp.width as f64, comp.height as f64] } else { [w as f64, h as f64] })
-            })
-            .collect()
+        ids.iter().filter_map(|id| comp.layer(*id)).map(|l| (l.id, effectcraft_render::effect_bounds(&s.project, comp, l).0)).collect()
     };
     let uids = s.edit(&format!("Apply {}", spec.name), None, |proj, st| {
         let mut out = vec![];
@@ -130,6 +124,19 @@ fn find_fx(s: &Session, p: &Value, cmd: &str) -> Result<(effectcraft_project::It
     }
     .ok_or_else(|| bad(cmd, "no such effect"))?;
     Ok((cid, lid, g.uid))
+}
+
+/// `effect.warning`: what Effect Controls warns about an effect (a custom OCIO config it can't
+/// read, or transforms it passes through), `null` when it renders as asked.
+fn warning(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "effect.warning";
+    let (cid, lid, uid) = find_fx(s, p, cmd)?;
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let layer = comp.layer(lid).ok_or(EngineError::NoComp)?;
+    let g = layer.effects().and_then(|fx| fx.groups().find(|g| g.uid == uid)).ok_or_else(|| bad(cmd, "no such effect"))?;
+    let t = super::time_p(s, p, Some(comp));
+    let ctx = effectcraft_render::EvalCtx { project: &s.project, comp_id: cid, comp, time: t, expr: s.expr.as_deref(), footage: None };
+    Ok(json!({"effect": uid, "warning": effectcraft_effects::warning(g, &mut |pr| ctx.value(layer, pr))}))
 }
 
 /// A colour parameter's eyedropper on a keyer (Effect Controls): the colour of the effect's input
@@ -368,8 +375,7 @@ fn reset(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, lid, uid) = find_fx(s, p, "effect.reset")?;
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     let layer = comp.layer(lid).ok_or(EngineError::NoComp)?;
-    let (w, h) = effectcraft_render::source_size(&s.project, layer);
-    let size = if w == 0 { [comp.width as f64, comp.height as f64] } else { [w as f64, h as f64] };
+    let size = effectcraft_render::effect_bounds(&s.project, comp, layer).0;
     let lt = layer.layer_time(s.time());
     let g = layer.effects().and_then(|fx| fx.groups().find(|g| g.uid == uid)).ok_or_else(|| bad("effect.reset", "gone"))?;
     let spec = match &g.kind {
@@ -381,7 +387,8 @@ fn reset(s: &mut Session, p: &Value) -> Result<Value> {
     s.edit(&format!("Reset {name}"), None, |proj, _| {
         let g = layer_mut(proj, cid, lid)?.props.find_group_mut(uid).ok_or_else(|| bad("effect.reset", "gone"))?;
         for ps in &spec.params {
-            if let Some(pr) = g.get_mut(ps.id) {
+            // (`group/param` ids live in twirl-down groups.)
+            if let Some(pr) = g.prop_mut(ps.id) {
                 pr.set_value_at(lt, effectcraft_effects::default_value(ps, size));
             }
         }
@@ -409,21 +416,65 @@ fn list(_: &mut Session, p: &Value) -> Result<Value> {
             filter.as_ref().is_none_or(|f| effectcraft_effects::name_matches(e, f) || e.id.contains(f.as_str()) || e.category.to_ascii_lowercase().contains(f))
         })
         .map(|e| {
-            json!({"id": e.id, "name": e.name, "category": e.category, "gpu": e.gpu, "float": e.float, "params": e.params.iter().map(|p| json!({"id": p.id, "name": p.name, "default": p.default.to_json()})).collect::<Vec<_>>()})
+            json!({"id": e.id, "name": e.name, "category": e.category, "gpu": e.gpu, "float": e.float, "params": e.params.iter().map(|p| {
+                let mut out = json!({"id": p.id, "name": p.name, "type": p.default.kind_name(), "default": p.default.to_json()});
+                match &p.ui {
+                    effectcraft_project::ParamUi::Popup { options } => {
+                        // Engine/MCP popup values are zero-based; JSX exposes one-based values.
+                        out["options"] = json!(options.iter().enumerate().map(|(value, label)| json!({"value": value, "label": label})).collect::<Vec<_>>());
+                    }
+                    effectcraft_project::ParamUi::Slider { min, max, slider_min, slider_max, decimals } => {
+                        out["min"] = json!(min);
+                        out["max"] = json!(max);
+                        out["sliderMin"] = json!(slider_min);
+                        out["sliderMax"] = json!(slider_max);
+                        out["decimals"] = json!(decimals);
+                    }
+                    _ => {}
+                }
+                out
+            }).collect::<Vec<_>>()})
         })
         .collect();
     Ok(json!(v))
 }
 
+impl Session {
+    /// The named channels of layer `lid` in the active comp at the current time: its
+    /// multi-layer OpenEXR footage's layers and channels (`diffuse.R`, `depth.Z`, …), which
+    /// EXtractoR and the 3D Channel effects read. `None` for other layers.
+    pub fn layer_channels(&self, lid: LayerId) -> Option<std::sync::Arc<effectcraft_raster::AuxChannels>> {
+        let layer = self.active_comp()?.layer(lid)?;
+        let effectcraft_project::LayerSource::Footage { item } = layer.source else { return None };
+        let effectcraft_project::ItemKind::Footage(f) = &self.project.item(item)?.kind else { return None };
+        self.footage.aux(item, f, layer.layer_time(self.time()))
+    }
+}
+
+/// `layer.channels`: the layers and channels of a layer's multi-layer OpenEXR footage, and
+/// what each layer shows in red, green, blue and alpha (EXtractoR's popups).
+fn channels(s: &mut Session, p: &Value) -> Result<Value> {
+    let (_, lid) = super::layer_p(s, p, "layer.channels")?;
+    let Some(aux) = s.layer_channels(lid) else { return Ok(json!({"channels": [], "layers": []})) };
+    let layers: Vec<Value> = aux.layers().into_iter().map(|l| json!({"name": l, "rgba": aux.layer_rgba(l)})).collect();
+    Ok(json!({"channels": aux.names(), "layers": layers}))
+}
+
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!("effect.apply", "Apply Effect", [], None, "{effect: id|name (e.g. Gaussian Blur), layers?}", has_layers, apply),
+        crate::query!(
+            "layer.channels",
+            "Layer Channels",
+            "{layer?} → {channels: [name], layers: [{name, rgba: [r, g, b, a channel]}]} — a multi-layer OpenEXR layer's channels (EXtractoR's red / green / blue / alpha take these names)",
+            channels
+        ),
         cmd!(
             "effect.pickColor",
             "Pick Effect Colour",
             [],
             None,
-            "{layer?, effect?: index|uid|name, param: id (e.g. screenColour) | prop: uid, x, y (layer px), average?: bool (5×5), time?} — the colour of the effect's input there",
+            "{layer?, effect?: index|uid|name, param: id (e.g. screenColour) | prop: uid, x, y (effect space), average?: bool (5×5), time?} — the colour of the effect's input there",
             has_layers,
             pick_color
         ),
@@ -436,7 +487,18 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("effect.copy", "Copy Effects", [], None, "{layer?, effect? | effects?: [uid|name|index]} (default: the selected effects)", has_layers, copy),
         cmd!("effect.paste", "Paste Effects", [], None, "{layers?} — adds the copied effects to the layers", has_layers, paste),
         cmd!("effect.reset", "Reset Effect", [], None, "{layer?, effect}", has_layers, reset),
-        crate::query!("effect.list", "List Effects", "{filter?}", list),
+        crate::query!(
+            "effect.list",
+            "List Effects",
+            "{filter?} → [{params: [{id, name, type, default, options?, min?, max?, sliderMin?, sliderMax?, decimals?}]}]; popup indices are zero-based (JSX uses one-based values)",
+            list
+        ),
+        crate::query!(
+            "effect.warning",
+            "Effect Warning",
+            "{layer?, effect?: index|uid|name (default: the selected effect), time?} → {effect, warning: string|null} — what Effect Controls warns about (an OCIO config it can't read, transforms it passes through)",
+            warning
+        ),
         crate::query!(
             "effect.plugins.list",
             "List Effect Plug-ins",
@@ -453,4 +515,37 @@ pub fn specs() -> Vec<CommandSpec> {
             plugins_load
         ),
     ]
+}
+
+#[cfg(test)]
+mod list_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn effect_list_exposes_popup_labels_and_numeric_slider_limits() {
+        let mut s = Session::default();
+        let menus = s.execute("effect.list", json!({"filter": "ec.control.dropdown"})).unwrap();
+        assert_eq!(menus.as_array().map(Vec::len), Some(1));
+        let menu = &menus[0]["params"][0];
+        assert_eq!(menu["type"], "enum");
+        assert_eq!(menu["default"], 0);
+        assert_eq!(
+            menu["options"],
+            json!([
+                {"value": 0, "label": "Item 1"},
+                {"value": 1, "label": "Item 2"},
+                {"value": 2, "label": "Item 3"}
+            ])
+        );
+        let sliders = s.execute("effect.list", json!({"filter": "ec.control.slider"})).unwrap();
+        assert_eq!(sliders.as_array().map(Vec::len), Some(1));
+        let slider = &sliders[0]["params"][0];
+        assert_eq!(slider["type"], "scalar");
+        assert_eq!(slider["min"], -1_000_000.0);
+        assert_eq!(slider["max"], 1_000_000.0);
+        assert_eq!(slider["sliderMin"], 0.0);
+        assert_eq!(slider["sliderMax"], 100.0);
+        assert_eq!(slider["decimals"], 2);
+        assert!(slider["options"].is_null());
+    }
 }

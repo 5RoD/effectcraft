@@ -15,6 +15,9 @@
 //! For each render the host asks `ec_alloc` for one buffer holding the parameters (`nparams`
 //! little-endian `f64`s) followed by the pixels (`width × height × 4` little-endian `f32`s,
 //! premultiplied RGBA, row-major), calls `ec_render`, and reads the pixels back.
+//! Inputs and bounded transfer arithmetic are checked before guest invocation. Pixels are
+//! copied back only on success; traps, error codes, bad allocations and fuel exhaustion return
+//! checked errors to preview/export, and failed instances are discarded. The ABI remains v1.
 //!
 //! Modules run in the [wasmi](https://github.com/wasmi-labs/wasmi) interpreter (pure Rust,
 //! MIT/Apache-2.0) with deterministic floats, no imports (no files, network or clock) and a

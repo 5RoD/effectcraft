@@ -110,3 +110,86 @@ fn checked_bloom_export_late_failure_preserves_destination_and_has_no_finished_s
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn checked_registered_plugin_late_panic_fails_export_and_later_valid_output_recovers() {
+    use effectcraft_effects::plugin::{EffectPlugin, PluginFrame, PluginManifest, PluginParams, register_plugin};
+    struct Fault(PluginManifest);
+    impl EffectPlugin for Fault {
+        fn manifest(&self) -> &PluginManifest {
+            &self.0
+        }
+        fn render(&self, frame: &mut PluginFrame, _params: &PluginParams, time: f64) -> Result<(), String> {
+            if time >= 1.0 {
+                frame.pixels[0] = [0.0; 4];
+                panic!("synthetic late export plug-in panic");
+            }
+            Ok(())
+        }
+    }
+    let spec = register_plugin(std::sync::Arc::new(Fault(PluginManifest {
+        api: 1,
+        id: "org.test.export-checked-plugin".into(),
+        name: "Checked Export Plug-in".into(),
+        category: "Test".into(),
+        version: String::new(),
+        author: String::new(),
+        description: String::new(),
+        params: Vec::new(),
+    })))
+    .unwrap();
+    let mut project = Project::default();
+    let mut comp = Comp::new(8, 8, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+    let solid = project.add_item("Emitter", Label::Red, None, ItemKind::Solid(Solid { color: [1.0; 3], width: 8, height: 8, pixel_aspect: 1.0 }));
+    let mut layer = build::layer(&mut project, &comp, "Emitter", LayerSource::Solid { item: solid }, (8, 8), None);
+    let effect = effectcraft_effects::instantiate(spec, &mut build::Ids(&mut project.next_id), spec.name, [8.0; 2]);
+    layer.props.sub_mut("effects").unwrap().children.push(effect.into());
+    comp.layers.push(layer);
+    let cid = project.add_item("Plug-in export", Label::Sandstone, None, ItemKind::Comp(comp.into()));
+    let before = project.clone();
+    let settings = RenderSettings { time_span: TimeSpan::Custom { start: Tick::ZERO, end: Tick::from_seconds_f64(2.0) }, ..Default::default() };
+    let output = OutputModule::for_format(OutputFormat::Gif);
+    let files = std::sync::Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
+    let received = files.clone();
+    let sink = move |path: &str, data: Vec<u8>| received.lock().unwrap().push((path.to_string(), data));
+    let mut job = Job {
+        project: &project,
+        footage: &NoFootage,
+        expr: None,
+        accel: None,
+        comp: cid,
+        settings: &settings,
+        output: &output,
+        path: "plugin.gif",
+        sink: Some(&sink),
+        nested_switches: true,
+        options: JobOptions::default(),
+    };
+    let mut rendered = 0;
+    let error = export(&job, &mut |progress| {
+        rendered = rendered.max(progress.done);
+        true
+    })
+    .unwrap_err();
+    assert!(matches!(error, ExportError::Render(_)));
+    assert!(error.to_string().contains("Rust plug-in panicked"));
+    assert!(error.to_string().contains(spec.id));
+    assert!(rendered > 0, "a completed batch precedes the failed frame");
+    assert!(files.lock().unwrap().iter().all(|(name, _)| name.ends_with(".txt")), "no finished movie reaches the sink");
+    let directory = std::env::temp_dir().join(format!("ec-checked-plugin-export-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let destination = directory.join("completed.gif");
+    std::fs::write(&destination, b"previous successful export").unwrap();
+    job.path = destination.to_str().unwrap();
+    job.sink = None;
+    assert!(matches!(export(&job, &mut |_| true), Err(ExportError::Render(_))));
+    assert_eq!(std::fs::read(&destination).unwrap(), b"previous successful export");
+    assert_eq!(project, before);
+    let valid_settings = RenderSettings { time_span: TimeSpan::Custom { start: Tick::ZERO, end: Tick::from_seconds_f64(0.5) }, ..Default::default() };
+    job.settings = &valid_settings;
+    job.sink = Some(&sink);
+    job.path = "repaired.gif";
+    export(&job, &mut |_| true).unwrap();
+    assert!(files.lock().unwrap().iter().any(|(name, data)| name == "repaired.gif" && data.starts_with(b"GIF")));
+    std::fs::remove_dir_all(directory).unwrap();
+}

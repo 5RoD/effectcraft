@@ -734,7 +734,7 @@ fn decode_layer(p: &[u8]) -> Option<Buf> {
 /// Bump when rendering changes in a way that makes old disk entries wrong.
 // Fork evaluation includes Native Text Counter and checked Native Bloom semantics. Keep the
 // disk container format at v1; existing upstream pixels are misses under this renderer salt.
-const RENDER_VERSION: &str = "effectcraft-5rod-render-3";
+const RENDER_VERSION: &str = "effectcraft-5rod-render-4";
 
 fn hash_debug(h: &mut Hash128, v: &impl std::fmt::Debug) {
     h.write(format!("{v:?}").as_bytes());
@@ -1034,7 +1034,7 @@ mod render_version_tests {
         let comp =
             project.add_item("Cache salt", Default::default(), None, ItemKind::Comp(Comp::new(8, 8, FrameRate::FPS_30, Tick::from_seconds_f64(1.0)).into()));
         let current = comp_content_key(&project, comp);
-        for previous in ["effectcraft-render-1", "effectcraft-5rod-render-2"] {
+        for previous in ["effectcraft-render-1", "effectcraft-5rod-render-2", "effectcraft-5rod-render-3"] {
             let old_content = comp_content_key_with_version(&project, comp, previous);
             assert_ne!(old_content, current);
             assert_ne!(frame_key(old_content, 0, 1000, 0), frame_key(current, 0, 1000, 0));

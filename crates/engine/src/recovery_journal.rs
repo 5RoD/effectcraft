@@ -448,7 +448,7 @@ pub fn recover(store: &dyn ConfigStore, name: &str) -> Result<Recovered> {
     if !valid_name(name) {
         return Err(error("invalid journal name"));
     }
-    let checkpoint_text = store.read_bounded(&format!("{name}/checkpoint.json"), MAX_CHECKPOINT_BYTES).map_err(error)?;
+    let checkpoint_text = store.read_required_bounded(&format!("{name}/checkpoint.json"), MAX_CHECKPOINT_BYTES).map_err(error)?;
     let mut total_bytes = checkpoint_text.len();
     let checkpoint: Checkpoint = serde_json::from_str(&checkpoint_text).map_err(error)?;
     drop(checkpoint_text);
@@ -481,7 +481,7 @@ pub fn recover(store: &dyn ConfigStore, name: &str) -> Result<Recovered> {
     names.sort();
     for entry in names.into_iter().filter(|n| record_name(n)) {
         let mut apply = || -> Result<(Topology, Vec<(u64, Arc<Project>)>, u64)> {
-            let text = store.read_bounded(&format!("{name}/{entry}"), MAX_RECORD_BYTES).map_err(error)?;
+            let text = store.read_required_bounded(&format!("{name}/{entry}"), MAX_RECORD_BYTES).map_err(error)?;
             total_bytes = total_bytes.checked_add(text.len()).ok_or_else(|| error("replay byte count exhausted"))?;
             if total_bytes > MAX_JOURNAL_BYTES || sequence > MAX_RECORDS {
                 return Err(error("journal exceeds the supported replay limit"));
@@ -573,8 +573,8 @@ mod tests {
         fn read(&self, name: &str) -> Option<String> {
             self.dir.read(name)
         }
-        fn read_bounded(&self, name: &str, limit: usize) -> std::io::Result<String> {
-            self.dir.read_bounded(name, limit)
+        fn read_required_bounded(&self, name: &str, limit: usize) -> std::io::Result<String> {
+            self.dir.read_required_bounded(name, limit)
         }
         fn write(&self, name: &str, data: &str) -> std::io::Result<()> {
             self.writes.fetch_add(1, Ordering::Relaxed);
@@ -881,7 +881,7 @@ mod tests {
         let recovered = recover(&*store, name).unwrap();
         assert!(recovered.warning.as_deref().unwrap().contains("recovery size limit"));
         assert!(!record_name("1111111111111111111é.json"));
-        assert!(store.dir.read_bounded(&entry, MAX_RECORD_BYTES).is_err());
+        assert!(store.dir.read_required_bounded(&entry, MAX_RECORD_BYTES).is_err());
     }
 
     #[test]

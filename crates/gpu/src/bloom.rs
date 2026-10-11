@@ -54,6 +54,19 @@ pub(crate) fn resident(encoder: &mut Enc, context: &EffectCtx, input: GBuf) -> R
 
 fn resident_plan(encoder: &mut Enc, input: GBuf, plan: &BloomPlan) -> Result<GBuf, BloomError> {
     encoder.g.check_health().map_err(BloomError::Gpu)?;
+    if encoder.take_missing() {
+        return Err(BloomError::Gpu("a preceding GPU dispatch was unavailable; retry the complete frame on the CPU".into()));
+    }
+    for entry in ["bloom_extract", "bloom_finish", "bloom_reduce", "box_h", "box_v"] {
+        let required = match entry {
+            "bloom_reduce" => plan.view != 0 && plan.levels.iter().any(|level| level.factor > 1),
+            "box_h" | "box_v" => plan.view != 0 && plan.levels.iter().any(|level| level.radii.iter().any(|radius| *radius > 0)),
+            _ => true,
+        };
+        if required && !encoder.g.has_kernel(entry) {
+            return Err(BloomError::Gpu(format!("required kernel {entry} is unavailable; retry the complete frame on the CPU")));
+        }
+    }
     let fits = |size: [u32; 2]| encoder.g.fits(size[0], size[1]);
     if !fits(plan.source) || !fits(plan.output) || !fits(plan.atlas) || plan.levels.iter().any(|level| !fits(level.size)) {
         return Err(BloomError::Gpu("a planned texture exceeds this device's dimension limit; use the checked CPU core or reduce radius/resolution".into()));
@@ -84,6 +97,9 @@ fn resident_plan(encoder: &mut Enc, input: GBuf, plan: &BloomPlan) -> Result<GBu
             encoder.copy_into(&blurred, &atlas, 0, level.atlas_y);
         }
         encoder.pixels("bloom_finish", &parameters, &source, Some(&atlas), &output, None);
+    }
+    if encoder.take_missing() {
+        return Err(BloomError::Gpu("a required bloom dispatch was unavailable; no output was published".into()));
     }
     Ok(GBuf { img: output, offset: input.offset.map(|value| value + plan.pad as f64), scale: input.scale })
 }
@@ -120,6 +136,25 @@ mod tests {
         let required = std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|value| value == "1");
         assert!(!required || gpu.is_some(), "Native Bloom acceptance requires a working GPU and successfully compiled kernels");
         gpu
+    }
+
+    #[test]
+    fn missing_bloom_or_blur_kernels_reject_output_before_publication() {
+        if gpu().is_none() {
+            return;
+        }
+        let params = EffectParams { values: [("radius".into(), Value::Scalar(12.0)), ("threshold".into(), Value::Scalar(0.0))].into() };
+        let context = EffectCtx { params: &params, time: 0.0, layer_size: [8.0; 2], seed: 0, adjustment: false, env: EffectEnv::default() };
+        let input = Buf { img: Image::filled(8, 8, [2.0, 1.0, 0.5, 1.0]), offset: [0.0; 2], scale: 1.0 };
+        let before = input.img.clone();
+        for entry in ["bloom_extract", "bloom_reduce", "box_h"] {
+            let mut device = pollster::block_on(crate::context::GpuContext::request()).unwrap();
+            device.drop_kernel(entry);
+            let gpu = Gpu::from_context(device);
+            let error = render_checked(&gpu, &context, &input).unwrap_err();
+            assert!(error.to_string().contains(entry), "{error}");
+            assert_eq!(input.img, before);
+        }
     }
 
     fn scene(space: ColorSpace, linear: bool) -> Image {

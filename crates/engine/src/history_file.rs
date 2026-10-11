@@ -294,7 +294,7 @@ fn decode_archive(text: &str, history: Option<Value>, current: &Arc<Project>) ->
             if let ItemKind::Comp(old) = &item.kind
                 && let Some(Item { kind: ItemKind::Comp(now), .. }) = current.items.get(id)
             {
-                cache.insert(Arc::as_ptr(old) as usize, (now.clone(), current.next_id));
+                cache.insert((Arc::as_ptr(old) as usize, first.schema < effectcraft_project::SCHEMA_EFFECT_SPACE), (now.clone(), current.next_id));
             }
         }
     }

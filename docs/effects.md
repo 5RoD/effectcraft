@@ -3,7 +3,7 @@
 <!-- Generated from the effect registry (crates/effects/src/catalog.rs); do not edit by hand.
      Regenerate: UPDATE_DOCS=1 cargo test -p effectcraft-effects --lib effects_doc_is_current -->
 
-EffectCraft ships 308 effects with 3040 parameters in total, grouped into the same categories as the Effects & Presets panel. Every effect is our own implementation, written from public behaviour descriptions and standard image-processing literature. Reference-workflow effects use corresponding parameter names, order, popup options, units, defaults and ranges; original native tools use their own documented controls.
+EffectCraft ships 308 effects with 3045 parameters in total, grouped into the same categories as the Effects & Presets panel. Every effect is our own implementation, written from public behaviour descriptions and standard image-processing literature. Reference-workflow effects use corresponding parameter names, order, popup options, units, defaults and ranges; original native tools use their own documented controls.
 
 - **GPU**: 282 effects also run on the GPU compositor with identical results.
 - **32**: 308 effects process 32-bit float (HDR, overbright) pixels without clamping.
@@ -324,7 +324,7 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 | CC Hair | `ec.sim.cchair` | 20 | GPU | 32 | Implemented |
 | CC Mr. Mercury | `ec.sim.ccmrmercury` | 23 | GPU | 32 | Implemented |
 | CC Particle Systems II | `ec.sim.ccparticlesystems2` | 21 | GPU | 32 | Implemented |
-| CC Particle World | `ec.sim.ccparticleworld` | 30 | GPU | 32 | Implemented |
+| CC Particle World | `ec.sim.ccparticleworld` | 35 | GPU | 32 | Implemented |
 | CC Pixel Polly | `ec.sim.ccpixelpolly` | 10 | GPU | 32 | Implemented |
 | CC Rainfall | `ec.sim.ccrainfall` | 14 | GPU | 32 | Implemented |
 | CC Scatterize | `ec.sim.ccscatterize` | 4 | GPU | 32 | Implemented |
@@ -414,7 +414,7 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 
 | Effect | Id | Params | GPU | 32 | Status |
 |---|---|---:|:-:|:-:|---|
-| Apply Color LUT | `ec.utility.applylut` | 0 | GPU | 32 | Implemented |
+| Apply Color LUT | `ec.utility.applylut` | 1 | GPU | 32 | Implemented |
 | CC Overbrights | `ec.utility.ccoverbrights` | 2 | GPU | 32 | Implemented |
 | Cineon Converter | `ec.utility.cineon` | 7 | GPU | 32 | Implemented |
 | Color Profile Converter | `ec.utility.colorprofileconverter` | 7 | GPU | 32 | Implemented |

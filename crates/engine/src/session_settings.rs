@@ -3,13 +3,13 @@
 use std::path::Path;
 
 use crate::autosave::{self, Sentinel};
-use crate::ease_presets::EASE_PRESETS_FILE;
 use crate::prefs::{PREFS_FILE, Prefs};
 use crate::shortcuts::{Keymaps, SHORTCUTS_FILE, ShortcutTable, UiCommand};
 use crate::{EngineError, Result, Session};
 
 impl Session {
-    /// Load settings, shortcut and ease presets from the config store and apply them.
+    /// Load settings, shortcut presets and scripts' settings from the config store and apply
+    /// them.
     pub fn load_settings(&mut self) {
         if let Some(c) = &self.config {
             if let Some(t) = c.read(PREFS_FILE) {
@@ -18,8 +18,13 @@ impl Session {
             if let Some(t) = c.read(SHORTCUTS_FILE) {
                 self.keymaps = Keymaps::from_json(&t);
             }
-            if let Some(t) = c.read(EASE_PRESETS_FILE) {
-                self.ease_presets = crate::ease_presets::parse(&t);
+        }
+        crate::commands::scripts::load_script_settings(self);
+        if let Some(config) = &self.config {
+            match config.read_bounded(crate::ease_presets::EASE_PRESETS_FILE, 1 << 20) {
+                Ok(Some(text)) => self.ease_presets = crate::ease_presets::parse(&text),
+                Ok(None) => {}
+                Err(error) => log::warn!("cannot load the native easing library: {error}"),
             }
         }
         self.prefs_changed();
@@ -213,10 +218,15 @@ impl Session {
 
     pub fn autosave_folder(&self) -> Option<std::path::PathBuf> {
         let root = self.default_autosave_root();
-        autosave::folder(&self.prefs, self.path.as_deref(), root.as_deref()).map(|base| self.autosave.run.autosave_folder(base))
+        self.autosave_folder_override
+            .clone()
+            .or_else(|| autosave::folder(&self.prefs, self.path.as_deref(), root.as_deref()))
+            .map(|base| self.autosave.run.autosave_folder(base))
     }
 
-    pub(crate) fn autosave_prefs(&self) -> crate::prefs::Prefs {
+    /// Apply host isolation and the native run's separate autosave slot without persisting
+    /// either folder in the user's settings.
+    pub fn autosave_prefs(&self) -> crate::prefs::Prefs {
         let mut prefs = self.prefs.clone();
         if let Some(folder) = self.autosave_folder() {
             prefs.auto_save.location = "custom".into();
@@ -314,7 +324,8 @@ impl Session {
         if !self.needs_save() || self.autosave.saved_revision == Some(self.revision) {
             return None;
         }
-        if self.path.is_none() && self.prefs.auto_save.location != "custom" && self.default_autosave_root().is_none() {
+        if self.path.is_none() && self.prefs.auto_save.location != "custom" && self.default_autosave_root().is_none() && self.autosave_folder_override.is_none()
+        {
             return None;
         }
         Some(self.autosave_now())

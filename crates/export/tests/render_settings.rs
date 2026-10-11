@@ -1,16 +1,18 @@
 //! Render Settings and Output Module features end to end (through a [`Sink`], so nothing touches
 //! the disk): field rendering and 3:2 pulldown, crop / region of interest / resize, alpha-only
 //! and premultiplied output, the solo and guide-layer overrides, the render log, storage
-//! overflow and PCM audio formats.
+//! overflow, PCM audio formats and the compositor a job renders on.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use effectcraft_color::Label;
+use effectcraft_effects::Buf;
 use effectcraft_export::render_queue::*;
 use effectcraft_export::{Job, JobOptions, Report, Sink, StorageQuota, export};
 use effectcraft_keyframe::{Keyframe, Value};
 use effectcraft_project::{Comp, ItemId, ItemKind, LayerSource, Project, Solid, build};
-use effectcraft_render::NoFootage;
+use effectcraft_render::{Accelerator, AutoPick, FxStep, Image, NoFootage, Renderer};
 use effectcraft_time::{FrameRate, Tick};
 
 const W: u32 = 64;
@@ -43,6 +45,20 @@ fn custom(start: f64, end: f64) -> RenderSettings {
 }
 
 fn run_with(p: &Project, cid: ItemId, s: &RenderSettings, om: &OutputModule, path: &str, options: JobOptions, cancel: bool) -> (Result<Report, String>, Files) {
+    run_on(p, cid, s, om, path, options, None, cancel)
+}
+
+/// [`run_with`] with an accelerator.
+fn run_on(
+    p: &Project,
+    cid: ItemId,
+    s: &RenderSettings,
+    om: &OutputModule,
+    path: &str,
+    options: JobOptions,
+    accel: Option<&dyn Accelerator>,
+    cancel: bool,
+) -> (Result<Report, String>, Files) {
     let files: Files = Default::default();
     let f = files.clone();
     let sink: Box<Sink> = Box::new(move |path: &str, data: Vec<u8>| f.lock().unwrap().push((path.to_string(), data)));
@@ -50,7 +66,7 @@ fn run_with(p: &Project, cid: ItemId, s: &RenderSettings, om: &OutputModule, pat
         project: p,
         footage: &NoFootage,
         expr: None,
-        accel: None,
+        accel,
         comp: cid,
         settings: s,
         output: om,
@@ -319,11 +335,144 @@ fn wav_and_aiff_channels_and_formats() {
     let d = files.lock().unwrap()[0].1.clone();
     let u16_at = |o: usize| u16::from_le_bytes([d[o], d[o + 1]]);
     assert_eq!((u16_at(20), u16_at(22), u16_at(32), u16_at(34)), (3, 2, 8, 32), "IEEE float stereo");
-    // AIFF has no float: 24-bit.
+    // Plain AIFF has no float: 32-bit float is AIFF-C with `fl32` samples (#317).
     let mut aiff = OutputModule::for_format(OutputFormat::Aiff);
     aiff.audio_format = AudioFormat::F32;
     let files = run(&p, cid, &s, &aiff, "/w/c.aif");
     let d = files.lock().unwrap()[0].1.clone();
+    let u32_at = |o: usize| u32::from_be_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]);
+    assert_eq!((&d[..4], u32_at(4) as usize + 8, &d[8..12]), (&b"FORM"[..], d.len(), &b"AIFC"[..]));
+    assert_eq!((&d[12..16], u32_at(16), u32_at(20)), (&b"FVER"[..], 4, 0xA280_5140));
+    assert_eq!(&d[24..28], b"COMM");
+    let comm = 32;
+    assert_eq!(u32_at(28) as usize, 18 + 4 + 22, "COMM: AIFF fields, compression type, name");
+    assert_eq!(u16::from_be_bytes([d[comm], d[comm + 1]]), 2, "stereo");
+    assert_eq!(u32_at(comm + 2), 24_000, "half a second at 48 kHz");
+    assert_eq!(u16::from_be_bytes([d[comm + 6], d[comm + 7]]), 32, "sample size");
+    assert_eq!(&d[comm + 18..comm + 22], b"fl32");
+    assert_eq!(&d[comm + 22..comm + 44], b"\x1532-bit floating point");
+    let ssnd = comm + 44;
+    assert_eq!((&d[ssnd..ssnd + 4], u32_at(ssnd + 4) as usize), (&b"SSND"[..], 8 + 24_000 * 2 * 4));
+    // 16- and 24-bit stay plain AIFF.
+    aiff.audio_format = AudioFormat::S24;
+    let files = run(&p, cid, &s, &aiff, "/w/d.aif");
+    let d = files.lock().unwrap()[0].1.clone();
     assert_eq!(&d[8..12], b"AIFF");
     assert_eq!(u16::from_be_bytes([d[26], d[27]]), 24, "sample size");
+}
+
+#[test]
+fn cancelled_export_removes_only_files_it_opened() {
+    use effectcraft_export::ExportError;
+    let dir = std::env::temp_dir().join(format!("ec-cancel-owned-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (p, cid) = project(FrameRate::new(25, 1), |_, _| {});
+    struct Overflow;
+    impl StorageQuota for Overflow {
+        fn has_room(&self, path: &str, _: u64) -> bool {
+            path.contains("overflow")
+        }
+    }
+    for overflow in [false, true] {
+        let output_dir = if overflow { dir.join("overflow") } else { dir.clone() };
+        std::fs::create_dir_all(&output_dir).unwrap();
+        let settings = RenderSettings { skip_existing: true, storage_overflow: overflow, ..Default::default() };
+        for format in [OutputFormat::PngSequence, OutputFormat::H264] {
+            let om = OutputModule::for_format(format);
+            let path = dir.join(if format.is_sequence() { "clip_[#####].png" } else { "clip.mp4" });
+            let path = path.to_str().unwrap();
+            let decoys = ["clip.aep", "clip2.psd", "clip000.mp4", "clip_99999.png", "clip_00000.png", "clip.txt", "clip_RenderLog.txt"];
+            for name in decoys {
+                std::fs::write(output_dir.join(name), b"keep").unwrap();
+            }
+            // Skip-existing checks the primary destination even when the new frames overflow.
+            std::fs::write(dir.join("clip_00000.png"), b"keep").unwrap();
+            let result = export(
+                &Job {
+                    project: &p,
+                    footage: &NoFootage,
+                    expr: None,
+                    accel: None,
+                    comp: cid,
+                    settings: &settings,
+                    output: &om,
+                    path,
+                    sink: None,
+                    nested_switches: true,
+                    options: JobOptions {
+                        log: RenderLog::PlusPerFrameInfo,
+                        storage: Some(&Overflow),
+                        overflow: vec![output_dir.to_string_lossy().into_owned()],
+                        ..Default::default()
+                    },
+                },
+                &mut |progress| progress.done == 0,
+            );
+            assert!(matches!(result, Err(ExportError::Cancelled)), "{result:?}");
+            for name in decoys {
+                assert_eq!(std::fs::read(output_dir.join(name)).unwrap(), b"keep", "{name}");
+            }
+            let remaining: Vec<_> = std::fs::read_dir(&output_dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            assert_eq!(remaining.len(), decoys.len(), "partial files remain: {remaining:?}");
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A GPU compositor stand-in that renders every frame solid green (the CPU draws the bar and the
+/// block on black) and keeps Auto's timing history.
+#[derive(Default)]
+struct GreenAccel {
+    pick: AutoPick,
+    frames: AtomicUsize,
+}
+
+impl Accelerator for GreenAccel {
+    fn name(&self) -> String {
+        "green".into()
+    }
+    fn comp_frame(&self, r: &Renderer, comp: ItemId, _t: Tick) -> Option<Image> {
+        self.frames.fetch_add(1, Ordering::SeqCst);
+        let c = r.project.comp(comp)?;
+        Some(Image::filled(c.width, c.height, [0.0, 1.0, 0.0, 1.0]))
+    }
+    fn supports_effect(&self, _id: &str) -> bool {
+        false
+    }
+    fn effects(&self, _chain: &[FxStep], _buf: &Buf, _levels: Option<f32>) -> Option<Buf> {
+        None
+    }
+    fn auto_pick(&self) -> Option<&AutoPick> {
+        Some(&self.pick)
+    }
+}
+
+#[test]
+fn a_job_renders_on_one_compositor() {
+    // #414: Auto chose the CPU or the GPU for each frame from measured frame times, so GPU
+    // renders of the same frames differed run to run. A job renders every frame on the
+    // project's renderer.
+    let (mut p, cid) = project(FrameRate::new(25, 1), |_, _| {});
+    let om = OutputModule::for_format(OutputFormat::PngSequence);
+    let s = custom(0.0, 0.4);
+    let render = |p: &Project, accel: &GreenAccel, path: &str| {
+        let (r, files) = run_on(p, cid, &s, &om, path, JobOptions::default(), Some(accel), false);
+        r.expect("export");
+        (0..10).map(|i| png(&files, i)).collect::<Vec<_>>()
+    };
+    // Mercury GPU Acceleration: every frame on the GPU, the same in every run.
+    p.settings.gpu_acceleration = true;
+    let gpu = GreenAccel::default();
+    let a = render(&p, &gpu, "/g/a_[#####].png");
+    assert_eq!(gpu.frames.load(Ordering::SeqCst), 10);
+    for (i, f) in a.iter().enumerate() {
+        assert!(f.pixels().all(|px| px.0 == [0, 255, 0, 255]), "frame {i} rendered on the CPU");
+    }
+    assert_eq!(a, render(&p, &gpu, "/g/b_[#####].png"));
+    // Mercury Software Only: every frame on the CPU.
+    p.settings.gpu_acceleration = false;
+    let cpu = GreenAccel::default();
+    let c = render(&p, &cpu, "/g/c_[#####].png");
+    assert_eq!(cpu.frames.load(Ordering::SeqCst), 0);
+    assert_eq!(c[0].get_pixel(10, 44).0, [255, 0, 0, 255], "the CPU drew the red block");
 }

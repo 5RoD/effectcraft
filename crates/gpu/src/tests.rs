@@ -160,8 +160,8 @@ impl Scene {
     pub(crate) fn effect(&mut self, l: &mut Layer, id: &str, vals: &[(&str, Value)]) {
         let spec = effectcraft_effects::find(id).unwrap();
         let mut next = self.p.next_id;
-        let size = effectcraft_render::source_size(&self.p, l);
-        let mut g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [size.0 as f64, size.1 as f64]);
+        let size = effectcraft_render::effect_bounds(&self.p, &self.comp, l).0;
+        let mut g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, size);
         self.p.next_id = next;
         for (k, v) in vals {
             g.prop_mut(k).unwrap_or_else(|| panic!("{id}: no {k}")).value = v.clone();
@@ -643,6 +643,52 @@ fn backend_selection_and_display_frames() {
     }
 }
 
+/// The display texture carries a full mip chain, each level the 2 × 2 mean of the one above, so the
+/// viewer minifies a frame without aliasing (#417).
+#[test]
+fn display_frames_are_mipmapped() {
+    let Some(g) = gpu() else { return };
+    let s = blend_scene(BitDepth::Bpc8, BlendMode::Screen);
+    let mut r = Renderer::new(&s.p, &Pattern, opts());
+    r.accel = Some(g);
+    let f = g.render_display(&r, s.cid, Tick::ZERO).expect("display frame");
+    assert_eq!(f.texture.mip_level_count(), crate::context::mip_levels(f.width, f.height));
+    assert_eq!(f.texture.mip_level_count(), u32::BITS - f.width.max(f.height).leading_zeros());
+    let base = g.read_display(&f).expect("readback");
+    // Level 1, copied out to read it back.
+    let (w1, h1) = (f.width / 2, f.height / 2);
+    let tex = g.device().create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d { width: w1, height: h1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let mut e = crate::context::Enc::new(&g.ctx);
+    e.encoder().copy_texture_to_texture(
+        wgpu::TexelCopyTextureInfo { texture: &f.texture, mip_level: 1, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        wgpu::Extent3d { width: w1, height: h1, depth_or_array_layers: 1 },
+    );
+    let level1 = e.read_texture(&tex, w1, h1, 4).expect("level 1");
+    let at = |x: u32, y: u32, c: usize| base[((y * f.width + x) * 4) as usize + c] as f32;
+    let mut varied = false;
+    for y in 0..h1 {
+        for x in 0..w1 {
+            for c in 0..4 {
+                let want = (at(2 * x, 2 * y, c) + at(2 * x + 1, 2 * y, c) + at(2 * x, 2 * y + 1, c) + at(2 * x + 1, 2 * y + 1, c)) / 4.0;
+                let got = level1[((y * w1 + x) * 4) as usize + c] as f32;
+                assert!((want - got).abs() <= 1.0, "({x}, {y}) channel {c}: {got} against the mean {want}");
+                varied |= want != at(2 * x, 2 * y, c);
+            }
+        }
+    }
+    assert!(varied, "the scene has edges to average");
+}
+
 /// Browsers' WGSL compilers reject an f32 literal whose exact decimal value lies outside the f32
 /// range (`3.40282347e38` rounds to f32::MAX in Rust but exceeds it), which invalidates the whole
 /// module (every kernel); naga accepts it, so native runs can't catch it. Every float literal
@@ -696,7 +742,8 @@ fn devices_with_webgl2_limits_are_declined() {
     let desc = wgpu::DeviceDescriptor { required_limits: wgpu::Limits::downlevel_webgl2_defaults(), ..Default::default() };
     let Ok((device, queue)) = pollster::block_on(adapter.request_device(&desc)) else { return };
     let err = crate::context::GpuContext::new(&adapter, device, queue).err().expect("declined");
-    assert!(err.contains("max_storage_buffers_per_shader_stage"), "{err}");
+    // A GL adapter (FreeBSD's llvmpipe) is declined for its backend before its limits are checked.
+    assert!(err.contains("max_storage_buffers_per_shader_stage") || err.contains("(Gl)"), "{err}");
 }
 
 /// GPU work inside the video memory guard returns its result when the device has room (#106).
@@ -705,4 +752,98 @@ fn within_memory_returns_the_work_when_there_is_room() {
     let Some(g) = gpu() else { return };
     let img = g.within_memory(|| g.ctx.image(64, 32)).expect("room for a 64×32 texture");
     assert_eq!((img.width, img.height), (64, 32));
+}
+
+/// A buffer whose allocation fails (here: over the device's buffer size limit; on Adreno an
+/// internal `ERROR_INITIALIZATION_FAILED`) is reported to the caller's error scope instead of
+/// panicking in `create_buffer_init`'s mapped range on a frame thread (#591).
+#[test]
+fn a_failed_buffer_allocation_is_an_error_not_a_panic() {
+    hold_gpu_lock();
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return };
+    let required_limits =
+        wgpu::Limits { max_buffer_size: 4096, max_storage_buffer_binding_size: 4096, max_uniform_buffer_binding_size: 4096, ..Default::default() };
+    let desc = wgpu::DeviceDescriptor { required_limits, ..Default::default() };
+    let (device, queue) = pollster::block_on(adapter.request_device(&desc)).expect("a device with a small buffer limit");
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::context::buffer_init(&device, &queue, Some("too big"), &[0u8; 8192], wgpu::BufferUsages::STORAGE);
+        crate::context::buffer_init(&device, &queue, Some("unaligned"), &[1u8; 7], wgpu::BufferUsages::UNIFORM);
+    }));
+    let error = pollster::block_on(scope.pop());
+    assert!(made.is_ok(), "a failed allocation must not panic");
+    assert!(error.is_some(), "the failed allocation reaches the error scope");
+}
+
+/// Precomp layers (not collapsed) render their nested comp resident on the GPU
+/// (`walk::draw_precomp`): match the CPU (nested blend modes, effects inside and outside,
+/// transforms, opacity, a blend mode on the precomp layer, half resolution,
+/// two instances at different times of the same nested comp).
+#[test]
+fn nested_precomps_render_resident() {
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        let mut s = Scene::new(depth);
+        let inner = Comp::new(60, 40, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+        let inner_id = s.p.add_item("Inner", Label::Sandstone, None, ItemKind::Comp(inner.clone().into()));
+        {
+            let mut ins = Scene { p: std::mem::take(&mut s.p), cid: inner_id, comp: inner };
+            let mut a = ins.footage(50, 30);
+            ins.effect(&mut a, "ec.blur.gaussian", &[("blurriness", n(3.0))]);
+            ins.push(a);
+            let mut b = ins.solid([0.2, 0.7, 0.4], 30, 20);
+            b.blend_mode = BlendMode::Difference;
+            set(&mut b, "transform/rotation", Value::Scalar(15.0));
+            ins.push(b);
+            s.p = ins.p;
+        }
+        let bg = s.footage(97, 61);
+        s.push(bg);
+        let mut pre = build::layer(&mut s.p, &s.comp, "Inner", LayerSource::Comp { item: inner_id }, (60, 40), None);
+        set(&mut pre, "transform/rotation", Value::Scalar(25.0));
+        set(&mut pre, "transform/opacity", Value::Scalar(80.0));
+        s.effect(&mut pre, "ec.color.levels", &[("gamma", n(1.3))]);
+        pre.blend_mode = BlendMode::Screen;
+        s.push(pre);
+        // A second instance, later in the nested comp's time.
+        let mut pre2 = build::layer(&mut s.p, &s.comp, "Inner 2", LayerSource::Comp { item: inner_id }, (60, 40), None);
+        set(&mut pre2, "transform/position", v3(70.0, 40.0));
+        pre2.start_time = Tick::from_seconds_f64(-0.5);
+        s.push(pre2);
+        check(&format!("nested precomps {depth:?}"), compare_at(&s, opts(), Tick::from_seconds_f64(0.2)), 0.0);
+        let half = RenderOpts { scale: 0.5, ..opts() };
+        check(&format!("nested precomps half {depth:?}"), compare_at(&s, half, Tick::from_seconds_f64(0.2)), 0.0);
+    }
+}
+
+/// #613: an effect kernel the device's shader compiler rejects (FXC on DirectX 12 aborting on
+/// `pointwise`) no longer turns the whole GPU compositor off: the context is built without it,
+/// lists it, and the effects that need it render on the CPU, matching the CPU render.
+#[test]
+fn effects_whose_kernels_failed_render_on_the_cpu() {
+    if gpu().is_none() {
+        return;
+    }
+    let Ok(mut ctx) = pollster::block_on(crate::context::GpuContext::request()) else { return };
+    ctx.drop_kernel("pointwise");
+    ctx.drop_kernel("box_h");
+    let names: Vec<&str> = ctx.unavailable_kernels().iter().map(|(e, _)| *e).collect();
+    assert_eq!(names, ["pointwise", "box_h"]);
+    let g = Gpu::from_context(ctx);
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        let mut s = Scene::new(depth);
+        let mut l = s.footage(80, 50);
+        s.effect(&mut l, "ec.color.exposure", &[("master/exposure", n(0.7))]);
+        s.effect(&mut l, "ec.color.tint", &[("black", c(0.1, 0.0, 0.3)), ("amount", n(80.0))]);
+        s.effect(&mut l, "ec.blur.gaussian", &[("blurriness", n(5.0))]);
+        s.effect(&mut l, "ec.channel.invert", &[("blend", n(50.0))]);
+        s.push(l);
+        let cpu = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Cpu, ..opts() }).comp_frame_cpu(s.cid, Tick::ZERO);
+        let mut r = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..opts() });
+        r.accel = Some(&g);
+        let img = g.render(&r, s.cid, Tick::ZERO).expect("the GPU renders the frame");
+        let mut d = diff(&cpu, &img, tolerance(depth));
+        d.quantized = depth != BitDepth::Bpc32;
+        check(&format!("missing kernels {depth:?}"), Some(d), 0.0);
+    }
 }

@@ -115,14 +115,18 @@ fn module_with(manifest: &str, render_body: &str) -> String {
 }
 
 fn render(spec: &effectcraft_effects::EffectSpec, gain: f64, on: bool) -> Image {
+    render_at(spec, gain, on, 0.0, 4).unwrap()
+}
+
+fn render_at(spec: &effectcraft_effects::EffectSpec, gain: f64, on: bool, time: f64, width: u32) -> Result<Image, String> {
     let mut next = 1;
     let g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [4.0, 2.0]);
     let mut params = effectcraft_effects::flatten_params(&g, &mut |p| p.value.clone());
     params.values.insert("gain".into(), effectcraft_keyframe::Value::Scalar(gain));
     params.values.insert("on".into(), effectcraft_keyframe::Value::Bool(on));
-    let ctx = EffectCtx { params: &params, time: 0.0, layer_size: [4.0, 2.0], seed: 1, adjustment: false, env: EffectEnv::default() };
-    let buf = Buf { img: Image::filled(4, 2, [0.8, 0.6, 0.2, 1.0]), offset: [0.0; 2], scale: 1.0 };
-    effectcraft_effects::apply(spec, &ctx, buf).unwrap().img
+    let ctx = EffectCtx { params: &params, time, layer_size: [f64::from(width), 2.0], seed: 1, adjustment: false, env: EffectEnv::default() };
+    let buf = Buf { img: Image::filled(width, 2, [0.8, 0.6, 0.2, 1.0]), offset: [0.0; 2], scale: 1.0 };
+    effectcraft_effects::apply(spec, &ctx, buf).map(|buf| buf.img)
 }
 
 #[test]
@@ -156,10 +160,9 @@ fn wasm_plugin_registers_and_renders() {
 
 #[test]
 fn wasm_plugins_are_sandboxed() {
-    // A runaway loop runs out of fuel: the frame comes back unchanged instead of hanging.
+    // A runaway loop returns a checked fuel error instead of hanging.
     let spec = load_wasm(gain_module("org.test.spin", "(loop $spin br $spin)").as_bytes(), "spin.wat").unwrap();
-    let img = render(spec, 0.5, false);
-    assert_eq!(img.get(0, 0), [0.8, 0.6, 0.2, 1.0]);
+    assert!(render_at(spec, 0.5, false, 0.0, 4).unwrap_err().contains("fuel"));
     // No imports (files, clock, network…).
     let imports = r#"(module (import "env" "now" (func $now (result f64))) (memory (export "memory") 1))"#;
     assert!(load_err(load_wasm(imports.as_bytes(), "imports.wat")).contains("import"));
@@ -268,33 +271,65 @@ fn manifest_parameter_schemas_are_validated() {
 }
 
 #[test]
-fn render_failures_leave_the_frame_and_recover() {
-    let orig = [0.8, 0.6, 0.2, 1.0];
-    // ec_render traps (when time > 0.5), returns an error code, or ec_alloc hands back memory
-    // out of bounds: the frame passes through unchanged, and the plug-in keeps working.
-    let trap = load_wasm(gain_module("org.test.trap", "local.get $t f64.const 0.5 f64.gt if unreachable end").as_bytes(), "trap.wat").unwrap();
-    let mut next = 1;
-    let g = effectcraft_effects::instantiate(trap, &mut Ids(&mut next), trap.name, [4.0, 2.0]);
-    let params = effectcraft_effects::flatten_params(&g, &mut |p| p.value.clone());
-    let at = |time: f64| {
-        let ctx = EffectCtx { params: &params, time, layer_size: [4.0, 2.0], seed: 1, adjustment: false, env: EffectEnv::default() };
-        let buf = Buf { img: Image::filled(4, 2, orig), offset: [0.0; 2], scale: 1.0 };
-        effectcraft_effects::apply(trap, &ctx, buf).unwrap().img
-    };
-    assert_eq!(at(1.0).get(0, 0), orig, "trapped");
-    assert_eq!(at(0.0).get(0, 0), [0.4, 0.3, 0.1, 1.0], "a fresh instance after the trap");
-    assert_eq!(at(1.0).get(0, 0), orig);
-    assert_eq!(at(0.0).get(1, 1), [0.4, 0.3, 0.1, 1.0]);
-    let code = load_wasm(gain_module("org.test.code", "i32.const 7 return").as_bytes(), "code.wat").unwrap();
-    assert_eq!(render(code, 0.5, false).get(0, 0), orig);
-    let oob = edit(&gain_module("org.test.oob", ""), "    i32.const 65536)", "    i32.const -16)");
-    let oob = load_wasm(oob.as_bytes(), "oob.wat").unwrap();
-    assert_eq!(render(oob, 0.5, false).get(0, 0), orig);
-    // Runaway rendering: out of fuel every time, never hangs.
-    let spin = load_wasm(gain_module("org.test.spin2", "(loop $spin br $spin)").as_bytes(), "spin2.wat").unwrap();
-    for _ in 0..3 {
-        assert_eq!(render(spin, 0.5, false).get(0, 0), orig);
+fn render_failures_are_checked_and_later_valid_frames_recover() {
+    for (id, body, reason) in [
+        ("org.test.trap", "local.get $t f64.const 0.5 f64.gt if local.get $px f32.const 0 f32.store unreachable end", "ec_render trapped"),
+        ("org.test.code", "local.get $t f64.const 0.5 f64.gt if i32.const 7 return end", "ec_render returned error 7"),
+        ("org.test.spin2", "local.get $t f64.const 0.5 f64.gt if (loop $spin br $spin) end", "fuel"),
+    ] {
+        let spec = load_wasm(gain_module(id, body).as_bytes(), "fault.wat").unwrap();
+        assert!(matches!(spec.render, effectcraft_effects::EffectRender::Checked(_)));
+        for _ in 0..2 {
+            let error = render_at(spec, 0.5, false, 1.0, 4).unwrap_err();
+            assert!(error.contains(reason), "{id}: {error}");
+            assert_eq!(render_at(spec, 0.5, false, 0.0, 4).unwrap().get(0, 0), [0.4, 0.3, 0.1, 1.0], "fresh instance after {id}");
+        }
     }
+    for (id, bad_pointer, reason) in [("org.test.oob", "-16", "out of bounds"), ("org.test.unaligned", "65537", "aligned")] {
+        // ec_alloc has no time argument: request a different small frame size for recovery.
+        let module = edit(
+            &gain_module(id, ""),
+            "    i32.const 65536)",
+            &format!("    local.get $n i32.const 176 i32.eq if (result i32) i32.const {bad_pointer} else i32.const 65536 end)"),
+        );
+        let spec = load_wasm(module.as_bytes(), "alloc.wat").unwrap();
+        assert!(render_at(spec, 0.5, false, 0.0, 4).unwrap_err().contains(reason));
+        assert_eq!(render_at(spec, 0.5, false, 0.0, 5).unwrap().get(4, 1), [0.4, 0.3, 0.1, 1.0]);
+    }
+    let alloc_trap =
+        edit(&gain_module("org.test.alloc-trap", ""), "    i32.const 65536)", "    local.get $n i32.const 176 i32.eq if unreachable end i32.const 65536)");
+    let spec = load_wasm(alloc_trap.as_bytes(), "alloc-trap.wat").unwrap();
+    assert!(render_at(spec, 0.5, false, 0.0, 4).unwrap_err().contains("ec_alloc trapped"));
+    assert!(render_at(spec, 0.5, false, 0.0, 5).is_ok());
+}
+
+#[test]
+fn wasm_direct_render_validates_host_inputs_before_guest_invocation() {
+    use crate::{EffectPlugin, PluginFrame, PluginParams};
+    let plugin = crate::wasm::WasmPlugin::new(gain_module("org.test.direct", "unreachable").as_bytes(), "direct.wat").unwrap();
+    let manifest = plugin.manifest();
+    let flat = [0.5, 0.0, 0.0, 0.0, 1.0, 1.0];
+    let params = PluginParams { manifest, flat: &flat };
+    let mut pixels = [[0.8, 0.6, 0.2, 1.0]; 8];
+    let before = pixels;
+    for size in [[u32::MAX, u32::MAX], [8192, 8192], [0, 2], [4, 1]] {
+        let mut frame = PluginFrame { width: size[0], height: size[1], pixels: &mut pixels, scale: 1.0 };
+        let error = plugin.render(&mut frame, &params, 0.0).unwrap_err();
+        assert!(!error.contains("trapped"), "{error}");
+    }
+    for scale in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0] {
+        let mut frame = PluginFrame { width: 4, height: 2, pixels: &mut pixels, scale };
+        assert!(plugin.render(&mut frame, &params, 0.0).unwrap_err().contains("scale"));
+    }
+    let mut frame = PluginFrame { width: 4, height: 2, pixels: &mut pixels, scale: 1.0 };
+    for time in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(plugin.render(&mut frame, &params, time).unwrap_err().contains("time"));
+    }
+    for bad in [vec![], vec![0.0; 7], vec![f64::NAN; 6], vec![f64::INFINITY; 6]] {
+        assert!(plugin.render(&mut frame, &PluginParams { manifest, flat: &bad }, 0.0).unwrap_err().contains("parameter"));
+    }
+    assert!(plugin.render(&mut frame, &params, 0.0).unwrap_err().contains("ec_render trapped"));
+    assert_eq!(pixels, before, "WASM never copies failed provisional pixels back");
 }
 
 #[test]

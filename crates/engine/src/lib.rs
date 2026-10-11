@@ -17,6 +17,7 @@ pub mod config;
 pub mod demo;
 pub mod ease_presets;
 pub mod footage_check;
+pub mod footage_reload;
 pub mod guard;
 pub mod history;
 pub mod history_file;
@@ -40,6 +41,7 @@ pub mod remote;
 pub mod render_queue;
 pub mod roto;
 pub mod scriptui;
+pub mod sequence;
 mod session_settings;
 pub mod shortcuts;
 pub mod storage;
@@ -104,6 +106,13 @@ pub trait Services: Send + Sync {
     fn exists(&self, path: &str) -> bool {
         std::path::Path::new(path).exists()
     }
+    /// A file's size and modification time (nanoseconds since 1970), to notice that it changed
+    /// on disk (Settings ▸ Import ▸ Reload Footage Changed on Disk); `None` when it can't be read.
+    fn stamp(&self, path: &str) -> Option<(u64, u128)> {
+        let meta = std::fs::metadata(path).ok()?;
+        let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+        Some((meta.len(), modified.as_nanos()))
+    }
     /// Keep a file the app made for itself (footage extracted from a template): like
     /// [`Services::write_file`], creating its folder, but never offered as a download (web: it
     /// goes to browser storage only).
@@ -112,6 +121,19 @@ pub trait Services: Send + Sync {
             let _ = std::fs::create_dir_all(d);
         }
         self.write_file(path, data)
+    }
+    /// The files in folder `dir` (full paths; no folders, no hidden files), for image-sequence
+    /// detection on import. Empty when it can't be read.
+    fn list_dir(&self, dir: &str) -> Vec<String> {
+        let Ok(rd) = std::fs::read_dir(if dir.is_empty() { "." } else { dir }) else { return vec![] };
+        rd.filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()) && !e.file_name().to_string_lossy().starts_with('.'))
+            .map(|e| e.path().to_string_lossy().to_string())
+            .collect()
+    }
+    /// Whether `path` is a folder (dropped or picked folders import their files).
+    fn is_dir(&self, path: &str) -> bool {
+        std::path::Path::new(path).is_dir()
     }
 }
 
@@ -128,11 +150,15 @@ impl Services for FsServices {
 
 /// Imports media files into the project (implemented by the media layer).
 pub trait Importer: Send + Sync {
-    /// Probe a file and return footage metadata.
+    /// Probe one file and return footage metadata. Image sequences are the engine's
+    /// ([`sequence`]): it groups numbered stills and probes their first file here.
     fn probe(&self, path: &str) -> std::result::Result<effectcraft_project::Footage, String>;
     /// A footage file's bytes are now at `path` (extracted from a template): hosts whose media
     /// layer reads from memory (the browser) register them; file-based ones need nothing.
     fn register(&self, _path: &str, _data: &[u8]) {}
+    /// An image sequence's other frames (its first was probed) are footage now: hosts whose
+    /// media layer reads from memory (the browser) register them; file-based ones need nothing.
+    fn add_frames(&self, _paths: &[String]) {}
 }
 
 /// A keyframe reference: layer, property uid, key time (layer time).
@@ -194,6 +220,10 @@ pub struct EditorState {
     /// The last copy was keyframes (Paste pastes keys at the CTI).
     #[serde(skip)]
     pub clip_is_keys: bool,
+    /// Values of selected unanimated properties (match path, value), copied with Edit ▸ Copy;
+    /// Paste sets the same properties of the selected layers.
+    #[serde(skip)]
+    pub value_clipboard: Vec<(String, effectcraft_keyframe::Value)>,
     /// Copied effect instances (Edit ▸ Copy with effects selected); Paste adds them to the
     /// selected layers.
     #[serde(skip)]
@@ -351,6 +381,9 @@ pub struct Session {
     /// Why there is no [`Session::accel`] (`render.backend`'s `why`): the host's reason, e.g. a
     /// headless start without `--gpu` or the compositor's setup error.
     pub accel_note: Option<String>,
+    /// The graphics adapter and backend the window draws with (`NVIDIA GeForce RTX 4070
+    /// (Vulkan)`), as the host reports it: the System Compatibility Report shows it.
+    pub window_adapter: Option<String>,
     /// Expression syntax checker (set by the host that links the expression engine).
     pub expr_check: Option<fn(&str) -> std::result::Result<(), String>>,
     pub importer: Option<Arc<dyn Importer>>,
@@ -396,14 +429,20 @@ pub struct Session {
     pub config: Option<Arc<dyn config::ConfigStore>>,
     /// Keyboard shortcut presets.
     pub keymaps: shortcuts::Keymaps,
-    /// User ease presets (Window ▸ Ease Presets; the built-in ones are in [`ease_presets`]).
+    /// Original native editable easing library.
     pub ease_presets: Vec<ease_presets::EasePreset>,
+    /// Scripts' `app.settings`, kept in the settings store (see
+    /// [`commands::scripts::SCRIPT_SETTINGS_FILE`]).
+    pub script_settings: commands::scripts::ScriptSettings,
     /// Frontend-only commands offered for binding.
     pub ui_commands: Vec<shortcuts::UiCommand>,
     /// Cache of the resolved active preset (read it with [`Session::shortcuts`]).
     pub shortcut_table: std::sync::OnceLock<shortcuts::ShortcutTable>,
     /// Auto-save bookkeeping.
     pub autosave: autosave::AutoSaveState,
+    /// Host-owned isolation for all auto-saves (e.g. one MCP session). Independent of settings
+    /// and project bookkeeping, so opening/saving a project or changing preferences keeps it.
+    pub autosave_folder_override: Option<std::path::PathBuf>,
     /// The viewer snapshot (Take Snapshot / Show Snapshot).
     pub snapshot: Option<viewer::Snapshot>,
     /// The JavaScript scripting engine (set by the host that links `effectcraft-script`):
@@ -446,7 +485,20 @@ pub struct Session {
     /// event loop (the desktop app) turn this on; headless sessions run `footage.check` when
     /// they want it.
     pub check_footage_on_open: bool,
+    /// Each footage file's size and modification time when last seen (Settings ▸ Import ▸
+    /// Reload Footage Changed on Disk, [`footage_reload`]).
+    pub footage_stamps: std::collections::HashMap<String, footage_reload::Stamp>,
+    /// The stamps being taken on a worker thread ([`footage_reload::start_scan`]).
+    pub footage_scan: Option<footage_reload::Scan>,
+    /// How many script-issued commands are running ([`Session::execute_for_script`]): while one
+    /// is, settings that guard what scripts may do can't change (see
+    /// [`prefs::Scripting::same_permissions`]).
+    pub script_calls: ScriptCalls,
 }
+
+/// The count behind [`Session::running_for_script`]; only the engine changes it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScriptCalls(u32);
 
 /// A thumbnail render ([`Session::thumbnail_job`]): (width, height, RGBA8).
 pub type ThumbnailJob = Box<dyn FnOnce() -> Option<(u32, u32, Vec<u8>)> + Send>;
@@ -488,6 +540,7 @@ impl Default for Session {
             expr: None,
             accel: None,
             accel_note: None,
+            window_adapter: None,
             expr_check: None,
             importer: None,
             exporter: None,
@@ -512,9 +565,11 @@ impl Default for Session {
             config: None,
             keymaps: shortcuts::Keymaps::default(),
             ease_presets: vec![],
+            script_settings: Default::default(),
             ui_commands: vec![],
             shortcut_table: std::sync::OnceLock::new(),
             autosave: autosave::AutoSaveState::default(),
+            autosave_folder_override: None,
             snapshot: None,
             script: None,
             plugin_loader: None,
@@ -533,6 +588,9 @@ impl Default for Session {
             next_task_id: 1,
             learn: None,
             check_footage_on_open: false,
+            footage_stamps: Default::default(),
+            footage_scan: None,
+            script_calls: ScriptCalls::default(),
         }
     }
 }
@@ -577,6 +635,22 @@ impl Session {
         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         commands::check_params(spec, &params)?;
         self.execute(id, params)
+    }
+
+    /// [`Session::execute`] for a command a script asked for (the JavaScript engine's
+    /// `app.run`, ScriptUI callbacks…). The command and everything it runs count as the script's:
+    /// it may not change the settings that limit scripts (Settings ▸ Scripting & Expressions ▸
+    /// Application Scripting), which only the user can, from the UI, CLI or control channel.
+    pub fn execute_for_script(&mut self, id: &str, params: Value) -> Result<Value> {
+        self.script_calls.0 = self.script_calls.0.saturating_add(1);
+        let r = self.execute(id, params);
+        self.script_calls.0 = self.script_calls.0.saturating_sub(1);
+        r
+    }
+
+    /// Whether the command running was issued by a script ([`Session::execute_for_script`]).
+    pub fn running_for_script(&self) -> bool {
+        self.script_calls.0 > 0
     }
 
     pub fn is_enabled(&self, id: &str) -> bool {
@@ -971,29 +1045,31 @@ impl Session {
 
 /// Bring effect instances saved by earlier versions up to date with the effect registry
 /// (renamed / regrouped / added parameters, reordered popups; see
-/// [`effectcraft_effects::migrate`]).
+/// [`effectcraft_effects::migrate`]), and a project from before
+/// [`effectcraft_project::SCHEMA_EFFECT_SPACE`] into effect space
+/// ([`effectcraft_effects::migrate::to_effect_space`]). Stamps the current schema.
 pub fn upgrade_effects(p: &mut Project) {
     upgrade_effects_cached(p, &mut Default::default());
 }
 
 // Saved history shares composition snapshots. Upgrade each unique composition once and
 // retain the original Arc when its controls already match the registry.
-pub(crate) fn upgrade_effects_cached(p: &mut Project, cache: &mut std::collections::HashMap<usize, (Arc<effectcraft_project::Comp>, u64)>) {
-    let mut sizes = std::collections::HashMap::new();
+pub(crate) fn upgrade_effects_cached(p: &mut Project, cache: &mut std::collections::HashMap<(usize, bool), (Arc<effectcraft_project::Comp>, u64)>) {
+    let to_effect_space = p.schema < effectcraft_project::SCHEMA_EFFECT_SPACE;
+    let mut bounds = std::collections::HashMap::new();
     for (cid, item) in &p.items {
         let effectcraft_project::ItemKind::Comp(c) = &item.kind else { continue };
-        if cache.contains_key(&(Arc::as_ptr(c) as usize)) {
+        if cache.contains_key(&(Arc::as_ptr(c) as usize, to_effect_space)) {
             continue;
         }
         for l in &c.layers {
-            let (w, h) = effectcraft_render::source_size(p, l);
-            sizes.insert((*cid, l.id), if w == 0 { [c.width as f64, c.height as f64] } else { [w as f64, h as f64] });
+            bounds.insert((*cid, l.id), effectcraft_render::effect_bounds(p, c, l));
         }
     }
     let mut next = p.next_id;
     for (cid, it) in p.items.iter_mut() {
         let effectcraft_project::ItemKind::Comp(c) = &mut it.kind else { continue };
-        let address = Arc::as_ptr(c) as usize;
+        let address = (Arc::as_ptr(c) as usize, to_effect_space);
         if let Some((comp, required_next)) = cache.get(&address) {
             *c = comp.clone();
             next = next.max(*required_next);
@@ -1001,14 +1077,24 @@ pub(crate) fn upgrade_effects_cached(p: &mut Project, cache: &mut std::collectio
         }
         let mut updated: Option<effectcraft_project::Comp> = None;
         for (layer_index, l) in c.layers.iter().enumerate() {
-            let size = sizes.get(&(*cid, l.id)).copied().unwrap_or([100.0, 100.0]);
+            let (size, origin) = bounds.get(&(*cid, l.id)).copied().unwrap_or(([100.0, 100.0], [0.0; 2]));
+            let shift = |o: [f64; 2]| [-o[0], -o[1]];
+            let d = if l.switches.adjustment { [0.0; 2] } else { shift(origin) };
+            let clone_d = |src: Option<u64>| match src {
+                Some(id) => bounds.get(&(*cid, LayerId(id))).map_or([0.0; 2], |b| shift(b.1)),
+                None => d,
+            };
             let Some(fx) = l.effects() else { continue };
             for (effect_index, n) in fx.children.iter().enumerate() {
                 let effectcraft_project::Node::Group(g) = n else { continue };
                 let effectcraft_project::GroupKind::Effect { effect } = &g.kind else { continue };
                 if let Some(spec) = effectcraft_effects::find(effect) {
                     let mut group = g.clone();
-                    if effectcraft_effects::migrate::upgrade_instance(spec, &mut group, &mut effectcraft_project::build::Ids(&mut next), size) {
+                    effectcraft_effects::migrate::upgrade_instance(spec, &mut group, &mut effectcraft_project::build::Ids(&mut next), size);
+                    if to_effect_space {
+                        effectcraft_effects::migrate::to_effect_space(spec, &mut group, size, d, &clone_d);
+                    }
+                    if group != *g {
                         let comp = updated.get_or_insert_with(|| (**c).clone());
                         if let Some(node) =
                             comp.layers.get_mut(layer_index).and_then(|l| l.props.sub_mut("effects")).and_then(|fx| fx.children.get_mut(effect_index))
@@ -1025,6 +1111,7 @@ pub(crate) fn upgrade_effects_cached(p: &mut Project, cache: &mut std::collectio
         cache.insert(address, (c.clone(), next));
     }
     p.next_id = next;
+    p.schema = effectcraft_project::SCHEMA_VERSION;
 }
 
 #[cfg(test)]
@@ -1058,6 +1145,8 @@ mod tests_fidelity;
 #[cfg(test)]
 mod tests_frame_export;
 #[cfg(test)]
+mod tests_key_metadata_order;
+#[cfg(test)]
 mod tests_keylight;
 #[cfg(test)]
 mod tests_lottie;
@@ -1081,6 +1170,8 @@ mod tests_project_items;
 mod tests_proxy;
 #[cfg(test)]
 mod tests_rig3d;
+#[cfg(test)]
+mod tests_sequence;
 #[cfg(test)]
 mod tests_settings;
 #[cfg(test)]
@@ -1201,3 +1292,6 @@ mod tests_paint;
 mod tests_panels;
 #[cfg(test)]
 mod tests_roto;
+
+#[cfg(test)]
+mod tests_key_time;

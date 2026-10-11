@@ -111,6 +111,29 @@ fn reset_effect_restores_defaults_in_one_undo_step() {
 }
 
 #[test]
+fn reset_restores_parameters_inside_twirl_down_groups() {
+    let (mut s, a, _) = comp_with_two_solids();
+    // Fractal and Scribble keep most parameters in groups (`mandelbrot/…`, `edgeOptions/…`).
+    for (effect, changes) in [
+        ("Fractal", [("setChoice", json!(1)), ("mandelbrot/mandelbrotX", json!(1.25)), ("fractalColor/hue", json!(90.0))]),
+        ("Scribble", [("scribble", json!(2)), ("edgeOptions/edgeWidth", json!(33.0)), ("strokeOptions/spacing", json!(9.0))]),
+    ] {
+        let fx = apply(&mut s, a, effect);
+        let group = |s: &Session| layer(s, a).effects().unwrap().groups().find(|g| g.uid == fx).unwrap().clone();
+        let defaults: Vec<_> = changes.iter().map(|(id, _)| group(&s).prop(id).unwrap().value.clone()).collect();
+        for (id, v) in &changes {
+            let uid = group(&s).prop(id).unwrap().uid;
+            s.execute("prop.set", json!({"layer": a, "prop": uid, "value": v})).unwrap();
+            assert_ne!(group(&s).prop(id).unwrap().value, defaults[changes.iter().position(|(i, _)| i == id).unwrap()], "{effect} {id} changed");
+        }
+        s.execute("effect.reset", json!({"layer": a, "effect": fx})).unwrap();
+        for ((id, _), d) in changes.iter().zip(&defaults) {
+            assert_eq!(&group(&s).prop(id).unwrap().value, d, "{effect} {id} back to its default");
+        }
+    }
+}
+
+#[test]
 fn reset_keys_animated_params_at_the_cti() {
     let (mut s, a, _) = comp_with_two_solids();
     let blur = apply(&mut s, a, "Gaussian Blur");
@@ -370,4 +393,123 @@ fn checked_bloom_remote_cpu_retry_finishes_without_obsolete_deferred_passes() {
     assert!(!gpu);
     assert_eq!(pixels.as_ref().unwrap(), &expected);
     assert_eq!(declines.calls.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn opening_a_schema_1_project_moves_shape_layer_effect_points_into_effect_space() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Main", "width": 200, "height": 100, "frameRate": 30, "duration": 2})).unwrap();
+    let shape = s.execute("layer.newShape", json!({"kind": "rect", "size": [180, 80]})).unwrap()["layer"].as_u64().unwrap();
+    let solid = s.execute("layer.newSolid", json!({"color": "#0000ff", "width": 200, "height": 100})).unwrap()["layer"].as_u64().unwrap();
+    let point = |s: &Session, lid: u64, fx: u64, id: &str| -> KV {
+        let l = layer(s, lid);
+        let g = l.effects().unwrap().groups().find(|g| g.uid == fx).unwrap();
+        g.props().find(|p| p.match_id == id || (id.is_empty() && p.ui == effectcraft_project::ParamUi::Point)).unwrap().value.clone()
+    };
+    let set = |s: &mut Session, lid: u64, fx: u64, id: &str, v: [f64; 2]| {
+        let l = layer(s, lid);
+        let g = l.effects().unwrap().groups().find(|g| g.uid == fx).unwrap();
+        let uid = g.props().find(|p| p.match_id == id || (id.is_empty() && p.ui == effectcraft_project::ParamUi::Point)).unwrap().uid;
+        s.execute("prop.set", json!({"layer": lid, "prop": uid, "value": v})).unwrap();
+    };
+    let twirl = apply(&mut s, shape, "Twirl");
+    set(&mut s, shape, twirl, "center", [-30.0, -10.0]);
+    let bulge = apply(&mut s, shape, "Bulge");
+    let control = apply(&mut s, shape, "Point Control");
+    set(&mut s, shape, control, "", [5.0, 5.0]);
+    let on_solid = apply(&mut s, solid, "Twirl");
+    set(&mut s, solid, on_solid, "center", [30.0, 20.0]);
+    let adjust = s.execute("layer.newShape", json!({"kind": "rect", "size": [50, 50]})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.setSwitch", json!({"layers": [adjust], "switch": "adjustment", "value": true})).unwrap();
+    let on_adjust = apply(&mut s, adjust, "Twirl");
+    set(&mut s, adjust, on_adjust, "center", [40.0, 30.0]);
+    assert_eq!(point(&s, shape, bulge, "center"), KV::Vec2([100.0, 50.0]), "Bulge's default centre");
+
+    let old = s.project.to_file_json().unwrap().replacen("\"schema\": 2", "\"schema\": 1", 1);
+    assert!(old.contains("\"schema\": 1"));
+    let dir = std::env::temp_dir().join(format!("ec-effect-space-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("old.ecproj").to_string_lossy().to_string();
+    std::fs::write(&path, old).unwrap();
+    let mut s2 = Session::default();
+    s2.execute("file.open", json!({"path": path})).unwrap();
+    assert_eq!(s2.project.schema, effectcraft_project::SCHEMA_VERSION);
+    let check = |s2: &Session| {
+        assert_eq!(point(s2, shape, twirl, "center"), KV::Vec2([70.0, 40.0]), "a set point keeps its place in the comp");
+        assert_eq!(point(s2, shape, bulge, "center"), KV::Vec2([100.0, 50.0]), "a default point becomes the layer centre");
+        assert_eq!(point(s2, shape, control, ""), KV::Vec2([5.0, 5.0]), "expression controls keep their values");
+        assert_eq!(point(s2, solid, on_solid, "center"), KV::Vec2([30.0, 20.0]), "a solid's effect space is its layer space");
+        assert_eq!(point(s2, adjust, on_adjust, "center"), KV::Vec2([40.0, 30.0]), "an adjustment layer's effects see the comp");
+    };
+    check(&s2);
+    // Saved as schema 2 and opened again: nothing moves twice.
+    s2.execute("file.save", json!({"path": path})).unwrap();
+    let mut s3 = Session::default();
+    s3.execute("file.open", json!({"path": path})).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+    check(&s3);
+}
+
+#[test]
+fn ocio_effect_warns_about_unsupported_config_transforms() {
+    let (mut s, a, _) = comp_with_two_solids();
+    let fx = apply(&mut s, a, "OCIO Color Space Transform");
+    let warning = |s: &mut Session| s.execute("effect.warning", json!({"layer": a, "effect": fx})).unwrap()["warning"].clone();
+    assert!(warning(&mut s).is_null(), "built-in config");
+    let set = |s: &mut Session, param: &str, value: serde_json::Value| {
+        let uid = layer(s, a).effects().unwrap().groups().next().unwrap().get(param).unwrap().uid;
+        s.execute("prop.set", json!({"layer": a, "prop": uid, "value": value})).unwrap();
+    };
+    let config = "ocio_profile_version: 2\ncolorspaces:\n  - !<ColorSpace>\n    name: lin\n  - !<ColorSpace>\n    name: graded\n    from_scene_reference: !<GradingToneTransform> {}\n";
+    set(&mut s, "config", json!(1));
+    set(&mut s, "configFile", json!(config));
+    set(&mut s, "sourceName", json!("lin"));
+    set(&mut s, "destinationName", json!("graded"));
+    let w = warning(&mut s);
+    assert!(w.as_str().is_some_and(|w| w.contains("GradingToneTransform")), "{w}");
+    set(&mut s, "destinationName", json!("lin"));
+    assert!(warning(&mut s).is_null());
+    set(&mut s, "destinationName", json!("nowhere"));
+    assert!(warning(&mut s).as_str().is_some_and(|w| w.contains("no color space `nowhere`")));
+    set(&mut s, "configFile", json!("/no/such/config.ocio"));
+    assert!(warning(&mut s).as_str().is_some_and(|w| w.starts_with("Can't read the OCIO config")));
+}
+
+#[test]
+fn effect_upgrade_cache_keeps_shared_states_of_different_schemas_distinct() {
+    let mut session = Session::default();
+    let comp = crate::project::ItemId(session.execute("comp.new", json!({"width": 200, "height": 100})).unwrap()["comp"].as_u64().unwrap());
+    let shape = session.execute("layer.newShape", json!({"kind": "rect", "size": [180, 80]})).unwrap()["layer"].as_u64().unwrap();
+    let effect = apply(&mut session, shape, "Twirl");
+    let prop = layer(&session, shape).effects().unwrap().groups().find(|g| g.uid == effect).unwrap().get("center").unwrap().uid;
+    session.execute("prop.set", json!({"layer": shape, "prop": prop, "value": [-30.0, -10.0]})).unwrap();
+    let mut old = (*session.project).clone();
+    old.schema = 1;
+    let mut current = old.clone();
+    current.schema = crate::project::SCHEMA_EFFECT_SPACE;
+    let shared = current.comp_arc(comp).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&shared, &old.comp_arc(comp).unwrap()));
+    let point = |project: &crate::project::Project| {
+        project
+            .comp(comp)
+            .unwrap()
+            .layer(LayerId(shape))
+            .unwrap()
+            .effects()
+            .unwrap()
+            .groups()
+            .find(|g| g.uid == effect)
+            .unwrap()
+            .get("center")
+            .unwrap()
+            .value
+            .clone()
+    };
+    let mut cache = Default::default();
+    crate::upgrade_effects_cached(&mut old, &mut cache);
+    assert_eq!(point(&old), KV::Vec2([70.0, 40.0]));
+    crate::upgrade_effects_cached(&mut current, &mut cache);
+    assert_eq!(point(&current), KV::Vec2([-30.0, -10.0]), "schema-2 states must not reuse schema-1 point migration");
+    assert!(std::sync::Arc::ptr_eq(&shared, &current.comp_arc(comp).unwrap()), "an unchanged current-schema composition remains shared");
+    assert_eq!(old.schema, crate::project::SCHEMA_VERSION);
 }

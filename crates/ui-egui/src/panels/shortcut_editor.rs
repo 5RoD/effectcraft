@@ -15,6 +15,7 @@
 //! `shortcuts.rename`, `shortcuts.delete`, `shortcuts.import`, `shortcuts.export`,
 //! `shortcuts.resetPreset`, `shortcuts.close`.
 
+use crate::i18n::{tr, tr_args};
 use effectcraft_engine::shortcuts::{APP_SCOPE, Bindable, DEFAULT_PRESET, normalize};
 use egui::{Align2, Color32, Rect, RichText, Sense, Stroke, StrokeKind, pos2, vec2};
 use serde_json::{Value, json};
@@ -203,6 +204,8 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
                 _ => None,
             })
         });
+        // The shortcut field must not also type the key it just recorded (Alt+R came out as `rAlt+R`).
+        ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(_) | egui::Event::Key { .. })));
         if let Some((k, m)) = got {
             st.recording = false;
             if k != egui::Key::Escape
@@ -237,7 +240,7 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     super::dialogs::modal(ctx, "Keyboard Shortcuts", vec2(1000.0, 720.0), t, |ui| {
         // ---- preset bar
         ui.horizontal(|ui| {
-            ui.label("Preset:");
+            ui.label(tr("Preset:"));
             let r = egui::ComboBox::from_id_salt("sc-preset").selected_text(&active).width(220.0).show_ui(ui, |ui| {
                 for n in &presets {
                     if ui.selectable_label(*n == active, n).clicked() {
@@ -247,7 +250,7 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
             });
             app.auto.add("shortcuts.preset", r.response.rect, "Preset");
             let custom = active != DEFAULT_PRESET;
-            let b = ui.button("Duplicate");
+            let b = ui.button(tr("Duplicate"));
             app.auto.add("shortcuts.duplicate", b.rect, "Duplicate");
             if b.clicked() {
                 run.push(("shortcuts.preset".into(), json!({"op": "duplicate", "from": active, "name": format!("{active} copy")})));
@@ -255,35 +258,35 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
             if let Some(name) = &mut st.rename {
                 let r = ui.add(egui::TextEdit::singleline(name).desired_width(140.0));
                 app.auto.add("shortcuts.renameField", r.rect, "New name");
-                if ui.button("Rename").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                if ui.button(tr("Rename")).clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                     run.push(("shortcuts.preset".into(), json!({"op": "rename", "name": active, "newName": name})));
                     st.rename = None;
                 }
             } else {
-                let b = ui.add_enabled(custom, egui::Button::new("Rename"));
+                let b = ui.add_enabled(custom, egui::Button::new(tr("Rename")));
                 app.auto.add("shortcuts.rename", b.rect, "Rename");
                 if b.clicked() {
                     st.rename = Some(active.clone());
                 }
             }
-            let b = ui.add_enabled(custom, egui::Button::new("Delete"));
+            let b = ui.add_enabled(custom, egui::Button::new(tr("Delete")));
             app.auto.add("shortcuts.delete", b.rect, "Delete");
             if b.clicked() {
                 run.push(("shortcuts.preset".into(), json!({"op": "delete", "name": active})));
             }
-            let b = ui.add_enabled(custom, egui::Button::new("Reset Preset"));
+            let b = ui.add_enabled(custom, egui::Button::new(tr("Reset Preset")));
             app.auto.add("shortcuts.resetPreset", b.rect, "Reset Preset");
             if b.clicked() {
                 run.push(("shortcuts.reset".into(), json!({})));
             }
-            let b = ui.button("Import...");
+            let b = ui.button(tr("Import..."));
             app.auto.add("shortcuts.import", b.rect, "Import");
             if b.clicked()
                 && let Some(p) = app.hooks.pick_files.as_ref().and_then(|f| f(&["json"]).into_iter().next())
             {
                 run.push(("shortcuts.import".into(), json!({"path": p})));
             }
-            let b = ui.button("Export...");
+            let b = ui.button(tr("Export..."));
             app.auto.add("shortcuts.export", b.rect, "Export");
             if b.clicked()
                 && let Some(p) = app.hooks.pick_save_file.as_ref().and_then(|f| f(&format!("{active}.json"), "json"))
@@ -294,7 +297,7 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
         ui.add_space(6.0);
         // ---- modifiers + legend
         ui.horizontal(|ui| {
-            ui.label("Modifiers:");
+            ui.label(tr("Modifiers:"));
             let names = if cfg!(target_os = "macos") { ["⌃ Ctrl", "⌘ Cmd", "⌥ Opt", "⇧ Shift"] } else { ["", "Ctrl", "Alt", "Shift"] };
             for (i, (n, id)) in names.iter().zip(["ctrl", "cmd", "alt", "shift"]).enumerate() {
                 if n.is_empty() {
@@ -396,13 +399,13 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
         p.rect_filled(info, 4.0, t.row);
         let p = ui.painter_at(info.shrink(2.0));
         if let Some(k) = &st.key {
-            p.text(info.left_top() + vec2(8.0, 6.0), Align2::LEFT_TOP, format!("Key: {k}"), Tokens::semibold(12.0), t.tab_text_active);
+            p.text(info.left_top() + vec2(8.0, 6.0), Align2::LEFT_TOP, tr_args("Key: {}", &[&k]), Tokens::semibold(12.0), t.tab_text_active);
             let mut yy = info.min.y + 26.0;
             let mut list: Vec<(String, String, String)> =
                 table.bindings().into_iter().filter(|(sc, _)| split(sc).1 == *k).map(|(sc, b)| (sc.to_string(), b.label.clone(), b.scope.clone())).collect();
             list.sort();
             if list.is_empty() {
-                p.text(pos2(info.min.x + 8.0, yy), Align2::LEFT_TOP, "Not assigned", Tokens::ui(11.5), t.text_dim);
+                p.text(pos2(info.min.x + 8.0, yy), Align2::LEFT_TOP, tr("Not assigned"), Tokens::ui(11.5), t.text_dim);
             }
             for (sc, label, scope) in list.into_iter().take(9) {
                 let col = if scope == APP_SCOPE { APP_COLOR } else { PANEL_COLOR };
@@ -411,12 +414,12 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
                 yy += 17.0;
             }
         } else {
-            p.text(info.left_top() + vec2(8.0, 6.0), Align2::LEFT_TOP, "Click a key to see its commands.", Tokens::ui(11.5), t.text_dim);
+            p.text(info.left_top() + vec2(8.0, 6.0), Align2::LEFT_TOP, tr("Click a key to see its commands."), Tokens::ui(11.5), t.text_dim);
         }
         ui.add_space(4.0);
         // ---- search + command list + editor
         ui.horizontal(|ui| {
-            let r = ui.add(egui::TextEdit::singleline(&mut st.query).hint_text("Search commands or shortcuts").desired_width(360.0));
+            let r = ui.add(egui::TextEdit::singleline(&mut st.query).hint_text(tr("Search commands or shortcuts")).desired_width(360.0));
             app.auto.add("shortcuts.search", r.rect, "Search");
         });
         ui.add_space(4.0);
@@ -476,7 +479,7 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
             ui.vertical(|ui| {
                 ui.set_width(310.0);
                 let Some(b) = st.selected.as_ref().and_then(|k| table.find(k)).cloned() else {
-                    ui.label(RichText::new("Select a command to change its shortcut.").color(t.text_dim));
+                    ui.label(RichText::new(tr("Select a command to change its shortcut.")).color(t.text_dim));
                     return;
                 };
                 ui.label(RichText::new(&b.label).font(Tokens::semibold(13.0)).color(t.tab_text_active));
@@ -484,7 +487,7 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
                 ui.add_space(6.0);
                 let keys = table.keys.get(&b.key).cloned().unwrap_or_default();
                 if keys.is_empty() {
-                    ui.label(RichText::new("No shortcut").color(t.text_dim));
+                    ui.label(RichText::new(tr("No shortcut")).color(t.text_dim));
                 }
                 for (n, k) in keys.iter().enumerate() {
                     ui.horizontal(|ui| {
@@ -509,7 +512,7 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
                         st.recording = false;
                     }
                     let norm = normalize(&st.pending);
-                    let b2 = ui.add_enabled(norm.is_some(), egui::Button::new("Assign"));
+                    let b2 = ui.add_enabled(norm.is_some(), egui::Button::new(tr("Assign")));
                     app.auto.add("shortcuts.assign", b2.rect, "Assign");
                     if b2.clicked()
                         && let Some(k) = norm
@@ -526,31 +529,31 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
                     let conflicts = table.conflicts(&b, &k);
                     if !conflicts.is_empty() {
                         ui.add_space(4.0);
-                        ui.label(RichText::new(format!("⚠ {} is used by:", crate::menus::shortcut_text(&k))).color(t.warning));
+                        ui.label(RichText::new(tr_args("⚠ {} is used by:", &[&(crate::menus::shortcut_text(&k))])).color(t.warning));
                         for c in conflicts.iter().take(4) {
                             ui.label(RichText::new(format!("   {} ({})", c.label, c.scope)).color(t.warning));
                         }
                     }
                 }
                 ui.add_space(6.0);
-                let r = ui.add_enabled(keys != b.defaults, egui::Button::new("Reset to Default"));
+                let r = ui.add_enabled(keys != b.defaults, egui::Button::new(tr("Reset to Default")));
                 app.auto.add("shortcuts.resetCommand", r.rect, "Reset to Default");
                 if r.clicked() {
                     run.push(("shortcuts.reset".into(), json!({"command": b.command, "params": b.params})));
                 }
                 if !b.defaults.is_empty() {
                     let d: Vec<String> = b.defaults.iter().map(|k| crate::menus::shortcut_text(k)).collect();
-                    ui.label(RichText::new(format!("Default: {}", d.join(", "))).color(t.text_faint));
+                    ui.label(RichText::new(tr_args("Default: {}", &[&(d.join(", "))])).color(t.text_faint));
                 }
                 if active == DEFAULT_PRESET {
                     ui.add_space(6.0);
-                    ui.label(RichText::new("Changing a shortcut creates a custom preset; the default stays as it is.").color(t.text_faint).small());
+                    ui.label(RichText::new(tr("Changing a shortcut creates a custom preset; the default stays as it is.")).color(t.text_faint).small());
                 }
             });
         });
         ui.add_space(6.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let r = ui.add(egui::Button::new(RichText::new("   OK   ").color(Color32::WHITE)).fill(t.accent));
+            let r = ui.add(egui::Button::new(RichText::new(tr("   OK   ")).color(Color32::WHITE)).fill(t.accent));
             app.auto.add("shortcuts.close", r.rect, "OK");
             close |= r.clicked();
         });
@@ -585,6 +588,41 @@ mod tests {
         }
         assert_eq!(split("Cmd+Shift+K"), ([false, true, false, true], "K".into()));
         assert_eq!(split("Cmd++"), ([false, true, false, false], "+".into()));
+        // The plus key, with and without modifiers, parses back (typed by hand or recorded).
+        for txt in ["+", "Cmd++", "Alt++"] {
+            assert_eq!(crate::menus::parse_shortcut(txt).map(|(_, k)| k), Some(egui::Key::Plus), "{txt}");
+        }
+        assert_eq!(crate::menus::parse_shortcut("Alt+R").map(|(m, k)| (m.alt, k)), Some((true, egui::Key::R)));
         assert_eq!(split("F9"), ([false; 4], "F9".into()));
+    }
+
+    fn frame(app: &mut EffectcraftApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+        app.auto.begin_frame();
+        let mut out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| crate::panels::dialogs::show(app, ui.ctx()));
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn recording_a_shortcut_does_not_also_type_the_key_into_the_field() {
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx, &app.tokens, crate::i18n::language(&app));
+        open(&mut app);
+        app.dialog_state.shortcuts.selected = app.session.shortcuts().bindables.first().map(|b| b.key.clone());
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let [x, y, w, h] = app.auto.find("shortcuts.record").expect("shortcut field").rect;
+        let at = pos2(x + w / 2.0, y + h / 2.0);
+        let click = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(at), click(true)]);
+        frame(&mut app, &ctx, vec![click(false)]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.dialog_state.shortcuts.recording);
+        // Alt+R arrives as the key and as the typed text `r`.
+        let key = egui::Event::Key { key: egui::Key::R, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::ALT };
+        frame(&mut app, &ctx, vec![key, egui::Event::Text("r".into())]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.dialog_state.shortcuts.pending, "Alt+R");
     }
 }

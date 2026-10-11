@@ -28,6 +28,7 @@ mod distort2;
 mod distort3;
 pub mod distort4;
 pub mod face_track;
+pub mod fidelity;
 mod generate;
 mod generate2;
 mod generate3;
@@ -79,7 +80,7 @@ pub use color2::{Curve, auto_correct_settings, color_link_mode, color_link_sampl
 pub use color3::OffsetCurve;
 pub use distort::transform_shutter;
 pub use distort2::{MAGNIFY_MODES, bezier_grid, parse_mesh};
-pub use distort3::{RESHAPE_POINTS, ReshapeSetup, SmearSetup, reshape_setup, smear_setup, warp_inverse_map};
+pub use distort3::{RESHAPE_POINTS, ReshapeSetup, SmearSetup, cc_smear_pad, reshape_setup, smear_setup, warp_inverse_map};
 pub use distort4::liquify_mesh;
 use effectcraft_keyframe::Value;
 use effectcraft_project::build::Ids;
@@ -240,7 +241,20 @@ pub fn flatten_params(g: &PropGroup, eval: &mut dyn FnMut(&Property) -> Value) -
     Params { values }
 }
 
-/// A layer image in flight: layer-space point `p` sits at pixel `p * scale + offset`.
+/// The warning shown with effect instance `g` (Effect Controls, `effect.warning`), its
+/// parameters evaluated by `eval`: settings it can't render as asked, such as an OCIO config it
+/// can't read or transforms it passes through. `None` when it renders as asked.
+pub fn warning(g: &PropGroup, eval: &mut dyn FnMut(&Property) -> Value) -> Option<String> {
+    let GroupKind::Effect { effect } = &g.kind else { return None };
+    // Only the effects that can warn evaluate their parameters.
+    if !ocio::CUSTOM_CONFIG_FX.contains(&effect.as_str()) {
+        return None;
+    }
+    ocio::warning(effect, &flatten_params(g, eval))
+}
+
+/// A layer image in flight: point `p` sits at pixel `p * scale + offset`. Points are in layer
+/// space, or in effect space while the layer's effects run (see [`Buf::rebase`]).
 #[derive(Clone, Debug, Default)]
 pub struct Buf {
     pub img: Image,
@@ -251,6 +265,12 @@ pub struct Buf {
 impl Buf {
     pub fn to_px(&self, p: [f64; 2]) -> (f64, f64) {
         (p[0] * self.scale + self.offset[0], p[1] * self.scale + self.offset[1])
+    }
+    /// Measure from `origin` (in the current coordinates): a point `p` becomes `p − origin`.
+    /// Moves between layer space and effect space (the renderer's `effect_bounds`).
+    pub fn rebase(&mut self, origin: [f64; 2]) {
+        self.offset[0] += origin[0] * self.scale;
+        self.offset[1] += origin[1] * self.scale;
     }
     /// Grow by `pad` transparent pixels on every side.
     pub fn pad(&mut self, pad: u32) {
@@ -282,8 +302,14 @@ pub struct LayerPixels {
 
 /// Services the renderer offers effects that look beyond their own pixels.
 pub trait EffectHost: Sync {
+    /// Pixels entering the effect stack, in effect space, before any effects. For an
+    /// adjustment layer this is the composition below it, in the effect working space.
+    fn original(&self) -> Option<&Buf> {
+        None
+    }
+
     /// Layer `id` of the same composition at the current comp time. `masks_and_effects`
-    /// selects "Effects & Masks" over "Source". `None` for missing/self/recursive references.
+    /// selects "Effects & Masks" over "Source". `None` for missing/recursive references; own Source reads are supported.
     fn layer(&self, id: u64, masks_and_effects: bool) -> Option<LayerPixels>;
     /// `frames` stereo sample frames (interleaved L R …) of layer `id`'s audio starting at comp
     /// time `start` seconds, at `rate` Hz. `None` when the layer has no audio.
@@ -349,11 +375,6 @@ pub struct EffectEnv<'a> {
     /// comp's and the layer's motion blur switches are on (Transform's Use Composition's
     /// Shutter Angle).
     pub shutter: Option<(f64, f64, u32)>,
-    /// Top-left corner of the layer bounds ([`EffectCtx::layer_size`]) in layer coordinates:
-    /// (0, 0) for layers with a source rectangle; shape and text layers have comp-sized bounds
-    /// centred on their origin (−w/2, −h/2). Edge pinning measures from these bounds
-    /// ([`util::pin_rect`]).
-    pub bounds_origin: [f64; 2],
 }
 
 /// What an effect gets to render with.
@@ -419,6 +440,10 @@ pub(crate) fn p(id: &'static str, name: &'static str, default: Value, ui: ParamU
 }
 pub(crate) fn slider(min: f64, max: f64, smin: f64, smax: f64, decimals: u8) -> ParamUi {
     ParamUi::Slider { min, max, slider_min: smin, slider_max: smax, decimals }
+}
+/// A file parameter offering files with these extensions (Effect Controls' Choose…).
+pub(crate) fn file_ui(exts: &[&str]) -> ParamUi {
+    ParamUi::File { filters: exts.iter().map(|s| s.to_string()).collect() }
 }
 pub(crate) fn popup(opts: &[&str]) -> ParamUi {
     ParamUi::Popup { options: opts.iter().map(|s| s.to_string()).collect() }
@@ -679,6 +704,7 @@ pub const PARAM_GROUPS: &[(&str, &str)] = &[
     ("sourceCrops", "Source Crops"),
     // Simulation.
     ("extras", "Extras"),
+    ("effectCamera", "Effect Camera"),
     ("wiggle", "Wiggle"),
     ("light", "Light"),
     ("shading", "Shading"),
@@ -1107,6 +1133,11 @@ pub const GPU_EFFECTS: &[&str] = &[
     "ec.obsolete.pathtext",
 ];
 
+/// Effects that can read [`EffectHost::comp_scene`] (the comp camera or the first comp light):
+/// their output changes when the camera, the lights or the layer's own transform move, so the
+/// renderer's layer cache folds the comp scene into the key for these.
+pub const READS_COMP_SCENE: &[&str] = &["ec.sim.carddance", "ec.sim.shatter", "ec.transition.cardwipe", "ec.sim.caustics", "ec.sim.ccparticleworld"];
+
 /// Effects whose output depends on [`EffectCtx::time`] directly (not only through animated
 /// parameters). The renderer's layer cache folds the layer time into the key for these.
 /// The `time_dependence_is_declared` test checks the list against every registered effect.
@@ -1168,7 +1199,9 @@ pub const TIME_DEPENDENT: &[&str] = &[
 pub fn is_time_dependent(id: &str) -> bool {
     // Simulations replay from layer time 0, so every frame differs even when the defaults
     // happen to look static at the test's two sample times.
-    id.starts_with("ec.sim.") || TIME_DEPENDENT.contains(&id)
+    // Plug-in API v1 supplies time without declaring whether the effect reads it. Include
+    // time for registered external effects so static sources do not freeze animated output.
+    id.starts_with("ec.sim.") || TIME_DEPENDENT.contains(&id) || (!id.starts_with("ec.") && plugin::plugin(id).is_some())
 }
 
 /// Run an effect on a buffer.

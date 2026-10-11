@@ -28,6 +28,20 @@ impl ThemeKind {
             _ => None,
         }
     }
+
+    /// The settings value (`appearance.theme`, `appearance.darkTheme`, `appearance.lightTheme`).
+    pub fn name(self) -> &'static str {
+        match self {
+            ThemeKind::FiveRod => "5rod",
+            ThemeKind::Dark => "dark",
+            ThemeKind::Darker => "darker",
+            ThemeKind::Light => "light",
+        }
+    }
+
+    pub fn is_light(self) -> bool {
+        self == ThemeKind::Light
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -70,6 +84,20 @@ pub struct Tokens {
     pub timecode: Color32,
     pub danger: Color32,
     pub warning: Color32,
+    /// Effect Controls effect headers, and the header of the effect being worked on (it or one
+    /// of its properties selected).
+    pub fx_header: Color32,
+    pub fx_header_active: Color32,
+    /// Timeline: a selected layer's row in the time graph, the boxes behind the A/V and layer
+    /// switches, the time navigator and the work area bar.
+    pub tl_graph_selected: Color32,
+    pub switch_well: Color32,
+    pub tl_nav_bar: Color32,
+    pub tl_work_area_bar: Color32,
+    /// The Timeline's expression field and the colour of enabled expressions (their text and
+    /// the names of properties that have one).
+    pub expr_bg: Color32,
+    pub expr_text: Color32,
     /// Label colours (`Label::ALL` order), from Settings ▸ Labels.
     pub labels: [Color32; 17],
     pub radius: f32,
@@ -142,6 +170,14 @@ impl Tokens {
             timecode: Color32::from_rgb(0x3d, 0x8f, 0xf5),
             danger: Color32::from_rgb(0xe0, 0x4a, 0x3c),
             warning: Color32::from_rgb(0xe8, 0x9a, 0x2c),
+            fx_header: Color32::from_rgb(0x2a, 0x2a, 0x2a),
+            fx_header_active: Color32::from_rgb(0x2f, 0x3a, 0x52),
+            tl_graph_selected: Color32::from_rgb(0x2a, 0x2a, 0x2a),
+            switch_well: Color32::from_rgb(0x19, 0x19, 0x19),
+            tl_nav_bar: Color32::from_rgb(0x55, 0x55, 0x55),
+            tl_work_area_bar: Color32::from_rgb(0x5c, 0x5c, 0x5c),
+            expr_bg: Color32::from_rgb(0x1a, 0x1a, 0x1a),
+            expr_text: Color32::from_rgb(0xe8, 0x7c, 0x5c),
             labels: default_labels(),
             radius: 6.0,
             radius_sm: 3.0,
@@ -209,6 +245,18 @@ impl Tokens {
                 tl_ruler_bg: Color32::from_rgb(0xe2, 0xe2, 0xe2),
                 tl_ruler_text: Color32::from_rgb(0x50, 0x50, 0x50),
                 pasteboard: Color32::from_rgb(0xa8, 0xa8, 0xa8),
+                // Keyframes have no outline: dark enough to stand out on the light time graph.
+                keyframe: Color32::from_rgb(0x6c, 0x6c, 0x6c),
+                // Custom-painted surfaces in the Light palette, so dark text stays readable on
+                // them (#644).
+                fx_header: Color32::from_rgb(0xd8, 0xd8, 0xd8),
+                fx_header_active: Color32::from_rgb(0xb0, 0xcf, 0xec),
+                tl_graph_selected: Color32::from_rgb(0xc2, 0xc2, 0xc2),
+                switch_well: Color32::from_rgb(0xf2, 0xf2, 0xf2),
+                tl_nav_bar: Color32::from_rgb(0x9a, 0x9a, 0x9a),
+                tl_work_area_bar: Color32::from_rgb(0x94, 0x94, 0x94),
+                expr_bg: Color32::from_rgb(0xf2, 0xf2, 0xf2),
+                expr_text: Color32::from_rgb(0xa3, 0x34, 0x17),
                 ..dark
             },
         }
@@ -233,8 +281,9 @@ impl Tokens {
     }
 
     /// Theme tokens for the current settings: theme, UI brightness and label colours.
-    pub fn from_prefs(p: &effectcraft_engine::prefs::Prefs) -> Tokens {
-        let kind = ThemeKind::from_name(&p.appearance.theme).unwrap_or_default();
+    /// The tokens for theme `kind` (resolved from the appearance mode) with the rest of the
+    /// Appearance settings: brightness, label colours, gradients.
+    pub fn from_prefs(p: &effectcraft_engine::prefs::Prefs, kind: ThemeKind) -> Tokens {
         let mut t = Tokens::for_kind(kind).with_brightness(p.appearance.brightness as f32);
         for (i, l) in effectcraft_color::Label::ALL.iter().enumerate() {
             let [r, g, b] = p.label_rgb(*l);
@@ -274,6 +323,10 @@ impl Tokens {
             &mut self.tl_ruler_bg,
             &mut self.pasteboard,
             &mut self.work_area,
+            &mut self.fx_header,
+            &mut self.tl_graph_selected,
+            &mut self.switch_well,
+            &mut self.expr_bg,
         ] {
             adj(c);
         }
@@ -293,8 +346,14 @@ static INTER_MEDIUM: &[u8] = include_bytes!("../../../assets/fonts/Inter-Medium.
 static INTER_SEMIBOLD: &[u8] = include_bytes!("../../../assets/fonts/Inter-SemiBold.ttf");
 static JETBRAINS_MONO: &[u8] = include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
 
-/// Install fonts (Inter, Inter Medium/SemiBold, JetBrains Mono) and egui visuals.
-pub fn install(ctx: &egui::Context, t: &Tokens) {
+/// Install fonts (Inter, Inter Medium/SemiBold, JetBrains Mono) and egui visuals. `language` is the
+/// resolved interface language from [`crate::i18n::language`] (`en`, `ja`, `zh-hans` or `zh-hant`),
+/// not the stored `general.language` preference: `system` is already resolved there, so a Chinese
+/// system draws Chinese with the default setting. The CJK fallback that draws the interface's own
+/// script is registered first, so a Chinese interface is drawn by a Chinese face and a Japanese one
+/// by a Japanese face. `install` is called again when the language changes (see the `EffectcraftApp`
+/// frame loop), so the fonts do not need a restart.
+pub fn install(ctx: &egui::Context, t: &Tokens, language: &str) {
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert("inter".into(), Arc::new(FontData::from_static(INTER_REGULAR)));
     fonts.font_data.insert("inter-medium".into(), Arc::new(FontData::from_static(INTER_MEDIUM)));
@@ -304,30 +363,122 @@ pub fn install(ctx: &egui::Context, t: &Tokens) {
     fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "jbmono".into());
     fonts.families.insert(FontFamily::Name("semibold".into()), vec!["inter-semibold".into(), "inter".into()]);
     fonts.families.insert(FontFamily::Name("medium".into()), vec!["inter-medium".into(), "inter".into()]);
-    // Reuse the text engine's script-aware system fallback (#84), without embedding a CJK font.
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use effectcraft_text::fonts;
-        let base = fonts::resolve("Inter", "Regular").face;
-        let face = fonts::face(fonts::fallback_for('あ', base));
-        if face.has_char('あ')
-            && let Some(font) = face.font()
-        {
-            // Use the already-read, parsed bytes rather than reading a font file twice.
-            let mut data = FontData::from_owned(font.data().as_bytes().to_vec());
-            data.index = face.info.index;
-            fonts.font_data.insert("japanese-system".into(), Arc::new(data));
-            for family in fonts.families.values_mut() {
-                family.push("japanese-system".into());
-            }
-        }
-    }
+    install_script_fallbacks(&mut fonts, language);
     ctx.set_fonts(fonts);
     apply_visuals(ctx, t);
 }
 
+/// Scripts the bundled fonts lack beyond CJK, each probed with one of its letters: names typed in
+/// them (layers, items, comments) are drawn by an installed face instead of missing-glyph boxes
+/// (#394). egui shapes each run of one face, so Arabic letters join and a word reads right to
+/// left; it has no bidirectional layout, so the words of a name still follow each other left to
+/// right.
+#[cfg(not(target_arch = "wasm32"))]
+const SCRIPT_PROBES: &[(char, &str)] = &[
+    ('م', "arabic-system"),
+    ('א', "hebrew-system"),
+    ('क', "devanagari-system"),
+    ('ক', "bengali-system"),
+    ('ਕ', "gurmukhi-system"),
+    ('ક', "gujarati-system"),
+    ('க', "tamil-system"),
+    ('క', "telugu-system"),
+    ('ಕ', "kannada-system"),
+    ('ക', "malayalam-system"),
+    ('ก', "thai-system"),
+];
+
+/// Register the system fallbacks for scripts the bundled fonts lack in every font family, and
+/// return their names in registration order (empty when nothing installed covers a probe, so a
+/// machine without those fonts simply keeps the bundled ones). A face that covers several probes
+/// (Segoe UI draws Arabic and Hebrew, Nirmala UI every Indic script) is registered once.
+///
+/// CJK comes first. The text engine has its own script-aware fallback (#84), but which face it
+/// picks for Han ideographs depends on the locale environment: a Chinese interface on a
+/// Japanese-locale machine would be drawn with the Japanese face. The interface language is the
+/// better signal, so the probe for its script comes first — kana for Japanese, a Han character for
+/// the Chinese catalogs. Both scripts are registered, so file, layer and template names in the
+/// other one still render; then [`SCRIPT_PROBES`], then Hangul, since the Japanese and Chinese faces
+/// may lack it (Hiragino Sans on macOS has none). The web build has no system fonts
+/// and installs nothing.
+fn install_script_fallbacks(family_fonts: &mut FontDefinitions, language: &str) -> Vec<String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (family_fonts, language);
+        Vec::new()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use effectcraft_text::fonts;
+        // Kana is unambiguously Japanese; Han ideographs are shared, so the order decides which
+        // language's face draws them.
+        const KANA: (char, &str) = ('あ', "japanese-system");
+        const HAN: (char, &str) = ('文', "chinese-system");
+        // Hangul is probed last: with no Korean font installed the lookup can land on a catch-all
+        // face (Unifont) that also covers Arabic or Indic text but can't shape it, so the
+        // script-specific faces must be registered ahead of it. A face already seen is skipped.
+        const HANGUL: (char, &str) = ('한', "korean-system");
+        // Han text follows the interface language, not the operating system's locale.
+        fonts::set_cjk_locale(cjk_locale(language));
+        let base = fonts::resolve("Inter", "Regular").face;
+        let cjk = if is_chinese(language) { [HAN, KANA] } else { [KANA, HAN] };
+        let mut names = Vec::new();
+        let mut seen = Vec::new();
+        for &(probe, name) in cjk.iter().chain(SCRIPT_PROBES).chain(std::iter::once(&HANGUL)) {
+            let id = fonts::fallback_for(probe, base);
+            if seen.contains(&id) {
+                continue;
+            }
+            let face = fonts::face(id);
+            if !face.has_char(probe) {
+                continue; // nothing installed covers this script
+            }
+            let Some(font) = face.font() else { continue };
+            seen.push(id);
+            // Use the already-read, parsed bytes rather than reading a font file twice.
+            let mut data = FontData::from_owned(font.data().as_bytes().to_vec());
+            data.index = face.info.index;
+            family_fonts.font_data.insert(name.to_string(), Arc::new(data));
+            for family in family_fonts.families.values_mut() {
+                family.push(name.to_string());
+            }
+            names.push(name.to_string());
+        }
+        names
+    }
+}
+
+/// The CJK locale the text engine should prefer for Han text: the interface language when it names
+/// one, otherwise the empty string, which leaves the operating system's locale in charge.
+#[cfg(not(target_arch = "wasm32"))]
+fn cjk_locale(language: &str) -> &str {
+    match language {
+        "ja" | "zh-hans" | "zh-hant" => language,
+        _ => "",
+    }
+}
+
+/// Whether `language` is one of the Chinese catalogs.
+#[cfg(not(target_arch = "wasm32"))]
+fn is_chinese(language: &str) -> bool {
+    matches!(language, "zh-hans" | "zh-hant")
+}
+
+/// egui's theme preference for an appearance mode showing a `light` (or dark) theme. Sync with
+/// System leaves it at System: a concrete preference makes egui set the native window's
+/// appearance, and on macOS a window with its own appearance no longer hears when the system's
+/// changes (#642). A fixed Light or Dark mode pins the window to match.
+pub fn theme_preference(appearance_mode: &str, light: bool) -> egui::ThemePreference {
+    match appearance_mode {
+        "auto" => egui::ThemePreference::System,
+        _ if light => egui::ThemePreference::Light,
+        _ => egui::ThemePreference::Dark,
+    }
+}
+
 pub fn apply_visuals(ctx: &egui::Context, t: &Tokens) {
-    let mut v = if t.kind == ThemeKind::Light { Visuals::light() } else { Visuals::dark() };
+    let light = t.kind.is_light();
+    let mut v = if light { Visuals::light() } else { Visuals::dark() };
     v.panel_fill = t.panel_bg;
     v.window_fill = t.panel_bg;
     v.extreme_bg_color = t.field_bg;
@@ -361,8 +512,10 @@ pub fn apply_visuals(ctx: &egui::Context, t: &Tokens) {
     v.widgets.active.fg_stroke = Stroke::new(1.0, t.tab_text_active);
     v.widgets.open.bg_fill = t.hover;
     v.widgets.open.weak_bg_fill = t.hover;
-    ctx.set_visuals(v);
-    ctx.global_style_mut(|s| {
+    // egui keeps one style per light/dark theme and picks it by its theme preference (see
+    // [`theme_preference`]); both get ours, so whichever it picks, egui's defaults never show.
+    ctx.all_styles_mut(|s| {
+        s.visuals = v.clone();
         s.spacing.item_spacing = egui::vec2(6.0, 4.0);
         s.spacing.button_padding = egui::vec2(8.0, 3.0);
         s.spacing.interact_size.y = 22.0;
@@ -380,17 +533,20 @@ pub fn apply_visuals(ctx: &egui::Context, t: &Tokens) {
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
-mod japanese_font_tests {
-    #[test]
-    fn installed_japanese_fallback_is_available_in_all_ui_families() {
-        use effectcraft_text::fonts;
+mod script_font_tests {
+    use effectcraft_text::fonts;
+
+    /// Whether an installed face covers `probe` (else the glyph check is skipped).
+    fn installed(probe: char) -> bool {
         let base = fonts::resolve("Inter", "Regular").face;
-        if !fonts::face(fonts::fallback_for('あ', base)).has_char('あ') {
-            eprintln!("no Japanese system font installed; skipping glyph coverage");
-            return;
-        }
+        fonts::face(fonts::fallback_for(probe, base)).has_char(probe)
+    }
+
+    /// Every character of `text` draws a real glyph in every UI font family with the `language`
+    /// interface's fonts installed.
+    fn assert_drawn(language: &str, text: &str) {
         let ctx = egui::Context::default();
-        super::install(&ctx, &super::Tokens::for_kind(super::ThemeKind::Dark));
+        super::install(&ctx, &super::Tokens::for_kind(super::ThemeKind::Dark), language);
         let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
         // No renderer here: drop the frame's texture uploads (egui asserts on unhandled ones in debug).
         out.textures_delta.clear();
@@ -403,11 +559,11 @@ mod japanese_font_tests {
             ] {
                 let font = egui::FontId::new(13.0, family);
                 // epaint 0.36's has_glyph compares face keys, so it reports a false
-                // negative when a real Japanese glyph shares the replacement face.
+                // negative when a real glyph shares the replacement face.
                 // Check the rendered atlas glyph instead of that face-level predicate.
                 let missing = fonts.layout_no_wrap("\u{10ffff}".into(), font.clone(), egui::Color32::WHITE);
                 let missing_uv = missing.rows[0].glyphs[0].uv_rect;
-                for ch in "日本語コンポジションレイヤーエフェクト設定".chars() {
+                for ch in text.chars() {
                     let rendered = fonts.layout_no_wrap(ch.to_string(), font.clone(), egui::Color32::WHITE);
                     let uv = rendered.rows[0].glyphs[0].uv_rect;
                     assert!(uv.size.x > 0.0 && uv.size.y > 0.0, "empty {ch} in {font:?}");
@@ -415,5 +571,144 @@ mod japanese_font_tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn installed_japanese_fallback_is_available_in_all_ui_families() {
+        if !installed('あ') {
+            eprintln!("no Japanese system font installed; skipping glyph coverage");
+            return;
+        }
+        assert_drawn("ja", "日本語コンポジションレイヤーエフェクト設定");
+    }
+
+    /// #394: Arabic, Hebrew, Indic and Thai names are drawn by an installed face in an English
+    /// interface: the UI fonts were Inter and the CJK fallbacks only, so a layer named in Arabic
+    /// showed as missing-glyph boxes.
+    #[test]
+    fn installed_script_fallbacks_draw_arabic_hebrew_indic_and_thai_names() {
+        // Letters only: a vowel sign or virama on its own is drawn on a dotted circle.
+        for text in ["طبقةمرحبا", "שכבה", "परत", "কলম", "ਕਲਮ", "કલમ", "கடல", "కలమ", "ಕಲಮ", "കലമ", "กขค"]
+        {
+            let Some(probe) = text.chars().next() else { continue };
+            if !installed(probe) {
+                eprintln!("no system font covers {text}; skipping its glyph coverage");
+                continue;
+            }
+            assert_drawn("en", text);
+        }
+    }
+
+    /// egui shapes each run of one face: Arabic letters take their joined forms, and an Arabic
+    /// word reads right to left (its first letter drawn rightmost).
+    #[test]
+    fn arabic_words_are_joined_and_read_right_to_left() {
+        if !installed('م') {
+            eprintln!("no Arabic system font installed; skipping");
+            return;
+        }
+        let ctx = egui::Context::default();
+        super::install(&ctx, &super::Tokens::for_kind(super::ThemeKind::Dark), "en");
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        out.textures_delta.clear();
+        ctx.fonts_mut(|fonts| {
+            let font = egui::FontId::new(13.0, egui::FontFamily::Proportional);
+            let missing = fonts.layout_no_wrap("\u{10ffff}".into(), font.clone(), egui::Color32::WHITE).rows[0].glyphs[0].uv_rect;
+            let alone = fonts.layout_no_wrap("م".into(), font.clone(), egui::Color32::WHITE);
+            let word = fonts.layout_no_wrap("مرحبا".into(), font, egui::Color32::WHITE);
+            let glyphs = &word.rows[0].glyphs;
+            let meem = glyphs.iter().find(|g| g.chr == 'م').expect("the meem is laid out");
+            let alif = glyphs.iter().find(|g| g.chr == 'ا').expect("the alif is laid out");
+            assert!(meem.pos.x > alif.pos.x, "the first letter is drawn rightmost: {} vs {}", meem.pos.x, alif.pos.x);
+            let isolated = alone.rows[0].glyphs[0].uv_rect;
+            for uv in [meem.uv_rect, isolated] {
+                assert_ne!((uv.min, uv.max), (missing.min, missing.max), "a real glyph, not the replacement");
+            }
+            assert_ne!((meem.uv_rect.min, meem.uv_rect.max), (isolated.min, isolated.max), "the meem takes its initial form");
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The last `n` font names of `family`, in order.
+    fn tail(family: &[String], n: usize) -> Vec<&str> {
+        family.iter().rev().take(n).rev().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn cjk_fallbacks_follow_the_interface_language() {
+        // A Chinese interface asks for the Han probe first, so Han text is drawn by a Chinese face
+        // even when the operating system's locale is not Chinese.
+        assert_eq!(cjk_locale("zh-hans"), "zh-hans");
+        assert_eq!(cjk_locale("zh-hant"), "zh-hant");
+        assert_eq!(cjk_locale("ja"), "ja");
+        assert_eq!(cjk_locale("en"), "");
+        assert_eq!(cjk_locale("system"), "");
+        let mut chinese = FontDefinitions::default();
+        let installed = install_script_fallbacks(&mut chinese, "zh-hans");
+        let cjk = |names: &[String]| names.iter().filter(|n| matches!(n.as_str(), "chinese-system" | "japanese-system")).cloned().collect::<Vec<_>>();
+        if cjk(&installed).is_empty() {
+            eprintln!("no CJK font is installed: only the language plumbing can be checked here");
+        } else {
+            assert_eq!(installed.first().map(String::as_str), Some("chinese-system"), "the Han probe comes first");
+            assert!(chinese.font_data.contains_key("chinese-system"));
+        }
+        let expected: Vec<&str> = installed.iter().map(String::as_str).collect();
+        for (family, stack) in &chinese.families {
+            assert_eq!(tail(stack, installed.len()), expected, "{family:?}");
+        }
+        // A Japanese interface keeps the kana probe first, as it was before the language existed.
+        let mut japanese = FontDefinitions::default();
+        let installed = install_script_fallbacks(&mut japanese, "ja");
+        if let Some(first) = cjk(&installed).first() {
+            assert_eq!(installed.first(), Some(first));
+            assert_eq!(first, "japanese-system", "the kana probe comes first");
+        }
+        // And an English interface leaves the operating system's locale in charge.
+        let mut english = FontDefinitions::default();
+        install_script_fallbacks(&mut english, "en");
+    }
+
+    #[test]
+    fn hangul_gets_a_face_when_one_is_installed() {
+        use effectcraft_text::fonts;
+        let mut fonts_def = FontDefinitions::default();
+        install_script_fallbacks(&mut fonts_def, "en");
+        let base = fonts::resolve("Inter", "Regular").face;
+        let id = fonts::fallback_for('한', base);
+        let face = fonts::face(id);
+        if !face.has_char('한') {
+            eprintln!("no Hangul font is installed: nothing to check here");
+            return;
+        }
+        let Some(font) = face.font() else { return };
+        let bytes = font.data().as_bytes();
+        let covered = fonts_def.font_data.values().any(|d| d.font.as_ref() == bytes && d.index == face.info.index);
+        assert!(covered, "a face covering Hangul must be registered with egui");
+    }
+
+    #[test]
+    fn a_fallback_face_is_registered_at_most_once() {
+        let mut fonts = FontDefinitions::default();
+        let installed = install_script_fallbacks(&mut fonts, "zh-hant");
+        let mut unique = installed.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), installed.len(), "no name may be registered twice: {installed:?}");
+        let faces: Vec<_> = installed
+            .iter()
+            .map(|name| {
+                let data = fonts.font_data.get(name).unwrap_or_else(|| panic!("{name} is missing its font data"));
+                (data.font.as_ref(), data.index)
+            })
+            .collect();
+        for (i, a) in faces.iter().enumerate() {
+            assert!(!faces[i + 1..].contains(a), "{} shares its face with a later fallback: {installed:?}", installed[i]);
+        }
+        // Leave the operating system's locale behind for whatever runs next.
+        install_script_fallbacks(&mut fonts, "system");
     }
 }

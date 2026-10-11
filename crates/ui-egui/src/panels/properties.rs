@@ -15,6 +15,7 @@ use egui::{Align2, Color32, Rect, Sense, Stroke, pos2, vec2};
 use serde_json::json;
 
 use crate::dock::PanelKind;
+use crate::i18n::tr;
 use crate::icons::{self, Icon};
 use crate::theme::Tokens;
 use crate::{EffectcraftApp, widgets};
@@ -57,7 +58,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let comp = app.session.active_comp_arc();
     let layer = comp.as_ref().and_then(|c| app.session.state.selected_layers.first().and_then(|id| c.layer(*id)).cloned());
     let (Some(comp), Some(cid), Some(layer)) = (comp, app.session.active_comp_id(), layer) else {
-        p.text(rect.center(), Align2::CENTER_CENTER, "Select a layer to see its properties", Tokens::ui(12.0), t.text_faint);
+        p.text(rect.center(), Align2::CENTER_CENTER, crate::i18n::tr("Select a layer to see its properties"), Tokens::ui(12.0), t.text_faint);
         return;
     };
     let project = app.session.project.clone();
@@ -71,12 +72,23 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let mut y = top;
     let mut actions: Actions = vec![];
 
+    // Several layers selected: "(3) Selected Objects", as in After Effects. The rows show the
+    // first layer; the stopwatch, keyframe button and value edits apply to all of them (#355).
+    let selected = app.session.state.selected_layers.iter().filter(|id| comp.layer(**id).is_some()).count();
+    if selected > 1 {
+        let n = selected.to_string();
+        let label = crate::i18n::tr_args("({}) Selected Objects", &[&n]);
+        p.text(pos2(x0, y + ROW_H / 2.0), Align2::LEFT_CENTER, &label, Tokens::semibold(12.0), t.text);
+        app.auto.add("properties.selectedObjects", Rect::from_min_size(pos2(x0, y), vec2(w, ROW_H)), &label);
+        y += ROW_H + 4.0;
+    }
+
     // ---------------------------------------------------------------- Layer Transform
     if let Some(tr) = layer.transform().cloned() {
         section_header(app, ui, &p, x0, w, y, "Layer Transform", "properties.transform");
         let rr = Rect::from_min_size(pos2(x0 + w - 40.0, y), vec2(40.0, ROW_H));
         let resp = ui.interact(rr, egui::Id::new("props-reset"), Sense::click());
-        p.text(rr.right_center(), Align2::RIGHT_CENTER, "Reset", Tokens::ui(12.0), if resp.hovered() { t.accent_hover } else { t.accent });
+        p.text(rr.right_center(), Align2::RIGHT_CENTER, crate::i18n::tr("Reset"), Tokens::ui(12.0), if resp.hovered() { t.accent_hover } else { t.accent });
         app.auto.add("properties.transform.reset", rr, "Reset Transform");
         if resp.clicked() {
             for pr in tr.props() {
@@ -112,7 +124,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let resp = ui.interact(br, egui::Id::new("props-add-animator"), Sense::click());
         p.rect_stroke(br, 4.0, Stroke::new(1.0, if resp.hovered() { t.text_dim } else { t.field_border }), egui::StrokeKind::Inside);
         icons::paint(&p, Rect::from_center_size(pos2(br.min.x + 14.0, br.center().y), vec2(10.0, 10.0)), Icon::Plus, t.text);
-        p.text(pos2(br.min.x + 26.0, br.center().y), Align2::LEFT_CENTER, "Add Animator", Tokens::ui(12.0), t.text);
+        p.text(pos2(br.min.x + 26.0, br.center().y), Align2::LEFT_CENTER, crate::i18n::tr("Add Animator"), Tokens::ui(12.0), t.text);
         app.auto.add("properties.addAnimator", br, "Add Animator");
         let pop = egui::Id::new("props-add-animator-pop");
         if resp.clicked() {
@@ -120,7 +132,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
         let per_char = layer.props.prop("text/perChar3d").is_some_and(|q| q.value.as_bool());
         let entries = animator_entries(per_char);
-        let labels: Vec<String> = entries.iter().map(|(l, _)| l.clone()).collect();
+        // The entries are the English source strings; the menu draws them translated.
+        let labels: Vec<String> = entries.iter().map(|(l, _)| tr(l).to_string()).collect();
         if let Some(i) = widgets::popup_menu(ui, pop, br.left_bottom(), &labels, None) {
             match entries[i].1 {
                 "" => {}
@@ -132,7 +145,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let pr = Rect::from_min_size(pos2(br.max.x + 8.0, y), vec2(84.0, 24.0));
         let presp = ui.interact(pr, egui::Id::new("props-text-presets"), Sense::click());
         p.rect_stroke(pr, 4.0, Stroke::new(1.0, if presp.hovered() { t.text_dim } else { t.field_border }), egui::StrokeKind::Inside);
-        p.text(pr.center(), Align2::CENTER_CENTER, "Presets", Tokens::ui(12.0), t.text);
+        p.text(pr.center(), Align2::CENTER_CENTER, crate::i18n::tr("Presets"), Tokens::ui(12.0), t.text);
         app.auto.add("properties.textPresets", pr, "Text Animation Presets");
         let ppop = egui::Id::new("props-text-presets-pop");
         if presp.clicked() {
@@ -216,7 +229,7 @@ fn transform_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter,
                 match what {
                     "prev" => actions.push(("time.go".into(), json!({"to": "prevKey", "prop": uid}))),
                     "next" => actions.push(("time.go".into(), json!({"to": "nextKey", "prop": uid}))),
-                    _ => actions.push(("prop.toggleKey".into(), json!({"layer": lid, "prop": uid}))),
+                    _ => actions.push(("prop.toggleKey".into(), json!({"layer": lid, "prop": uid, "selected": true}))),
                 }
             }
         }
@@ -226,13 +239,18 @@ fn transform_row(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter,
         icons::paint(p, swr, Icon::Stopwatch, if resp.hovered() { t.text } else { t.text_dim });
         app.auto.add(&format!("{base}.stopwatch"), swr, &pr.name);
         if resp.clicked() {
-            actions.push(("prop.toggleAnimation".into(), json!({"layer": lid, "prop": uid})));
+            actions.push(("prop.toggleAnimation".into(), json!({"layer": lid, "prop": uid, "selected": true})));
         }
     }
     p.text(pos2(r.min.x + 42.0, cy), Align2::LEFT_CENTER, &pr.name, Tokens::ui(12.0), t.text);
     let vx = r.min.x + (r.width() * 0.5).max(130.0);
     let merge = format!("props-{uid}");
-    let set = |actions: &mut Actions, v: serde_json::Value| actions.push(("prop.set".into(), json!({"layer": lid, "prop": uid, "value": v, "merge": merge})));
+    // With several layers selected the edit applies to all: a scrub by the same change, a typed
+    // value as it is.
+    let scrub = ui.ctx().dragged_id().is_some() && ui.input(|i| i.pointer.is_decidedly_dragging());
+    let set = |actions: &mut Actions, v: serde_json::Value| {
+        actions.push(("prop.set".into(), json!({"layer": lid, "prop": uid, "value": v, "merge": merge, "selected": true, "offset": scrub})))
+    };
     let value = ectx.value(layer, pr);
     let is_scale = pr.name == "Scale";
     let pct = is_scale || pr.name == "Opacity";
@@ -318,13 +336,7 @@ fn text_section(
     // Font family and style.
     let fr = Rect::from_min_size(pos2(x0, y), vec2(w, 22.0));
     let pop = egui::Id::new("props-font-pop");
-    if widgets::dropdown(ui, fr, &doc.font, &t, egui::Id::new("props-font")).clicked() {
-        widgets::open_popup(ui, pop);
-    }
-    app.auto.add("properties.text.font", fr, "Font family");
-    // Every installed family (built only while the menu is open: it can be long).
-    let fams: Vec<String> = if widgets::popup_is_open(ui, pop) { effectcraft_engine::text_families() } else { vec![] };
-    if let Some(f) = widgets::popup_menu(ui, pop, fr.left_bottom(), &fams, fams.iter().position(|f| *f == doc.font)).and_then(|i| fams.get(i)) {
+    if let Some(f) = super::text_panels::font_picker(app, ui, pop, fr, &doc.font, "properties.text.font", true) {
         set(actions, json!({"font": f}));
     }
     y += 28.0;
@@ -362,7 +374,13 @@ fn text_section(
             p.text(pos2(col2, y + 9.0), Align2::LEFT_CENTER, "A", Tokens::semibold(11.0), t.text_dim);
             let r = Rect::from_min_size(pos2(col2 + 26.0, y), vec2(40.0, 18.0));
             let resp = ui.interact(r, egui::Id::new("props-leading-auto"), Sense::click());
-            p.text(pos2(r.min.x + 2.0, r.center().y), Align2::LEFT_CENTER, "Auto", Tokens::ui(12.0), if resp.hovered() { t.accent_hover } else { t.hot_text });
+            p.text(
+                pos2(r.min.x + 2.0, r.center().y),
+                Align2::LEFT_CENTER,
+                crate::i18n::tr("Auto"),
+                Tokens::ui(12.0),
+                if resp.hovered() { t.accent_hover } else { t.hot_text },
+            );
             app.auto.add("properties.text.leading", r, "leading");
             if resp.clicked() {
                 set(actions, json!({"leading": (doc.size * 1.2).round()}));
@@ -393,7 +411,7 @@ fn text_section(
         }
         app.auto.add(&format!("properties.text.{key}"), sw, label);
         let mut rgb = [c[0], c[1], c[2]];
-        if crate::header::color_popup(ui, pop, sw.left_bottom(), &mut rgb) {
+        if crate::widgets::color_popup(ui, pop, sw.left_bottom(), &mut rgb) {
             set(actions, json!({key: [rgb[0], rgb[1], rgb[2]], "merge": format!("props-text-{key}")}));
         }
         p.text(pos2(sw.max.x + 8.0, sw.center().y), Align2::LEFT_CENTER, label, Tokens::ui(12.0), t.text);
@@ -480,7 +498,7 @@ fn more_button(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, x
     let resp = ui.interact(r, egui::Id::new(id), Sense::click());
     p.rect_filled(r, 4.0, if resp.hovered() { t.hover } else { t.field_bg });
     p.text(pos2(r.min.x + 8.0, r.center().y), Align2::LEFT_CENTER, "···", Tokens::semibold(12.0), t.text);
-    p.text(pos2(r.min.x + 26.0, r.center().y), Align2::LEFT_CENTER, "More", Tokens::ui(12.0), t.text);
+    p.text(pos2(r.min.x + 26.0, r.center().y), Align2::LEFT_CENTER, crate::i18n::tr("More"), Tokens::ui(12.0), t.text);
     app.auto.add(auto, r, "More");
     if resp.clicked() {
         app.show_panel(panel);

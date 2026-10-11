@@ -1,11 +1,18 @@
 # EffectCraft for 5RoD — development status
 
-This is a Windows development fork of EffectCraft 0.6.0. The requested complete After Effects
+This is a Windows development fork of EffectCraft 0.8.0. The requested complete After Effects
 experience is the target; this build is not an accepted replacement yet. The existing installed
 application and Desktop shortcut have not been removed or replaced.
 
 ## Changes in this milestone
 
+- The upstream 0.8.0 integration retains this fork's journal, branching history, native tools and
+  theme alongside the newer camera/3D, color, docking, relinking and bounded frame-queue work.
+  Those features still need representative footage and workflow acceptance before installation.
+- Native and WebAssembly plug-ins render into provisional frames. Invalid geometry, parameters,
+  transfer bounds and trapped execution return checked errors; failed frames cannot become valid
+  previews or replace an existing export. Time-dependent API 1 plug-ins keep their layer clock in
+  the render-cache identity, so caching static layers cannot freeze animated plug-in output.
 - Project files and recovery checkpoints include undo, redo and abandoned branches. The History
   panel can revisit them after reopening. History is retained without the old 32/99 edit cap by
   default; continuous gestures still form one undo step. Unchanged items and layers are shared in
@@ -95,11 +102,11 @@ and the inherited [gap assessment](../gaps.md).
 ## Validation
 
 The complete repository gate is `cargo xtask ci`: formatting, clippy, workspace tests, dependency
-layering, licensed assets and WebAssembly checks. The integrated run passed on 2026-10-11 (local date):
-2,411 tests passed, 26 explicitly optional tests were ignored, all 30 assets were attributed,
+layering, licensed assets and WebAssembly checks. The 0.8.0 integration passed on 2026-10-11 (local date):
+2,955 tests passed, 27 explicitly optional tests were ignored, all 31 assets were attributed,
 dependency layering passed, and 32 crates passed the WebAssembly check. Formatting and native
-clippy with warnings denied also passed. The WebAssembly check reports one inherited dead-code
-warning in `effectcraft-media::pool::sample_time`.
+clippy with warnings denied also passed. The WebAssembly check reports an inherited dead-code
+warning for the native shortcut-suspension state.
 
 The run found and corrected a duplicate shortcut, missing Japanese menu entries, an assumption
 about variable-font advances, and timing-dependent test expectations. The viewer GPU test now
@@ -111,9 +118,10 @@ the production build and comparable performance measurements use the repository'
 profile. The measured host is an i9-10900F, 32 GB RAM and RTX 3050. Screenshots were generated from
 the real UI with the original procedural demo and inspected after rendering. The counter dialog
 was also inspected at 1680×1020 and 640×480; its action buttons remain visible while the fields scroll.
-The normal production desktop executable launched on the RTX 3050 Vulkan device, reopened the
+The earlier 0.6-based production desktop executable launched on the RTX 3050 Vulkan device, reopened the
 counter project, rendered its animated digits through the control API, and exited cleanly using
-an isolated configuration folder. [Performance results](performance.md) report the measured scope.
+an isolated configuration folder. The integrated 0.8 build still needs a production build and
+moving-footage acceptance. [Performance results](performance.md) report the earlier measured scope.
 
 The new journal also passed a separate Windows desktop test: simultaneous instances, forced
 termination, a real filesystem write failure and retry, Unicode content, exact project/history
@@ -124,11 +132,20 @@ establish production speed. Their scope is recorded in [edit recovery](edit-reco
 
 ## Playback and export acceptance targets
 
-The requested working footage is **2560×1440 at 60–144 fps**. Playback acceptance must measure
+The requested working footage is primarily **2560×1440 at 120 fps**, with 60 fps also used and
+144 fps reserved for optional stress testing. Playback acceptance must measure
 decoded video in the actual timeline: cold and cached startup, sustained presentation, dropped
 frames, scrubbing latency, p95/p99 frame time and memory growth. Frame deadlines are approximately
-16.67 ms at 60 fps and 6.94 ms at 144 fps. Existing synthetic render and edit benchmarks do not
+16.67 ms at 60 fps, 8.33 ms at 120 fps and 6.94 ms at 144 fps. Existing synthetic render and edit benchmarks do not
 prove this target. Effects, codecs and project complexity must be reported with each result.
+
+The supplied recording settings are OBS NVIDIA NVENC H.264, High profile, CQP 20, two B-frames,
+two-second keyframes, P5, High Quality tuning, quarter-resolution multipass, adaptive quantization
+enabled and lookahead disabled. The container is Hybrid MP4 with three AAC audio tracks; rescaling
+is disabled. Test finalized recordings and fragment boundaries as well as ordinary MP4 fixtures.
+OBS documents Hybrid MP4's fragmented storage and finalization in its
+[format guide](https://obsproject.com/kb/hybrid-mp4). The screenshot does not establish audio
+bitrate, color format or export preferences.
 
 Maximum-quality export should use the available i9-10900F, RTX 3050 and 32 GB RAM efficiently,
 including parallel work where it improves measured throughput. The user accepts reduced desktop

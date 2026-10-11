@@ -480,9 +480,16 @@ TextDocument.prototype = {
   get smallCaps() { return this.__style("smallCaps", false); },
   set smallCaps(v) { this.__set("smallCaps", !!v); },
   get superscript() { return this.__style("baseline", "normal") === "superscript"; },
-  set superscript(v) { this.__set("superscript", !!v); },
+  set superscript(v) {
+    // The pending document reads the same canonical baseline that setValue will apply.
+    if (v) this.__set("baseline", "superscript");
+    else if (this.superscript) this.__set("baseline", "normal");
+  },
   get subscript() { return this.__style("baseline", "normal") === "subscript"; },
-  set subscript(v) { this.__set("subscript", !!v); },
+  set subscript(v) {
+    if (v) this.__set("baseline", "subscript");
+    else if (this.subscript) this.__set("baseline", "normal");
+  },
   get tsume() { return this.__style("tsume", 0); },
   set tsume(v) { this.__set("tsume", __num(v)); },
   get boxText() { return !!(this.__base && this.__base.box_size); },
@@ -574,7 +581,9 @@ PropertyBase.prototype = {
     return false;
   },
   set selected(v) {
-    if (v) __call("prop.select", { comp: this.__layer.__comp, layer: this.__layer.__id, prop: this.__uid, add: true });
+    var ref = { comp: this.__layer.__comp, layer: this.__layer.__id, prop: this.__uid };
+    if (v) __call("prop.select", { comp: ref.comp, layer: ref.layer, prop: ref.prop, add: true });
+    else __call("prop.deselect", ref);
   },
   propertyGroup: function (n) {
     var p = this;
@@ -824,31 +833,30 @@ Property.prototype.property = function () { return null; };
   };
   P.keyTime = function (i) { return this.__key(i).time; };
   P.keyValue = function (i) { return this.__fromEngine(this.__key(i).value, this.__info()); };
-  // Select key `i` (only) so the selection-based keyframe commands act on it.
-  P.__select = function (i) {
-    var k = this.__key(i);
-    __call("keys.select", { comp: this.__layer.__comp, keys: [{ layer: this.__layer.__id, prop: this.__uid, time: k.layerTime }] });
-    return k;
+  // Run a keyframe command that acts on the selected keys on key `i` only; the user's key
+  // selection stays as it was, as with After Effects' per-key methods.
+  P.__keyCmd = function (i, id, params) {
+    this.__key(i);
+    params = params || {};
+    params.comp = this.__layer.__comp;
+    params.__keys = [{ layer: this.__layer.__id, prop: this.__uid, index: __num(i) - 1 }];
+    return __call(id, params);
   };
-  P.removeKey = function (i) {
-    this.__select(i);
-    __call("keys.delete", { comp: this.__layer.__comp });
-  };
+  P.removeKey = function (i) { this.__keyCmd(i, "keys.delete"); };
   P.keyInInterpolationType = function (i) { return KeyframeInterpolationType[this.__key(i).inInterp]; };
   P.keyOutInterpolationType = function (i) { return KeyframeInterpolationType[this.__key(i).outInterp]; };
-  P.isInterpolationTypeValid = function (t) { return t === 6612 || t === 6613 || t === 6614; };
+  // Values that don't interpolate (checkboxes, popups, text) only hold.
+  P.isInterpolationTypeValid = function (t) { return t === 6614 || ((t === 6612 || t === 6613) && this.__info().interpolates !== false); };
   P.setInterpolationTypeAtKey = function (i, inType, outType) {
     if (outType === undefined) outType = inType;
     if (!__interpKey[inType] || !__interpKey[outType]) throw __err("Bad KeyframeInterpolationType");
-    this.__select(i);
-    __call("keys.interpolation", { comp: this.__layer.__comp, "in": __interpKey[inType], out: __interpKey[outType] });
+    this.__keyCmd(i, "keys.interpolation", { "in": __interpKey[inType], out: __interpKey[outType] });
   };
   P.keyInTemporalEase = function (i) { return this.__key(i).inEase.map(function (e) { return new KeyframeEase(e.speed, e.influence); }); };
   P.keyOutTemporalEase = function (i) { return this.__key(i).outEase.map(function (e) { return new KeyframeEase(e.speed, e.influence); }); };
   P.setTemporalEaseAtKey = function (i, inEase, outEase) {
     if (outEase === undefined) outEase = inEase;
     if (!(inEase instanceof Array) || !(outEase instanceof Array)) throw __err("setTemporalEaseAtKey: eases must be arrays of KeyframeEase");
-    this.__select(i);
     function sp(a) { return a.map(function (e) { return __num(e.speed, "speed"); }); }
     function inf(a) {
       return a.map(function (e) {
@@ -857,14 +865,14 @@ Property.prototype.property = function () { return null; };
         return x;
       });
     }
-    __call("keys.velocity", { comp: this.__layer.__comp, inSpeed: sp(inEase), inInfluence: inf(inEase), outSpeed: sp(outEase), outInfluence: inf(outEase) });
+    this.__keyCmd(i, "keys.velocity", { inSpeed: sp(inEase), inInfluence: inf(inEase), outSpeed: sp(outEase), outInfluence: inf(outEase) });
   };
   P.keyTemporalContinuous = function (i) { return !!this.__key(i).continuous; };
-  P.setTemporalContinuousAtKey = function (i, b) { this.__select(i); __call("keys.interpolation", { comp: this.__layer.__comp, continuous: !!b }); };
+  P.setTemporalContinuousAtKey = function (i, b) { this.__keyCmd(i, "keys.interpolation", { continuous: !!b }); };
   P.keyTemporalAutoBezier = function (i) { return !!this.__key(i).autoBezier; };
-  P.setTemporalAutoBezierAtKey = function (i, b) { this.__select(i); __call("keys.interpolation", { comp: this.__layer.__comp, autoBezier: !!b }); };
+  P.setTemporalAutoBezierAtKey = function (i, b) { this.__keyCmd(i, "keys.interpolation", { autoBezier: !!b }); };
   P.keyRoving = function (i) { return !!this.__key(i).roving; };
-  P.setRovingAtKey = function (i, b) { this.__select(i); __call("keys.interpolation", { comp: this.__layer.__comp, roving: !!b }); };
+  P.setRovingAtKey = function (i, b) { this.__keyCmd(i, "keys.interpolation", { roving: !!b }); };
   P.keyInSpatialTangent = function (i) { return this.__key(i).spatialIn.slice(0, this.__info().dims); };
   P.keyOutSpatialTangent = function (i) { return this.__key(i).spatialOut.slice(0, this.__info().dims); };
   P.keySpatialContinuous = function (i) { return !!this.__key(i).spatialContinuous; };
@@ -873,8 +881,8 @@ Property.prototype.property = function () { return null; };
     var k = this.__key(i);
     __call("keys.setSpatialTangents", this.__ref({ time: k.layerTime, "in": inT, out: outT === undefined ? inT : outT }));
   };
-  P.setSpatialContinuousAtKey = function (i, b) { this.__select(i); __call("keys.interpolation", { comp: this.__layer.__comp, spatial: b ? "continuousBezier" : "bezier" }); };
-  P.setSpatialAutoBezierAtKey = function (i, b) { this.__select(i); __call("keys.interpolation", { comp: this.__layer.__comp, spatial: b ? "autoBezier" : "bezier" }); };
+  P.setSpatialContinuousAtKey = function (i, b) { this.__keyCmd(i, "keys.interpolation", { spatial: b ? "continuousBezier" : "bezier" }); };
+  P.setSpatialAutoBezierAtKey = function (i, b) { this.__keyCmd(i, "keys.interpolation", { spatial: b ? "autoBezier" : "bezier" }); };
   P.keySelected = function (i) { return !!this.__key(i).selected; };
   P.setSelectedAtKey = function (i, b) {
     var k = this.__key(i);
@@ -1229,6 +1237,7 @@ LayerCollection.prototype = {
     if (name !== undefined) p.name = String(name);
     if (width !== undefined) p.width = Math.round(__num(width, "width"));
     if (height !== undefined) p.height = Math.round(__num(height, "height"));
+    if (pixelAspect !== undefined) p.pixelAspect = __num(pixelAspect, "pixelAspect");
     return this.__dur(this.__new(__call("layer.newSolid", p)), duration);
   },
   addNull: function (duration) { return this.__dur(this.__new(__call("layer.newNull", { comp: this.__comp })), duration); },
@@ -1336,7 +1345,18 @@ Item.prototype = {
   get parentFolder() { return __item(this.__info().parent); },
   set parentFolder(f) { __call("project.move", { items: [this.__id], folder: f && f.__id ? f.__id : null }); },
   get selected() { return this.__info().selected; },
-  set selected(v) { if (v) __call("project.select", { items: [this.__id], add: true }); },
+  set selected(v) {
+    var selection = __get("project").selection;
+    var selected = selection.indexOf(this.__id) !== -1;
+    if (!!v === selected) return;
+    if (v) {
+      __call("project.select", { items: [this.__id], add: true });
+    } else {
+      var id = this.__id;
+      // Replace just this item, preserving the other Project panel selections and their order.
+      __call("project.select", { items: selection.filter(function (item) { return item !== id; }) });
+    }
+  },
   get usedIn() { return this.__info().usedIn.map(function (c) { return new CompItem(c); }); },
   remove: function () { __call("project.delete", { items: [this.__id] }); },
 };
@@ -1676,6 +1696,8 @@ Project.prototype = {
   set linearizeWorkingSpace(v) { __call("file.projectSettings", { linearize: !!v }); },
   get workingSpace() { return this.__info().workingSpace; },
   set workingSpace(v) { __call("file.projectSettings", { workingSpace: String(v) || "none" }); },
+  get workingGamma() { return this.__info().workingGamma; },
+  set workingGamma(v) { __call("file.projectSettings", { workingGamma: __num(v) }); },
   get timeDisplayType() { return this.__info().timeDisplayFrames ? TimeDisplayType.FRAMES : TimeDisplayType.TIMECODE; },
   set timeDisplayType(v) { __call("file.projectSettings", { timeDisplay: v === TimeDisplayType.FRAMES ? "frames" : "timecode" }); },
   get expressionEngine() { return "javascript-1.0"; },
@@ -1704,7 +1726,10 @@ Project.prototype = {
   importFile: function (opts) {
     var f = opts instanceof ImportOptions ? opts.file : opts;
     if (!f) throw __err("importFile(): no file");
-    var r = __call("file.import", { paths: [__str(f)] });
+    var args = { paths: [__str(f)] };
+    // After Effects imports just the picked file unless ImportOptions.sequence is set.
+    if (opts instanceof ImportOptions) args.sequence = !!opts.sequence;
+    var r = __call("file.import", args);
     if (r.errors && r.errors.length) throw __err(r.errors.join("; "));
     return __item(r.items[0]);
   },
@@ -1743,11 +1768,11 @@ var app = {
   exitCode: 0,
   saveProjectOnCrash: true,
   onError: null,
+  // Kept in the settings folder, so they last between runs (`script.settings.*`).
   settings: {
-    __s: {},
-    haveSetting: function (sec, key) { return (sec + "/" + key) in this.__s; },
-    getSetting: function (sec, key) { return this.__s[sec + "/" + key] || ""; },
-    saveSetting: function (sec, key, v) { this.__s[sec + "/" + key] = String(v); },
+    haveSetting: function (sec, key) { return __call("script.settings.get", { section: String(sec), key: String(key) }).have; },
+    getSetting: function (sec, key) { return __call("script.settings.get", { section: String(sec), key: String(key) }).value; },
+    saveSetting: function (sec, key, v) { __call("script.settings.save", { section: String(sec), key: String(key), value: String(v) }); },
   },
   preferences: {
     havePref: function () { return false; },

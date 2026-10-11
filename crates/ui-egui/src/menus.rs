@@ -27,6 +27,7 @@ macro_rules! uic {
 
 /// UI-only commands (not in the AE menus; shortcuts and the command palette).
 pub const UI_COMMANDS: &[UiCommand] = &[
+    uic!("window.dockAction", "Docking Action", [], None),
     uic!("playback.ramPreview", "Preview (Numpad 0)", [], Some("Num0")),
     uic!("playback.preview.shiftSpacebar", "Preview (Shift+Spacebar)", [], Some("Shift+Space")),
     uic!("playback.preview.shiftNumpad0", "Preview (Shift+Numpad 0)", [], Some("Shift+Num0")),
@@ -35,9 +36,18 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("view.fit", "Fit", [], Some("Shift+/")),
     uic!("view.actualSize", "100%", [], Some("/")),
     uic!("view.res.auto", "Resolution: Auto", [], None),
+    uic!("viewer.nudge.up", "Move Selected Layers Up 1 Pixel at Current Magnification", [], Some("ArrowUp")),
+    uic!("viewer.nudge.down", "Move Selected Layers Down 1 Pixel at Current Magnification", [], Some("ArrowDown")),
+    uic!("viewer.nudge.left", "Move Selected Layers Left 1 Pixel at Current Magnification", [], Some("ArrowLeft")),
+    uic!("viewer.nudge.right", "Move Selected Layers Right 1 Pixel at Current Magnification", [], Some("ArrowRight")),
+    uic!("viewer.nudge.up10", "Move Selected Layers Up 10 Pixels at Current Magnification", [], Some("Shift+ArrowUp")),
+    uic!("viewer.nudge.down10", "Move Selected Layers Down 10 Pixels at Current Magnification", [], Some("Shift+ArrowDown")),
+    uic!("viewer.nudge.left10", "Move Selected Layers Left 10 Pixels at Current Magnification", [], Some("Shift+ArrowLeft")),
+    uic!("viewer.nudge.right10", "Move Selected Layers Right 10 Pixels at Current Magnification", [], Some("Shift+ArrowRight")),
     uic!("view.safeMargins", "Title/Action Safe", [], None),
     uic!("view.transparencyGrid", "Transparency Grid", [], None),
     uic!("view.fastPreviews", "Fast Previews", [], None),
+    uic!("view.theme.toggle", "Next Appearance Mode", [], None),
     uic!("view.theme.dark", "Theme: Dark", [], None),
     uic!("view.theme.5rod", "Theme: 5RoD", [], None),
     uic!("view.theme.darker", "Theme: Darker", [], None),
@@ -115,6 +125,7 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("app.home", "Home", [], None),
     uic!("markers.dialog", "Marker Settings...", [], None),
     uic!("window.maximizePanel", "Maximize Panel Under Pointer", [], Some("`")),
+    uic!("window.maximizeApp", "Maximize or Restore Application Window", [], Some("Cmd+\\")),
     uic!("window.dockPanel", "Dock Panel", [], None),
     uic!("window.floatPanel", "Undock Panel", [], None),
     uic!("window.closePanel", "Close Panel", [], None),
@@ -231,6 +242,33 @@ fn reveal_targets(app: &EffectcraftApp) -> Vec<u64> {
     }
 }
 
+/// The arrow keys over the Composition panel or the Timeline: move the selected layers 1 pixel
+/// at the viewer's magnification (`up`, `down`, `left`, `right`), 10 with Shift (`up10`…), as
+/// After Effects does, so zoomed in they move by fractions of a comp pixel. Not while typing,
+/// or with mask points selected.
+fn nudge(app: &mut EffectcraftApp, ctx: &egui::Context, dir: &str) -> Result<Value, String> {
+    let (side, n) = match dir.strip_suffix("10") {
+        Some(side) => (side, 10.0),
+        None => (dir, 1.0),
+    };
+    let (x, y) = match side {
+        "up" => (0.0, -n),
+        "down" => (0.0, n),
+        "left" => (-n, 0.0),
+        "right" => (n, 0.0),
+        _ => return Err(format!("unknown nudge `{dir}`")),
+    };
+    let st = &app.session.state;
+    let over = matches!(app.ui.focused, PanelKind::Composition | PanelKind::Viewer(_) | PanelKind::Timeline);
+    if !over || st.selected_layers.is_empty() || st.text_edit.is_some() || !st.selected_vertices.is_empty() {
+        return Ok(Value::Null);
+    }
+    // Screen pixels per comp pixel.
+    let zoom = (app.ui.viewer.zoom.unwrap_or_else(|| crate::panels::viewer::last_fit(ctx)) * ctx.pixels_per_point()) as f64;
+    let k = if zoom.is_finite() && zoom > 1e-6 { 1.0 / zoom } else { 1.0 };
+    run_engine(app, ctx, "layer.nudge", json!({"x": x * k, "y": y * k}))
+}
+
 fn no_params(p: &Value) -> bool {
     p.as_object().is_none_or(|m| m.is_empty())
 }
@@ -266,6 +304,14 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
             Some(item) => run_engine(app, ctx, "renderQueue.remove", json!({"item": item})),
             None => Err("select a Render Queue item first".into()),
         };
+    }
+    // Shift+Delete deletes the Project panel's selection without asking; it does nothing in the
+    // other panels.
+    if id == "project.deleteWithoutConfirmation" {
+        if app.ui.focused != PanelKind::Project {
+            return Ok(Value::Null);
+        }
+        return crate::panels::delete_items::delete_confirmed(app, ctx, json!({}));
     }
     let now = ctx.input(|i| i.time);
     // Closing a modified project asks to save it first; the command runs once answered.
@@ -338,6 +384,9 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
         app.ui.tool = tool;
         return Ok(json!({"tool": tool}));
     }
+    if let Some(dir) = id.strip_prefix("viewer.nudge.") {
+        return nudge(app, ctx, dir);
+    }
     if let Some(k) = id.strip_prefix("timeline.reveal.") {
         if k == "animated" {
             return run_engine(app, ctx, "anim.reveal", json!({"kind": "keyframes"}));
@@ -371,6 +420,34 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
             _ => {}
         }
     }
+    if id == "window.dockAction" {
+        let value = params.get("action").cloned().ok_or("missing docking action")?;
+        let action: craft_ui::docking::Action<PanelKind> = serde_json::from_value(value).map_err(|error| format!("invalid docking action: {error}"))?;
+        if matches!(&action, craft_ui::docking::Action::Open { .. } | craft_ui::docking::Action::OpenAt { .. }) {
+            return Err("use the panel open commands to preserve viewer and ScriptUI lifecycle callbacks".into());
+        }
+        if let craft_ui::docking::Action::Close { panel } = &action {
+            let mut layout = crate::dock_shared::encode(&app.ui.dock, &app.ui.floating)?;
+            layout.apply(action.clone()).map_err(|error| error.to_string())?;
+            app.close_panel(*panel);
+            return Ok(Value::Null);
+        }
+        let mut error = None;
+        if !app.edit_layout(|layout| match layout.apply(action) {
+            Ok(()) => true,
+            Err(reason) => {
+                error = Some(reason);
+                false
+            }
+        }) {
+            return Err(error.unwrap_or_else(|| "invalid docking layout".into()));
+        }
+        return Ok(Value::Null);
+    }
+    // A UI-only command (not in the engine's menus), so `frontend` gets it from here.
+    if id == "window.maximizeApp" {
+        return frontend(app, ctx, id, params);
+    }
     // Docking: {panel, anchor, zone: center|left|right|top|bottom}, {panel, rect?}, {panel?}.
     if let Some(op) = id.strip_prefix("window.").filter(|o| matches!(*o, "maximizePanel" | "dockPanel" | "floatPanel" | "closePanel")) {
         let panel_of = |k: &str| params.get(k).and_then(Value::as_str).map(|s| PanelKind::from_name(s).ok_or(format!("unknown panel `{s}`")));
@@ -390,11 +467,10 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
             }
             "floatPanel" => {
                 let p = panel_of("panel").ok_or("floatPanel: need `panel`")??;
-                let r = params.get("rect").and_then(Value::as_array).map(|a| {
-                    let g = |i: usize| a.get(i).and_then(Value::as_f64).unwrap_or(0.0) as f32;
-                    [g(0), g(1), g(2), g(3)]
-                });
-                let r = r.unwrap_or_else(|| crate::dock_ui::default_float_rect(ctx.content_rect()));
+                let r = match params.get("rect") {
+                    Some(value) => serde_json::from_value::<[f32; 4]>(value.clone()).map_err(|_| "rect must contain four finite numbers")?,
+                    None => crate::dock_ui::default_float_rect(ctx.content_rect()),
+                };
                 if !app.edit_layout(|l| l.float(p, r)) {
                     return Err(format!("can't undock {}", p.title()));
                 }
@@ -426,6 +502,10 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
     if id == "view.res.auto" {
         app.ui.viewer.res = Resolution::Auto;
         return Ok(Value::Null);
+    }
+    if id == "view.theme.toggle" {
+        app.cycle_appearance(ctx);
+        return Ok(json!({"appearanceMode": app.session.prefs.appearance.appearance_mode}));
     }
     if let Some(th) = id.strip_prefix("view.theme.") {
         let k = crate::theme::ThemeKind::from_name(th).ok_or("unknown theme")?;
@@ -588,8 +668,9 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
             // up Effect Controls on that layer, as in After Effects.
             if matches!(id, "effect.apply" | "effect.applyLast") {
                 let r = run_engine(app, ctx, id, params.clone());
-                if r.is_ok() {
+                if let Ok(applied) = &r {
                     crate::panels::effect_controls::reveal_applied(app, &params);
+                    crate::panels::effect_controls::choose_files_after_apply(app, applied);
                 }
                 return r;
             }
@@ -634,7 +715,7 @@ fn clipboard_note(s: &effectcraft_engine::Session) -> String {
     }
 }
 
-fn run_engine(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
+pub(crate) fn run_engine(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
     let r = app.session.execute(id, params).map_err(|e| e.to_string());
     if let Err(e) = &r {
         app.ui.status = e.clone();
@@ -679,6 +760,8 @@ pub fn frontend(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, p: Valu
         }
         // View ▸ New Viewer.
         "view.newViewer" => json!({"viewer": crate::panels::viewers::new_viewer(app)}),
+        // Run by id (control channel, MCP): the Project panel's selection, whatever has focus.
+        "project.deleteWithoutConfirmation" => crate::panels::delete_items::delete_confirmed(app, ctx, json!({}))?,
         "window.scriptPanel" => {
             let id = p.get("window").and_then(Value::as_u64).ok_or("no ScriptUI panel window")? as u32;
             app.show_panel(PanelKind::ScriptPanel(id));
@@ -867,6 +950,12 @@ pub fn frontend(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, p: Valu
             };
             Value::Null
         }
+        // Ctrl+\ / Cmd+\, as in After Effects (#336): `{maximized}`, the window's new state.
+        "window.maximizeApp" => {
+            let maximized = !ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(maximized));
+            json!({"maximized": maximized})
+        }
         "view.fullScreen" => {
             let full = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!full));
@@ -901,6 +990,7 @@ pub fn frontend(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, p: Valu
             let name = app.ui.workspace.clone();
             app.ui.saved_workspaces.insert(name.clone(), app.ui.dock.clone());
             app.ui.saved_floating.insert(name.clone(), app.ui.floating.clone());
+            app.store_saved_workspaces();
             json!({"workspace": name})
         }
         "window.saveWorkspaceAs" => {
@@ -917,6 +1007,7 @@ pub fn frontend(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, p: Valu
             app.ui.saved_workspaces.insert(name.clone(), app.ui.dock.clone());
             app.ui.saved_floating.insert(name.clone(), app.ui.floating.clone());
             app.ui.workspace = name.clone();
+            app.store_saved_workspaces();
             json!({"workspace": name})
         }
         "window.editWorkspaces" => {
@@ -941,6 +1032,7 @@ pub fn frontend(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, p: Valu
                 if app.ui.saved_workspaces.remove(&name).is_none() && !builtin {
                     return Err(format!("no workspace `{name}`"));
                 }
+                app.store_saved_workspaces();
                 if app.ui.workspace == name {
                     app.set_workspace("Default");
                 }
@@ -958,6 +1050,7 @@ pub fn frontend(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, p: Valu
                 if app.ui.workspace == name {
                     app.ui.workspace = new.to_string();
                 }
+                app.store_saved_workspaces();
                 return Ok(json!({"renamed": new}));
             }
             json!({"workspaces": app.workspace_names()})
@@ -1098,6 +1191,7 @@ pub fn frontend(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, p: Valu
 /// Commands that need a file or folder path: ask the host's file dialog when `params` lacks one.
 fn file_dialog(app: &mut EffectcraftApp, id: &str, params: &Value) -> Option<Result<Value, String>> {
     enum Ask {
+        Folder,
         Import,
         OpenProject,
         Save(&'static str),
@@ -1126,6 +1220,7 @@ fn file_dialog(app: &mut EffectcraftApp, id: &str, params: &Value) -> Option<Res
         "file.installScript" | "file.installScriptUIPanel" => ("path", Ask::Open(&["jsx", "js"])),
         "effect.plugins.load" if params.get("folder").is_none() => ("path", Ask::Open(&["wasm", "wat"])),
         "file.replaceFootage" => ("path", Ask::Import),
+        "file.relinkFootage" => ("folder", Ask::Folder),
         "file.collectFiles" => ("folder", Ask::Save("Collected Files")),
         "file.saveCopyAsXml" => ("path", Ask::Save("Untitled Project.ecprojx")),
         "keys.rpfCameraImport" => ("path", Ask::Open(&["json", "csv", "txt"])),
@@ -1142,19 +1237,39 @@ fn file_dialog(app: &mut EffectcraftApp, id: &str, params: &Value) -> Option<Res
     {
         return None;
     }
-    let mut p = params.as_object().cloned().unwrap_or_default();
+    const MEDIA: &[&str] = &[
+        "mp4", "mov", "m4v", "mkv", "webm", "png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp", "exr", "wav", "aif", "aiff", "mp3", "flac", "ogg",
+        "opus", "svg", "pdf", "ai", "eps", "psd", "psb", "gltf", "glb", "obj", "json", "csv", "tsv",
+    ];
+    // A host whose modal dialogs would run a nested event loop inside this frame (macOS: a
+    // drag over the window then re-entered winit's event handler and aborted, #511) shows the
+    // dialog without blocking; the command continues when the answer arrives.
+    if let Some(spawn) = app.hooks.file_dialog_async.as_ref() {
+        let request = match ask {
+            Ask::Folder => crate::FileDialog::Folder,
+            Ask::Import => crate::FileDialog::Open { exts: MEDIA.iter().map(|e| e.to_string()).collect(), many: key == "paths" },
+            Ask::OpenProject => crate::FileDialog::OpenProject,
+            Ask::Open(exts) => crate::FileDialog::Open { exts: exts.iter().map(|e| e.to_string()).collect(), many: false },
+            Ask::Save(default) => crate::FileDialog::save(default),
+        };
+        let tx = app.dialog_answers.0.clone();
+        let answer = crate::DialogAnswer { command: id.to_string(), key, params: params.clone(), paths: Vec::new() };
+        spawn(
+            request,
+            Box::new(move |paths| {
+                let _ = tx.send(crate::DialogAnswer { paths, ..answer });
+            }),
+        );
+        return Some(Ok(json!({"dialog": id})));
+    }
     let picked: Option<Value> = match ask {
+        Ask::Folder => {
+            let Some(f) = app.hooks.pick_folder.as_ref() else { return Some(Err("no folder dialog available (pass `folder`)".into())) };
+            f().map(Value::from)
+        }
         Ask::Import => {
             let Some(f) = app.hooks.pick_files.as_ref() else { return Some(Err("no file dialog available (pass `paths`)".into())) };
-            let paths = f(&[
-                "mp4", "mov", "m4v", "mkv", "webm", "png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp", "exr", "wav", "aif", "aiff", "mp3", "flac",
-                "ogg", "opus", "svg", "pdf", "ai", "eps", "psd", "psb", "gltf", "glb", "obj", "json", "csv", "tsv",
-            ]);
-            match (paths.is_empty(), key) {
-                (true, _) => None,
-                (false, "paths") => Some(json!(paths)),
-                (false, _) => paths.first().map(|s| json!(s)),
-            }
+            picked_value(key, f(MEDIA))
         }
         Ask::OpenProject => {
             let Some(f) = app.hooks.pick_open_project.as_ref() else { return Some(Err("no file dialog available (pass `path`)".into())) };
@@ -1165,19 +1280,47 @@ fn file_dialog(app: &mut EffectcraftApp, id: &str, params: &Value) -> Option<Res
             f(exts).first().map(|s| json!(s))
         }
         Ask::Save(default) => {
-            let Some(f) = app.hooks.pick_save.as_ref() else { return Some(Err("no file dialog available (pass `path`)".into())) };
-            f(default).map(|s| json!(s))
+            let Some(picked) = app.hooks.save_dialog(default) else { return Some(Err("no file dialog available (pass `path`)".into())) };
+            picked.map(|s| json!(s))
         }
     };
     let Some(v) = picked else { return Some(Ok(Value::Null)) };
+    Some(run_with_picked(app, id, key, params, v))
+}
+
+/// The dialog's answer as the command's `key` parameter (`None`: cancelled).
+fn picked_value(key: &str, paths: Vec<String>) -> Option<Value> {
+    match (paths.is_empty(), key) {
+        (true, _) => None,
+        (false, "paths") => Some(json!(paths)),
+        (false, _) => paths.into_iter().next().map(Value::from),
+    }
+}
+
+/// A file dialog shown without blocking ([`crate::Hooks::file_dialog_async`]) answered: run its
+/// command with the picked path (nothing when it was cancelled).
+pub(crate) fn dialog_answered(app: &mut EffectcraftApp, answer: crate::DialogAnswer) {
+    let Some(v) = picked_value(answer.key, answer.paths) else { return };
+    if let Err(e) = run_with_picked(app, &answer.command, answer.key, &answer.params, v) {
+        app.ui.status = e;
+    }
+}
+
+/// Run command `id` with the path picked for it in parameter `key`.
+fn run_with_picked(app: &mut EffectcraftApp, id: &str, key: &str, params: &Value, v: Value) -> Result<Value, String> {
+    let mut p = params.as_object().cloned().unwrap_or_default();
     p.insert(key.to_string(), v);
     // Picked files import in the background, with the Importing card showing progress (#270).
     if matches!(id, "file.import" | "file.importMultiple") {
         p.insert("background".into(), Value::Bool(true));
     }
-    // Photoshop files ask how to import them first.
-    if id == "file.import" && crate::panels::dialogs::open_form(app, id, &Value::Object(p.clone())) {
-        return Some(Ok(json!({"dialog": id})));
+    // Photoshop files ask how to import them first; numbered stills whether to import them as an
+    // image sequence.
+    let picked = Value::Object(p.clone());
+    if id == "file.import" && crate::panels::dialogs::open_form(app, id, &picked)
+        || matches!(id, "file.import" | "file.importMultiple") && crate::panels::forms::open_import_sequence(app, &picked)
+    {
+        return Ok(json!({"dialog": id}));
     }
     // Save (untitled) becomes Save As.
     let id = if id == "file.save" { "file.saveAs" } else { id };
@@ -1185,7 +1328,7 @@ fn file_dialog(app: &mut EffectcraftApp, id: &str, params: &Value) -> Option<Res
     if let Err(e) = &r {
         app.ui.status = e.clone();
     }
-    Some(r)
+    r
 }
 
 /// A menu entry for display / `ui.menu.list`.
@@ -1341,7 +1484,16 @@ pub fn shortcut_text(s: &str) -> String {
 pub fn parse_shortcut(s: &str) -> Option<(egui::Modifiers, egui::Key)> {
     let mut m = egui::Modifiers::NONE;
     let mut key = None;
-    let parts: Vec<&str> = if s == "+" { vec!["+"] } else { s.split('+').collect() };
+    // The plus key itself is written `+` or `Cmd++`.
+    let (head, plus) = match s.strip_suffix("++") {
+        Some(h) => (h, true),
+        None if s == "+" => ("", true),
+        None => (s, false),
+    };
+    let mut parts: Vec<&str> = if head.is_empty() { vec![] } else { head.split('+').collect() };
+    if plus {
+        parts.push("+");
+    }
     for p in parts {
         match p {
             "Cmd" => {
@@ -1443,16 +1595,55 @@ fn space_tap_id() -> egui::Id {
     egui::Id::new("spacebar-tap")
 }
 
+/// The modifiers held when this frame's input began: the state the last pass ended with, if it
+/// ran this (egui keeps only the state after the frame's events). Records this pass's state.
+fn modifiers_at_start(ctx: &egui::Context) -> Option<egui::Modifiers> {
+    let id = egui::Id::new("shortcut-modifiers");
+    let pass = ctx.cumulative_pass_nr();
+    let now = ctx.input(|i| i.modifiers);
+    ctx.data_mut(|d| {
+        let last = d.get_temp::<(u64, egui::Modifiers, Option<egui::Modifiers>)>(id);
+        if let Some((p, _, start)) = last
+            && p == pass
+        {
+            return start;
+        }
+        let start = last.and_then(|(p, m, _)| (p.checked_add(1) == Some(pass)).then_some(m));
+        d.insert_temp(id, (pass, now, start));
+        start
+    })
+}
+
+/// Only Shift held (Shift+Delete, not Ctrl/Alt+Shift+Delete).
+fn only_shift(m: egui::Modifiers) -> bool {
+    m.shift && !m.alt && !m.ctrl && !m.command && !m.mac_cmd
+}
+
 /// Dispatch keyboard shortcuts (skipped while typing in a text field).
 pub fn handle_shortcuts(app: &mut EffectcraftApp, ctx: &egui::Context) {
+    handle_shortcuts_impl(app, ctx, false);
+}
+
+/// Tab can acquire widget focus while the current frame is drawn. Dispatch its application
+/// binding only afterward, and only when no widget owned focus before or after layout.
+pub fn handle_tab_shortcut(app: &mut EffectcraftApp, ctx: &egui::Context) {
+    if ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
+        handle_shortcuts_impl(app, ctx, true);
+    }
+}
+
+fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only: bool) {
+    let start = modifiers_at_start(ctx);
     // Dialog cancellation owns Escape even when a text field has keyboard focus.
-    if app.dialog.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+    if !tab_only && app.dialog.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         if crate::panels::shortcut_editor::recording(app) || egui::Popup::is_any_open(ctx) {
             return;
         }
         ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         if app.dialog == Some(crate::Dialog::LayerStyles) {
             crate::panels::layer_styles_dialog::finish(app, false);
+        } else if app.dialog == Some(crate::Dialog::Info) {
+            crate::panels::forms::close_info(app);
         } else {
             if app.dialog == Some(crate::Dialog::Settings)
                 && let Some(p) = app.dialog_state.prefs_snapshot.take()
@@ -1472,32 +1663,65 @@ pub fn handle_shortcuts(app: &mut EffectcraftApp, ctx: &egui::Context) {
     if ctx.input(|i| i.pointer.any_down()) || ctx.egui_wants_keyboard_input() {
         ctx.data_mut(|d| d.remove::<bool>(space_tap_id()));
     }
-    if ctx.egui_wants_keyboard_input() {
+    // While a menu or popup list is open, keys go to it, not to the app (Space must not start a
+    // preview behind the menu, #279).
+    if ctx.egui_wants_keyboard_input() || crate::widgets::any_menu_open(ctx) {
         return;
     }
     // Text editing in the viewer takes the clipboard events itself.
     let clipboard = app.session.state.text_edit.is_none();
-    let events: Vec<(egui::Key, egui::Modifiers, bool)> = ctx.input(|i| {
+    let project = app.ui.focused == PanelKind::Project;
+    let mut events: Vec<(egui::Key, egui::Modifiers, bool)> = ctx.input(|i| {
         // The windowing layer turns Ctrl+C / Ctrl+X / Ctrl+V into clipboard events instead of
         // key presses: map them back to the keys (with the modifiers held) so Edit ▸ Copy, Cut,
-        // Paste and their variants (Ctrl+Alt+C…) run.
-        let held = if i.modifiers.command { i.modifiers } else { egui::Modifiers::COMMAND };
-        i.events
-            .iter()
-            .filter_map(|e| match e {
+        // Paste and their variants (Ctrl+Alt+C…) run. Clipboard events carry no modifiers and
+        // `i.modifiers` is the state after all of the frame's events, so each is read with the
+        // modifiers where it is in the stream: walk the events from the frame's starting state.
+        // `None` when that isn't known.
+        let changed = i.events.iter().any(|e| matches!(e, egui::Event::ModifiersChanged(_) | egui::Event::WindowFocused(false)));
+        let mut at = if changed { start } else { Some(i.modifiers) };
+        let held = |at: Option<egui::Modifiers>| at.filter(|m| m.command).unwrap_or(egui::Modifiers::COMMAND);
+        let mut out = Vec::new();
+        for e in &i.events {
+            match e {
+                egui::Event::ModifiersChanged(m) => at = Some(*m),
+                // egui forgets the modifiers held when the window loses focus.
+                egui::Event::WindowFocused(false) => at = Some(egui::Modifiers::NONE),
                 egui::Event::Key { key, pressed: true, modifiers, repeat, .. }
-                    if !*repeat || matches!(key, egui::Key::PageUp | egui::Key::PageDown | egui::Key::ArrowLeft | egui::Key::ArrowRight) =>
+                    if !*repeat
+                        || matches!(
+                            key,
+                            egui::Key::PageUp | egui::Key::PageDown | egui::Key::ArrowLeft | egui::Key::ArrowRight | egui::Key::ArrowUp | egui::Key::ArrowDown
+                        ) =>
                 {
-                    Some((*key, *modifiers, true))
+                    out.push((*key, *modifiers, true));
                 }
-                egui::Event::Key { key: egui::Key::Space, pressed: false, .. } => Some((egui::Key::Space, egui::Modifiers::NONE, false)),
-                egui::Event::Copy if clipboard => Some((egui::Key::C, held, true)),
-                egui::Event::Cut if clipboard => Some((egui::Key::X, held, true)),
-                egui::Event::Paste(_) if clipboard => Some((egui::Key::V, held, true)),
-                _ => None,
-            })
-            .collect()
+                egui::Event::Key { key: egui::Key::Space, pressed: false, .. } => out.push((egui::Key::Space, egui::Modifiers::NONE, false)),
+                egui::Event::Copy if clipboard => out.push((egui::Key::C, held(at), true)),
+                // On Windows, Shift+Delete is the old Cut key and arrives as Cut too. The Project
+                // panel has no clipboard: there a Cut with only Shift held is Shift+Delete (Delete
+                // Project Items Without Confirmation). Never when the modifiers aren't known.
+                egui::Event::Cut if clipboard && project && at.is_some_and(only_shift) => {
+                    out.push((egui::Key::Delete, egui::Modifiers::SHIFT, true));
+                }
+                egui::Event::Cut if clipboard => out.push((egui::Key::X, held(at), true)),
+                egui::Event::Paste(_) if clipboard => out.push((egui::Key::V, held(at), true)),
+                _ => {}
+            }
+        }
+        out
     });
+    events.retain(|(key, _, _)| (*key == egui::Key::Tab) == tab_only);
+    // Numpad * (or `*` typed with Shift+8): Add Marker (#275). egui has no key for it, so it
+    // comes as text.
+    if !tab_only && clipboard && app.dialog.is_none() && ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Text(t) if t == "*"))) {
+        let bound = app.session.shortcuts().bindings().into_iter().find(|(k, _)| *k == "Num*").map(|(_, b)| (b.command.clone(), b.params.clone()));
+        if let Some((id, params)) = bound
+            && let Err(e) = invoke(app, ctx, &id, if params.is_null() { json!({}) } else { params })
+        {
+            app.ui.status = e;
+        }
+    }
     if events.is_empty() {
         return;
     }
@@ -1520,6 +1744,10 @@ pub fn handle_shortcuts(app: &mut EffectcraftApp, ctx: &egui::Context) {
         if key == egui::Key::Escape && app.dialog.is_some() {
             // Escape while recording a shortcut cancels the recording, not the editor.
             if crate::panels::shortcut_editor::recording(app) {
+                continue;
+            }
+            if app.dialog == Some(crate::Dialog::Info) {
+                crate::panels::forms::close_info(app);
                 continue;
             }
             // Escape in Settings is Cancel: restore the settings from when it opened.
@@ -1569,6 +1797,7 @@ pub fn handle_shortcuts(app: &mut EffectcraftApp, ctx: &egui::Context) {
 pub fn menu_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
     let mut clicked: Option<(String, Value)> = None;
+    let mut nav = crate::menu_keys::Nav::default();
     ui.horizontal_centered(|ui| {
         ui.add_space(6.0);
         egui::MenuBar::new().ui(ui, |ui| {
@@ -1576,13 +1805,15 @@ pub fn menu_bar(app: &mut EffectcraftApp, ui: &mut egui::Ui) {
                 if let MenuNode::Submenu { label, children } = node {
                     let r = ui.menu_button(crate::i18n::label(app, "", label), |ui| {
                         ui.set_min_width(if label == "Effect" { 200.0 } else { 280.0 });
-                        crate::widgets::menu_scroll(ui, |ui| menu_nodes(app, ui, children, &mut clicked));
+                        crate::widgets::menu_scroll(ui, |ui| menu_nodes(app, ui, children, &mut clicked, &mut nav, 0));
                     });
+                    nav.top(&r.response);
                     app.auto.add(&format!("menu.{label}"), r.response.rect, label);
                 }
             }
         });
     });
+    crate::menu_keys::handle(&ctx, &nav);
     if let Some((id, params)) = clicked
         && let Err(e) = invoke(app, &ctx, &id, if params.is_null() { json!({}) } else { params })
     {
@@ -1597,12 +1828,20 @@ pub(crate) fn menu_contents(app: &mut EffectcraftApp, ui: &mut egui::Ui, name: &
     if let Some(MenuNode::Submenu { children, .. }) =
         effectcraft_engine::menus::menu_bar().iter().find(|n| matches!(n, MenuNode::Submenu { label, .. } if label == name))
     {
-        menu_nodes(app, ui, children, &mut clicked);
+        menu_nodes(app, ui, children, &mut clicked, &mut crate::menu_keys::Nav::default(), 0);
     }
     clicked.map(|(id, params)| (id, if params.is_null() { json!({}) } else { params }))
 }
 
-fn menu_nodes(app: &mut EffectcraftApp, ui: &mut egui::Ui, nodes: &[MenuNode], clicked: &mut Option<(String, Value)>) {
+/// The entries `nodes` of a menu `depth` submenus deep, registered with `nav` for the keyboard.
+fn menu_nodes(
+    app: &mut EffectcraftApp,
+    ui: &mut egui::Ui,
+    nodes: &[MenuNode],
+    clicked: &mut Option<(String, Value)>,
+    nav: &mut crate::menu_keys::Nav,
+    depth: usize,
+) {
     for n in nodes {
         match n {
             MenuNode::Separator => {
@@ -1632,6 +1871,7 @@ fn menu_nodes(app: &mut EffectcraftApp, ui: &mut egui::Ui, nodes: &[MenuNode], c
                         None => r,
                     };
                     app.auto.add(&format!("menu.{name}.{i}"), r.rect, &e.label);
+                    nav.entry(ui, depth, &r, false);
                     if r.clicked() {
                         *clicked = Some((e.command.clone(), e.params.clone()));
                         ui.close();
@@ -1641,18 +1881,56 @@ fn menu_nodes(app: &mut EffectcraftApp, ui: &mut egui::Ui, nodes: &[MenuNode], c
             MenuNode::Submenu { label, children } => {
                 let ws = app.ui.workspace.clone();
                 let shown = crate::i18n::submenu(app, label, effectcraft_engine::menus::submenu_label(&app.session, label, &dyn_ctx(&ws, &[])));
-                ui.menu_button((gutter(false), shown.as_str()), |ui| {
+                let r = ui.menu_button((gutter(false), shown.as_str()), |ui| {
                     ui.set_min_width(if children.len() > 30 { 200.0 } else { 240.0 });
-                    crate::widgets::menu_scroll(ui, |ui| menu_nodes(app, ui, children, clicked));
+                    crate::widgets::menu_scroll(ui, |ui| menu_nodes(app, ui, children, clicked, nav, depth + 1));
                 });
+                nav.entry(ui, depth, &r.response, true);
+                if r.inner.is_some() {
+                    nav.opened(depth, &r.response);
+                }
             }
             MenuNode::Item(e) => {
-                if menu_entry(app, ui, e) {
+                let r = menu_entry(app, ui, e);
+                nav.entry(ui, depth, &r, false);
+                if r.clicked() {
                     *clicked = Some((e.command.clone(), e.params.clone()));
                     ui.close();
                 }
             }
         }
+    }
+}
+
+/// The menu bar's submenu at `path` (`["File", "Interpret Footage"]`) in a panel's context menu,
+/// with the menu bar's labels, shortcuts and enabled state; a chosen entry goes to `clicked`.
+pub(crate) fn submenu_at(app: &mut EffectcraftApp, ui: &mut egui::Ui, path: &[&str], clicked: &mut Option<(String, Value)>) {
+    let mut nodes = effectcraft_engine::menus::menu_bar();
+    let mut found = None;
+    for label in path {
+        let Some(n) = nodes.iter().find(|n| matches!(n, MenuNode::Submenu { label: l, .. } if l == label)) else { return };
+        if let MenuNode::Submenu { children, .. } = n {
+            nodes = children;
+        }
+        found = Some(n);
+    }
+    if let Some(n) = found {
+        menu_nodes(app, ui, std::slice::from_ref(n), clicked, &mut crate::menu_keys::Nav::default(), 0);
+    }
+    if let Some((_, p)) = clicked.as_mut()
+        && p.is_null()
+    {
+        *p = json!({});
+    }
+}
+
+/// The menu bar's entry for `command` in a panel's context menu (see [`submenu_at`]).
+pub(crate) fn entry_for(app: &EffectcraftApp, ui: &mut egui::Ui, command: &str, clicked: &mut Option<(String, Value)>) {
+    if let Some((_, e)) = effectcraft_engine::menus::entries().into_iter().find(|(_, e)| e.command == command)
+        && menu_entry(app, ui, e).clicked()
+    {
+        *clicked = Some((e.command.clone(), e.params_or_empty()));
+        ui.close();
     }
 }
 
@@ -1667,18 +1945,47 @@ fn gutter(checked: bool) -> egui::Atom<'static> {
     (if checked { "✔" } else { "" }).atom_size(egui::vec2(14.0, 14.0))
 }
 
-fn menu_entry(app: &EffectcraftApp, ui: &mut egui::Ui, e: &MenuEntry) -> bool {
-    let label = entry_label(app, e);
-    let mut b = egui::Button::new((gutter(entry_checked(app, e) == Some(true)), label));
+fn menu_entry(app: &EffectcraftApp, ui: &mut egui::Ui, e: &MenuEntry) -> egui::Response {
+    let (label, check, enabled) = (entry_label(app, e), gutter(entry_checked(app, e) == Some(true)), entry_enabled(app, e));
+    // Edit ▸ Label's entries show the label's colour before its name.
+    if e.command == "edit.label"
+        && let Some(l) = e.params.get("label").and_then(Value::as_str).and_then(effectcraft_engine::color::Label::from_name)
+    {
+        let out = ui.add_enabled_ui(enabled, |ui| egui::Button::new((check, crate::widgets::label_swatch(), label)).atom_ui(ui)).inner;
+        crate::widgets::paint_label_swatch(ui, &out, l, &app.tokens);
+        return out.response;
+    }
+    let mut b = egui::Button::new((check, label));
     if let Some(s) = entry_shortcut(app, e) {
         b = b.shortcut_text(shortcut_text(&s));
     }
-    ui.add_enabled(entry_enabled(app, e), b).clicked()
+    ui.add_enabled(enabled, b)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shortcut_passes_share_frame_start_modifiers() {
+        let ctx = egui::Context::default();
+        let mut starts = Vec::new();
+        let mut output = ctx.run_ui(egui::RawInput { events: vec![egui::Event::ModifiersChanged(egui::Modifiers::SHIFT)], ..Default::default() }, |ui| {
+            let ctx = ui.ctx();
+            starts.push(modifiers_at_start(ctx));
+            starts.push(modifiers_at_start(ctx));
+        });
+        output.textures_delta.clear();
+        assert_eq!(starts, vec![None, None]);
+        starts.clear();
+        let mut output = ctx.run_ui(egui::RawInput { events: vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)], ..Default::default() }, |ui| {
+            let ctx = ui.ctx();
+            starts.push(modifiers_at_start(ctx));
+            starts.push(modifiers_at_start(ctx));
+        });
+        output.textures_delta.clear();
+        assert_eq!(starts, vec![Some(egui::Modifiers::SHIFT), Some(egui::Modifiers::SHIFT)]);
+    }
 
     #[test]
     fn every_ui_shortcut_parses() {
@@ -1709,6 +2016,34 @@ mod tests {
         }
     }
 
+    /// #336: Ctrl+\ (Cmd+\ on macOS) maximizes the application window, and again restores
+    /// it, as in After Effects.
+    #[test]
+    fn ctrl_backslash_maximizes_or_restores_the_window() {
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        let (m, k) = parse_shortcut("Cmd+\\").unwrap();
+        assert!(m.command && k == egui::Key::Backslash, "{m:?} {k:?}");
+        assert!(bindings(&app.session).iter().any(|b| (b.0, b.1) == (m, k) && b.2 == "window.maximizeApp"));
+        let ctx = egui::Context::default();
+        let run = |app: &mut EffectcraftApp, maximized: bool| {
+            let input = egui::RawInput {
+                viewports: std::iter::once((egui::ViewportId::ROOT, egui::ViewportInfo { maximized: Some(maximized), ..Default::default() })).collect(),
+                ..Default::default()
+            };
+            let mut r = Value::Null;
+            let mut out = ctx.run_ui(input, |ui| r = invoke(app, ui.ctx(), "window.maximizeApp", json!({})).unwrap());
+            out.textures_delta.clear();
+            let cmds = out.viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.commands.clone()).unwrap_or_default();
+            (r, cmds)
+        };
+        let (r, cmds) = run(&mut app, false);
+        assert_eq!(r, json!({"maximized": true}));
+        assert!(cmds.contains(&egui::ViewportCommand::Maximized(true)), "{cmds:?}");
+        let (r, cmds) = run(&mut app, true);
+        assert_eq!(r, json!({"maximized": false}));
+        assert!(cmds.contains(&egui::ViewportCommand::Maximized(false)), "{cmds:?}");
+    }
+
     #[test]
     fn dispatch_uses_the_active_custom_preset() {
         let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
@@ -1737,6 +2072,82 @@ mod tests {
         let labels: Vec<String> = menu_items(&app).into_iter().filter(|i| i.id == "edit.label").map(|i| i.label).collect();
         assert!(labels.contains(&"Sunflower".to_string()), "{labels:?}");
         assert!(!labels.contains(&"Yellow".to_string()));
+    }
+
+    /// Saving anything but a project asks the save dialog for that file's extension (#293): the
+    /// project dialog, filtered to `.ecproj`, made macOS append `.ecproj` (`Frame.png.ecproj`).
+    /// Hosts with only the project dialog (the web) still get it, given the file name.
+    #[test]
+    fn save_dialogs_offer_the_file_extension() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        app.session.execute("comp.new", json!({"name": "A", "width": 64, "height": 36, "frameRate": 30, "duration": 1})).unwrap();
+        let ctx = egui::Context::default();
+        let asked: Rc<RefCell<Vec<String>>> = Rc::default();
+        let (a, b) = (asked.clone(), asked.clone());
+        app.hooks.pick_save = Some(Box::new(move |name: &str| {
+            a.borrow_mut().push(format!("project {name}"));
+            None
+        }));
+        app.hooks.pick_save_file = Some(Box::new(move |name: &str, ext: &str| {
+            b.borrow_mut().push(format!("file {name} [{ext}]"));
+            None
+        }));
+        for id in ["comp.saveFrameAs", "render.saveCurrentPreview", "file.exportLottie", "file.saveCopyAsXml", "file.collectFiles", "file.saveAs"] {
+            invoke(&mut app, &ctx, id, json!({})).unwrap();
+        }
+        assert_eq!(
+            *asked.borrow(),
+            [
+                "file Frame.png [png]",
+                "file Preview.mp4 [mp4]",
+                "file Animation.json [json]",
+                "file Untitled Project.ecprojx [ecprojx]",
+                "file Collected Files []",
+                "project Untitled Project.ecproj",
+            ]
+        );
+        // Without the other dialog, the project one names any file.
+        app.hooks.pick_save_file = None;
+        asked.borrow_mut().clear();
+        invoke(&mut app, &ctx, "comp.saveFrameAs", json!({})).unwrap();
+        assert_eq!(*asked.borrow(), ["project Frame.png"]);
+    }
+
+    /// #511: with a host's non-blocking dialogs, a command's file dialog opens without running
+    /// a nested event loop inside the frame (a drag over the window then aborted the app on
+    /// macOS); the command runs on a later frame with the answer, and a cancelled one not at all.
+    #[test]
+    fn file_dialogs_can_answer_on_a_later_frame() {
+        use std::sync::{Arc, Mutex};
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        app.session.execute("comp.new", json!({"name": "A", "width": 64, "height": 36, "frameRate": 30, "duration": 1})).unwrap();
+        let ctx = egui::Context::default();
+        app.hooks.pick_save = Some(Box::new(|_: &str| panic!("the blocking dialog is not used")));
+        let pending: Arc<Mutex<Vec<(crate::FileDialog, crate::DialogDone)>>> = Arc::default();
+        let queue = pending.clone();
+        app.hooks.file_dialog_async = Some(Box::new(move |dialog, done| queue.lock().unwrap().push((dialog, done))));
+        assert_eq!(invoke(&mut app, &ctx, "file.saveAs", json!({})).unwrap(), json!({"dialog": "file.saveAs"}));
+        let (dialog, done) = pending.lock().unwrap().pop().expect("a dialog was shown");
+        assert_eq!(dialog, crate::FileDialog::Save { default: "Untitled Project.ecproj".into(), ext: "ecproj".into(), project: true });
+        assert!(app.session.path.is_none(), "nothing saved until the dialog answers");
+        let dir = std::env::temp_dir().join(format!("ec-dialog-answer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Answered.ecproj");
+        // Answered from another thread, as the host's dialog does.
+        std::thread::spawn(move || done(vec![path.to_string_lossy().to_string()])).join().unwrap();
+        app.run_dialog_answers();
+        assert_eq!(app.session.path.as_deref(), Some(dir.join("Answered.ecproj").to_string_lossy().as_ref()));
+        assert!(dir.join("Answered.ecproj").is_file());
+        // Cancelled: nothing runs.
+        invoke(&mut app, &ctx, "comp.saveFrameAs", json!({})).unwrap();
+        let (dialog, done) = pending.lock().unwrap().pop().expect("a dialog was shown");
+        assert_eq!(dialog, crate::FileDialog::Save { default: "Frame.png".into(), ext: "png".into(), project: false });
+        done(Vec::new());
+        app.run_dialog_answers();
+        assert!(!dir.join("Frame.png").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

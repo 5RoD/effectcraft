@@ -53,7 +53,7 @@ impl Run {
         markers.retain(|m| valid_marker(m));
         markers.sort();
         // The old single marker is read once for migration. New native runs never write it.
-        let legacy = store.read_bounded(crate::autosave::SENTINEL, MAX_SENTINEL_BYTES);
+        let legacy = store.read_required_bounded(crate::autosave::SENTINEL, MAX_SENTINEL_BYTES);
         let mut names: Vec<_> = markers.into_iter().map(|m| format!("{DIRECTORY}/{m}")).collect();
         if legacy.is_ok() {
             names.insert(0, crate::autosave::SENTINEL.into());
@@ -69,7 +69,7 @@ impl Run {
             let Some(lease) = store.try_lease(&lease_name(&marker))? else { continue };
             // Keep the lease while the dialog is pending, so another new instance cannot
             // offer or remove the same dead session. A crash releases it automatically.
-            let recovery = match store.read_bounded(&marker, MAX_SENTINEL_BYTES) {
+            let recovery = match store.read_required_bounded(&marker, MAX_SENTINEL_BYTES) {
                 Ok(text) => match serde_json::from_str::<Sentinel>(&text) {
                     Ok(sentinel) => crate::autosave::recover_sentinel(store, prefs, sentinel),
                     Err(e) => Recovery {

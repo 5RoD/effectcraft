@@ -9,8 +9,8 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
 
-use effectcraft_media::{MediaPool, probe, probe_single};
-use effectcraft_project::{AlphaMode, FootageKind, ItemId};
+use effectcraft_media::{MediaPool, probe};
+use effectcraft_project::{AlphaMode, Footage, FootageKind, ItemId};
 use effectcraft_raster::Image;
 use effectcraft_render::FootageSource;
 use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
@@ -236,6 +236,29 @@ fn h264_mp4_probe_and_frames() {
     assert!(Arc::ptr_eq(&a, &b));
 }
 
+/// A reduced-resolution render's movie frames are converted at its size: they match resampling
+/// the full frames (testsrc2's saturated colours clip, where the two differ most), and are cached
+/// per size.
+#[test]
+fn h264_frames_at_reduced_sizes() {
+    let Some(p) = h264_mp4() else { return };
+    let f = probe(&p).expect("probe");
+    let pool = MediaPool::new();
+    for (n, (w, h)) in [(0i64, (960, 540)), (1, (640, 360)), (2, (480, 270)), (30, (323, 182))] {
+        let t = t_of(f.frame_rate, n);
+        let sized = pool.frame_at_size(ItemId(1), &f, t, w, h).expect("frame");
+        let full = pool.frame(ItemId(1), &f, t).expect("frame");
+        assert_eq!((sized.width, sized.height), (w, h));
+        let db = psnr(&sized, &effectcraft_raster::resample(&full, w, h));
+        eprintln!("h264 frame {n} at {w}×{h}: {db:.2} dB against the resampled full frame");
+        // Converting at half size averages before the YUV→RGB clip, so saturated pixels differ
+        // slightly; how much depends on the encoder that made the fixture (50 dB with x264 from
+        // ffmpeg 6.1, above 55 with newer ones), all well past visible.
+        assert!(db > 45.0, "frame {n} at {w}×{h}: {db:.2} dB");
+        assert!(Arc::ptr_eq(&sized, &pool.frame_at_size(ItemId(1), &f, t, w, h).expect("frame")), "cached");
+    }
+}
+
 #[test]
 fn h264_audio_samples() {
     let Some(p) = h264_mp4() else { return };
@@ -249,6 +272,68 @@ fn h264_audio_samples() {
     // before the start: silence
     let pre = pool.audio_samples(&f, Tick(-TICKS_PER_SECOND), 100, 48_000);
     assert!(pre.iter().all(|v| *v == 0.0));
+}
+
+/// H.264 + AAC at 44.1 kHz in MP4 (ffmpeg writes an edit list that skips the AAC priming):
+/// 440 Hz left, a 200 → 1000 Hz sweep right, 29.97 fps.
+fn aac_44k_mp4() -> Option<PathBuf> {
+    ffmpeg_fixture(
+        "aac_44k.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=64x48:rate=30000/1001:duration=3",
+            "-f",
+            "lavfi",
+            "-i",
+            "aevalsrc=0.5*sin(2*PI*440*t)|0.5*sin(2*PI*(200+400*t/3)*t):s=44100:d=3",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+        ],
+    )
+}
+
+/// `src`'s audio decoded by ffmpeg as interleaved stereo `f32` at `rate` Hz (external oracle).
+fn ffmpeg_audio(src: &Path, rate: u32) -> Vec<f32> {
+    let out = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(src)
+        .args(["-f", "f32le", "-ac", "2", "-ar", &rate.to_string(), "-"])
+        .output()
+        .expect("ffmpeg");
+    assert!(out.status.success(), "ffmpeg failed to decode {}", src.display());
+    out.stdout.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
+}
+
+/// Footage audio at a rate other than the file's, read in one-frame pieces as export and the
+/// preview mix do, matches ffmpeg's decode: a resampled MP4 read ramped from a wrong position
+/// at the start of every piece (peaks near 100 against a 0.5 tone), so AAC footage stuttered in
+/// previews and exports (#274).
+#[test]
+fn resampled_audio_read_in_frame_pieces_matches_ffmpeg() {
+    let (Some(a), Some(b)) = (aac_44k_mp4(), h264_mp4()) else { return };
+    // 44.1 kHz read at 48 kHz, 48 kHz read at 44.1 kHz; NTSC frames are fractional in samples.
+    for (p, rate) in [(a, 48_000u32), (b, 44_100)] {
+        let f = probe(&p).expect("probe");
+        let want = ffmpeg_audio(&p, rate);
+        let fps = FrameRate::new(30000, 1001);
+        let pool = MediaPool::new();
+        let (mut got, mut cursor) = (Vec::new(), 0i64);
+        for k in 1..=55 {
+            let end = fps.tick_of(k).to_units_floor(rate as i64);
+            got.extend(pool.audio_samples(&f, Tick::from_units(cursor, rate as i64), (end - cursor) as usize, rate));
+            cursor = end;
+        }
+        let worst = got.iter().zip(&want).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
+        eprintln!("{} at {rate} Hz: max error {worst:.4}", p.display());
+        assert!(want.len() >= got.len() && worst < 0.01, "{} at {rate} Hz: max error {worst}", p.display());
+    }
 }
 
 #[test]
@@ -297,9 +382,12 @@ fn vp9_webm_frames() {
 #[test]
 fn png_sequence_import() {
     let Some(first) = png_sequence() else { return };
-    let f = probe(&first).expect("probe");
-    assert_eq!(f.kind, FootageKind::Sequence);
-    assert_eq!(f.sequence.len(), 10);
+    // One file probes as a still; the engine groups numbered files into the sequence.
+    let mut f = probe(&first).expect("probe");
+    assert_eq!(f.kind, FootageKind::Still);
+    f.kind = FootageKind::Sequence;
+    f.sequence = (1..=10).map(|n| first.with_file_name(format!("seq_{n:04}.png")).to_string_lossy().to_string()).collect();
+    f.sync_sequence_duration();
     assert_eq!((f.width, f.height), (320, 240));
     assert_eq!(f.duration, FrameRate::FPS_30.tick_of(10));
     let pool = MediaPool::new();
@@ -312,9 +400,40 @@ fn png_sequence_import() {
     looped.loop_count = 2;
     let img = pool.frame_at(&looped, t_of(f.frame_rate, 13)).expect("frame");
     assert_eq!(*img, load_png(&first.with_file_name("seq_0004.png")));
-    // a single frame of it
-    let one = probe_single(&first).expect("probe");
-    assert_eq!(one.kind, FootageKind::Still);
+}
+
+/// A gap in a sequence's numbering shows colour bars, as in After Effects; in Force
+/// Alphabetical Order the files play back to back (#297).
+#[test]
+fn sequence_gaps_show_placeholders() {
+    let dir = fixtures().join(format!("gap-seq-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    // Frames 1, 2 and 4: frame 3 is missing. Each frame is a flat grey of its number.
+    let grey = |n: u8| image::RgbaImage::from_pixel(8, 4, image::Rgba([n * 50, n * 50, n * 50, 255]));
+    let mut files = vec![];
+    for n in [1u8, 2, 4] {
+        let p = dir.join(format!("gap_{n:03}.png"));
+        grey(n).save(&p).expect("write png");
+        files.push(p.to_string_lossy().to_string());
+    }
+    let mut f = Footage { kind: FootageKind::Sequence, sequence: files, ..probe(dir.join("gap_001.png")).expect("probe") };
+    f.sync_sequence_duration();
+    assert_eq!(f.duration, f.frame_rate.tick_of(4), "frames 1-4");
+    let pool = MediaPool::new();
+    let at = |f: &Footage, n: i64| pool.frame_at(f, t_of(f.frame_rate, n)).expect("frame");
+    let level = |img: &Image| (img.get(0, 0)[0] * 255.0).round() as u32;
+    assert_eq!(level(&at(&f, 1)), 100);
+    // The placeholder: colour bars across the frame, starting with 75 % white.
+    let bars = at(&f, 2);
+    assert_eq!((bars.width, bars.height), (8, 4));
+    assert_eq!(bars.get(0, 0), [0.75, 0.75, 0.75, 1.0]);
+    assert_eq!(bars.get(7, 3), [0.0, 0.0, 0.75, 1.0], "blue on the right");
+    assert_eq!(level(&at(&f, 3)), 200);
+    f.alphabetical = true;
+    f.sync_sequence_duration();
+    assert_eq!(f.duration, f.frame_rate.tick_of(3));
+    assert_eq!(level(&at(&f, 2)), 200, "frame 4 follows frame 2");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -448,4 +567,110 @@ fn exr_still_is_linear_float() {
     // straight 4.0 → encoded ≈ 1.83 (super-white kept) → re-premultiplied ≈ 0.92
     let b = img.data[1];
     assert!(b[3] == 0.5 && b[0] > 0.85 && b[0] < 1.0, "{b:?}");
+}
+
+/// A FLAC of `secs` seconds at `rate` Hz with `channels` channels of a 440 Hz sine (first two:
+/// −24 dBFS RMS, the rest quieter), samples of `fmt` (`s16`, or `s32` with 24 significant bits).
+fn sine_flac(secs: u32, rate: u32, channels: u32, fmt: &str) -> Option<PathBuf> {
+    let name = format!("sine_{secs}s_{rate}_{channels}ch_{fmt}.flac");
+    let src = format!("sine=frequency=440:sample_rate={rate}:duration={secs}");
+    let pan = format!("pan={channels}c|{}", (0..channels).map(|c| format!("c{c}={}*c0", if c < 2 { "1" } else { "0.5" })).collect::<Vec<_>>().join("|"));
+    let mut args = vec!["-f", "lavfi", "-i", &src, "-af", &pan, "-sample_fmt", fmt];
+    if fmt == "s32" {
+        args.extend(["-bits_per_raw_sample", "24"]);
+    }
+    args.extend(["-c:a", "flac"]);
+    ffmpeg_fixture(&name, &args)
+}
+
+/// #408 robustness: FLAC footage of any rate, depth and channel count reads correctly as the
+/// preview feeder reads it, one device block at a time at the mix rate, through its end and past
+/// it: two minutes of 24-bit, 6-channel, 96 kHz audio, and mono 8 kHz, 11.025 kHz, 192 kHz and
+/// 8-channel files.
+#[test]
+fn flac_audio_of_any_shape_reads_in_device_blocks() {
+    for (secs, rate, channels, fmt) in [(120, 96_000, 6, "s32"), (5, 8_000, 1, "s16"), (5, 11_025, 2, "s16"), (5, 192_000, 2, "s32"), (5, 48_000, 8, "s16")] {
+        let Some(p) = sine_flac(secs, rate, channels, fmt) else { return };
+        let f = probe(&p).expect("probe");
+        assert!(f.has_audio && f.kind == FootageKind::Audio, "{}", p.display());
+        assert!((f.duration.seconds() - f64::from(secs)).abs() < 0.01, "{}: {}", p.display(), f.duration.seconds());
+        let pool = MediaPool::new();
+        let mix = 48_000i64;
+        let total = f.duration.to_units_floor(mix);
+        let (mut at, mut sum, mut n, mut worst) = (0i64, 0.0f64, 0usize, std::time::Duration::ZERO);
+        let t0 = Instant::now();
+        while at < total + 4096 {
+            let t = Instant::now();
+            let s = pool.audio_samples(&f, Tick::from_units(at, mix), 1024, 48_000);
+            if at > 0 {
+                worst = worst.max(t.elapsed());
+            }
+            assert_eq!(s.len(), 2048);
+            assert!(s.iter().all(|v| v.is_finite() && v.abs() <= 1.0), "{} at {at}", p.display());
+            if at + 1024 <= total {
+                sum += s.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>();
+                n += s.len();
+            } else if at >= total {
+                assert!(s.iter().all(|v| *v == 0.0), "{}: silence past the end", p.display());
+            }
+            at += 1024;
+        }
+        // ffmpeg's sine source has an amplitude of 1/8, on both channels (mono is duplicated).
+        let rms = (sum / n.max(1) as f64).sqrt();
+        assert!((rms - 0.125 / 2f64.sqrt()).abs() < 0.003, "{}: rms {rms}", p.display());
+        eprintln!("{}: read {secs} s in {:?}, slowest block after the first {worst:?}", p.display(), t0.elapsed());
+        assert_eq!(pool.stats().opened, 1, "opened once, not per block");
+    }
+}
+
+/// #408: the first reads of a FLAC from many threads at once (a preview's frame workers, audio
+/// feeder, conform and waveform threads) decode it once: each decoded the whole file, so memory
+/// and time grew with the number of threads.
+#[test]
+fn concurrent_first_reads_open_a_file_once() {
+    let Some(p) = sine_flac(60, 44_100, 2, "s16") else { return };
+    let f = probe(&p).expect("probe");
+    let pool = MediaPool::new();
+    let start = Arc::new(std::sync::Barrier::new(8));
+    let reads: Vec<_> = (0..8)
+        .map(|_| {
+            let (pool, f, start) = (pool.clone(), f.clone(), start.clone());
+            std::thread::spawn(move || {
+                start.wait();
+                pool.audio_samples(&f, Tick(TICKS_PER_SECOND), 1024, 48_000)
+            })
+        })
+        .collect();
+    let reads: Vec<Vec<f32>> = reads.into_iter().map(|t| t.join().expect("read")).collect();
+    assert_eq!(pool.stats().opened, 1, "the file was opened once");
+    assert!(reads.iter().all(|r| *r == reads[0]) && reads[0].iter().any(|v| *v != 0.0));
+}
+
+/// Settings ▸ Disk ▸ Conformed Audio Folder: a FLAC's conformed file, written a chunk at a time,
+/// reads back exactly as the decoder reads.
+#[test]
+fn conformed_flac_audio_reads_back_like_the_decoder() {
+    let Some(p) = sine_flac(5, 44_100, 2, "s16") else { return };
+    let f = probe(&p).expect("probe");
+    let folder = fixtures().join(format!("conformed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&folder);
+    let pool = MediaPool::new();
+    let at = Tick::from_seconds_f64(2.5);
+    let decoded = pool.audio_samples(&f, at, 4800, 48_000);
+    pool.set_conform_folder(Some(folder.clone()));
+    let file = pool.conformed_path(&p.to_string_lossy(), 48_000).expect("a conformed path");
+    pool.audio_samples(&f, at, 4800, 48_000);
+    let t0 = Instant::now();
+    while !file.exists() {
+        assert!(t0.elapsed().as_secs() < 60, "the conformed file was never written");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // (Renamed into place once complete.) Raw interleaved stereo f32 at 48 kHz.
+    let bytes = std::fs::read(&file).expect("conformed file");
+    assert_eq!(bytes.len(), 5 * 48_000 * 8);
+    let s0 = at.to_units_floor(48_000) as usize * 8;
+    let conformed: Vec<f32> = bytes[s0..s0 + 4800 * 8].as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+    assert_eq!(conformed, decoded);
+    assert_eq!(pool.audio_samples(&f, at, 4800, 48_000), decoded);
+    let _ = std::fs::remove_dir_all(&folder);
 }

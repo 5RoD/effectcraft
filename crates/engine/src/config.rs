@@ -14,12 +14,19 @@ use std::sync::Mutex;
 /// Named text blobs (`prefs.json`, `shortcuts.json`, `session.lock`).
 pub trait ConfigStore: Send + Sync {
     fn read(&self, name: &str) -> Option<String>;
-    fn read_bounded(&self, name: &str, limit: usize) -> std::io::Result<String> {
-        let text = self.read(name).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "configuration file is unavailable"))?;
-        if text.len() > limit {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "configuration file exceeds the recovery size limit"));
+    /// Read a bounded UTF-8 entry, distinguishing missing entries from read errors.
+    /// The compatible default checks an existing store's returned string. Stores that read
+    /// from disk should override this to enforce the limit while reading.
+    fn read_bounded(&self, name: &str, max_bytes: usize) -> std::io::Result<Option<String>> {
+        let text = self.read(name);
+        if text.as_ref().is_some_and(|text| text.len() > max_bytes) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "configuration entry exceeds its size limit"));
         }
         Ok(text)
+    }
+    /// A required bounded entry for recovery, where absence is a contextual read error.
+    fn read_required_bounded(&self, name: &str, max_bytes: usize) -> std::io::Result<String> {
+        self.read_bounded(name, max_bytes)?.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "configuration file is unavailable"))
     }
     fn write(&self, name: &str, data: &str) -> std::io::Result<()>;
     fn remove(&self, name: &str) -> std::io::Result<()>;
@@ -165,8 +172,13 @@ impl ConfigStore for DirConfig {
     fn read(&self, name: &str) -> Option<String> {
         std::fs::read_to_string(self.dir.join(name)).ok()
     }
-    fn read_bounded(&self, name: &str, limit: usize) -> std::io::Result<String> {
-        String::from_utf8(read_file_bounded(&self.dir.join(name), limit)?).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    fn read_bounded(&self, name: &str, max_bytes: usize) -> std::io::Result<Option<String>> {
+        let bytes = match read_file_bounded(&self.dir.join(name), max_bytes) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        String::from_utf8(bytes).map(Some).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
     fn write(&self, name: &str, data: &str) -> std::io::Result<()> {
         let path = self.dir.join(name);

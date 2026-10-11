@@ -151,10 +151,15 @@ fn plugin_loading_reports_bad_modules_and_survives_failing_renders() {
     assert!(s.execute("effect.plugins.load", json!({"path": dir.join("missing.wasm").to_string_lossy()})).is_err());
     assert!(s.execute("effect.plugins.load", json!({"folder": dir.join("missing").to_string_lossy()})).is_err());
     assert!(s.execute("effect.plugins.load", json!({})).is_err());
-    // A plug-in that traps on every frame leaves the layer as it was.
+    // A trapping plug-in reports a checked failure; its provisional pixels cannot appear as
+    // completed output. Removing it permits the same document to render successfully again.
     let before = px(&s);
     s.execute("effect.apply", json!({"layer": l, "effect": "org.test.host.trap"})).unwrap();
-    assert_eq!(px(&s), before);
+    let project = s.project.clone();
+    let error = s.render_checked(s.active_comp_id().unwrap(), Tick::ZERO, Default::default()).unwrap_err();
+    assert!(error.to_string().contains("org.test.host.trap"), "{error}");
+    assert_eq!(s.project, project);
+    s.execute("effect.remove", json!({"layer": l, "effect": 1})).unwrap();
     s.execute("effect.apply", json!({"layer": l, "effect": "org.test.host.good"})).unwrap();
     assert_eq!(px(&s), before);
     let _ = std::fs::remove_dir_all(&dir);

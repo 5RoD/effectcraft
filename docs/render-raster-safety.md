@@ -27,8 +27,9 @@ action. GPU fallback must pass the same CPU validation.
 Video export validates composition size before codec setup can allocate a frame;
 finite positive Render Settings keep their existing 0.01–4 resolution clamp.
 Deferred ready-frame lookups validate current composition geometry before returning
-pixels. The fork's render-cache salt advances to `effectcraft-5rod-render-3`, so
-upstream and earlier candidate disk pixels cannot bypass these bounds. The disk
+pixels. The fork's render-cache salt is `effectcraft-5rod-render-4`, so
+upstream and earlier candidate disk pixels cannot bypass these bounds or checked
+plug-in failure handling. The disk
 file format remains `v1`.
 
 This is a focused pre-allocation fix, **not a total renderer memory budget**. An image

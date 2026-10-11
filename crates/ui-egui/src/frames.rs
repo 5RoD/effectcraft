@@ -280,8 +280,11 @@ fn comp_content_with(project: &Project, comp: ItemId, addr: impl Fn(ItemId, &Arc
     h.finish()
 }
 
-/// Hash of render options (part of [`FrameKey`] and of the disk key).
+/// Hash of render options (part of [`FrameKey`] and of the disk key). The scale counts as the
+/// key's thousandths ([`FrameKey::scale`]): a series rebuilt from the key (the cache bars) has
+/// the same options as the frames rendered at 1/3 = 0.333… (#595).
 pub fn opts_hash(o: &RenderOpts) -> u64 {
+    let o = RenderOpts { scale: (o.scale * 1000.0).round() / 1000.0, ..*o };
     let mut h = disk_cache::Hash128::default();
     h.write(format!("{o:?}").as_bytes());
     h.finish() as u64
@@ -427,11 +430,26 @@ pub fn to_color_image(img: &effectcraft_engine::render::Image) -> egui::ColorIma
     egui::ColorImage::new([img.width as usize, img.height as usize], px)
 }
 
-/// The size `size` is shown at in a texture whose sides can't exceed `max_side`: divided by the
-/// smallest whole factor that fits (frames of comps wider than the GPU's texture limit, #201).
+/// The whole factor an image of `size` is averaged down by for a texture: at least `min_k`, and
+/// the smallest that fits its sides in `max_side` (frames of comps wider than the GPU's texture
+/// limit, #201).
+pub fn fit_factor(size: [usize; 2], max_side: usize, min_k: usize) -> usize {
+    size[0].max(size[1]).div_ceil(max_side.max(1)).max(min_k).max(1)
+}
+
+/// The size `size` is shown at in a texture whose sides can't exceed `max_side`.
 pub fn fitted_size(size: [usize; 2], max_side: usize) -> [usize; 2] {
-    let k = size[0].max(size[1]).div_ceil(max_side.max(1)).max(1);
+    let k = fit_factor(size, max_side, 1);
     [size[0].div_ceil(k), size[1].div_ceil(k)]
+}
+
+/// The texture coordinates of the image within a texture averaged down by `k`: its last texels
+/// cover fewer pixels than the factor, so drawn over the image's area with these the texels sit
+/// exactly where their pixels are.
+pub fn fitted_uv(size: [usize; 2], k: usize) -> egui::Rect {
+    let k = k.max(1);
+    let f = |n: usize| (n as f64 / (n.div_ceil(k).max(1) * k) as f64) as f32;
+    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(f(size[0]), f(size[1])))
 }
 
 /// `img` as a texture the renderer accepts: unchanged when it fits in `max_side`, else averaged
@@ -439,21 +457,26 @@ pub fn fitted_size(size: [usize; 2], max_side: usize) -> [usize; 2] {
 /// same area, so only detail beyond the GPU's texture limit is lost, instead of the upload
 /// failing (#201).
 pub fn fit_texture(img: egui::ColorImage, max_side: usize) -> egui::ColorImage {
+    fit_texture_by(img, max_side, 1)
+}
+
+/// [`fit_texture`] averaging down by at least `min_k` (see [`fit_factor`]).
+pub fn fit_texture_by(img: egui::ColorImage, max_side: usize, min_k: usize) -> egui::ColorImage {
     let [w, h] = img.size;
-    let [fw, fh] = fitted_size(img.size, max_side);
-    if [fw, fh] == [w, h] {
+    let k = fit_factor(img.size, max_side, min_k);
+    if k == 1 {
         return img;
     }
-    let k = w.max(h).div_ceil(max_side.max(1)).max(1);
+    let (fw, fh) = (w.div_ceil(k), h.div_ceil(k));
     let px: Vec<egui::Color32> = (0..fw * fh)
         .into_par_iter()
         .map(|i| {
             let (x0, y0) = ((i % fw) * k, (i / fw) * k);
-            let (mut sum, mut n) = ([0u32; 4], 0u32);
+            let (mut sum, mut n) = ([0u64; 4], 0u64);
             for y in y0..(y0 + k).min(h) {
                 for c in img.pixels.get(y * w + x0..y * w + (x0 + k).min(w)).unwrap_or_default() {
                     for (s, v) in sum.iter_mut().zip(c.to_array()) {
-                        *s += v as u32;
+                        *s += v as u64;
                     }
                     n += 1;
                 }
@@ -521,6 +544,42 @@ impl Frames {
         let img = c.map.get(k).cloned()?;
         c.touch(k);
         Some(img)
+    }
+
+    /// Prefer the exact requested frame. While an edit renders, advance to the newest completed
+    /// revision of the same comp, time, scale, view and render options instead of freezing on the
+    /// image from before the drag. Input may arrive before the viewer draws on every UI frame,
+    /// so even a fast worker cannot always finish the *latest* revision in time.
+    ///
+    /// Never move backwards when workers finish out of order, and never substitute another time
+    /// or view while scrubbing or switching comps. The exact content lookup above also means an
+    /// undo can immediately reuse an old cache entry, regardless of its original revision.
+    pub fn get_for_viewer(&self, wanted: &FrameKey, shown: Option<&FrameKey>) -> Option<(FrameKey, FrameImage)> {
+        if let Some(img) = self.get(wanted) {
+            return Some((*wanted, img));
+        }
+        let shown = shown?;
+        if shown.comp != wanted.comp || shown.frame != wanted.frame || shown.view != wanted.view || shown.revision >= wanted.revision {
+            return None;
+        }
+        let mut c = self.cache.lock().ok()?;
+        let newest = c
+            .map
+            .keys()
+            .filter(|k| {
+                k.revision > shown.revision
+                    && k.revision < wanted.revision
+                    && k.comp == wanted.comp
+                    && k.frame == wanted.frame
+                    && k.scale == wanted.scale
+                    && k.view == wanted.view
+                    && k.opts == wanted.opts
+            })
+            .max_by_key(|k| k.revision)
+            .copied()?;
+        let img = c.map.get(&newest).cloned()?;
+        c.touch(&newest);
+        Some((newest, img))
     }
 
     /// The [`comp_content`] identity of `comp` in `project` at `revision` (taken once per
@@ -666,6 +725,12 @@ impl Frames {
             c.bytes = 0;
             c.gpu_bytes = 0;
         }
+        // Disk keys hash the footage files' size and time, but are remembered per revision; a
+        // file reloaded from disk without a new revision (a re-rendered image sequence) must be
+        // keyed again, or the disk cache serves the frames from before.
+        if let Ok(mut k) = self.content_keys.lock() {
+            k.clear();
+        }
     }
 
     /// Queue a prefetch frame (no-op if cached or already queued/rendering).
@@ -688,38 +753,44 @@ impl Frames {
             return;
         }
         let Ok(mut q) = self.queue.lock() else { return };
+        let Ok(mut inf) = self.inflight.lock() else { return };
         // Jobs for an older project revision can never be shown: drop them.
         let before = q.jobs.len();
         q.jobs.retain(|j| j.key.revision >= key.revision);
-        let dropped = before - q.jobs.len();
-        if dropped > 0
-            && let Ok(mut inf) = self.inflight.lock()
-        {
+        if q.jobs.len() < before {
             inf.retain(|k| k.revision >= key.revision || q.running.contains(k));
         }
         if urgent {
-            // Only the newest viewer frame is urgent; earlier ones become prefetch.
+            // Only the newest viewer frame is urgent. The comp's earlier viewer frames that
+            // haven't started are dropped (scrubbing: rendering every frame the pointer passed
+            // would hold the workers the frame under it needs); frames already rendering finish
+            // into the cache. During edits the viewer advances through compatible completed
+            // revisions; scrubbing holds its last frame until the requested time is in (#284).
+            // Other comps' viewer frames become prefetch.
+            q.jobs.retain(|j| {
+                let superseded = j.urgent && j.key != key && j.key.comp == key.comp;
+                if superseded {
+                    inf.remove(&j.key);
+                }
+                !superseded
+            });
             for j in q.jobs.iter_mut() {
                 j.urgent = j.key == key;
             }
         }
-        {
-            let Ok(mut inf) = self.inflight.lock() else { return };
-            if !inf.insert(key) {
-                return;
-            }
+        if !inf.insert(key) {
+            return;
         }
         q.seq += 1;
         let seq = q.seq;
         q.jobs.push(Job { key, src: src.clone(), comp, t, opts, urgent, seq });
+        drop(inf);
         drop(q);
         #[cfg(not(target_arch = "wasm32"))]
         if self.remote.is_none() {
             let w = self.worker();
-            // One spawn per job; each spawn renders whichever queued job matters most right now.
-            let job = move || {
-                w.run_next();
-            };
+            // One spawn per job; each spawn renders whichever queued jobs matter most right now.
+            let job = move || w.drain();
             match &self.pool {
                 Some(pool) => pool.spawn(job),
                 None => rayon::spawn(job),
@@ -876,7 +947,42 @@ struct Worker {
     failures: Arc<Mutex<VecDeque<(FrameKey, String)>>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    /// This pool thread is inside [`Worker::drain`] (rendering a frame).
+    static DRAINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Clears [`DRAINING`] when the drain ends, even by a panic.
+#[cfg(not(target_arch = "wasm32"))]
+struct Draining;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for Draining {
+    fn drop(&mut self) {
+        DRAINING.set(false);
+    }
+}
+
 impl Worker {
+    /// Render queued jobs, most important first, until the queue is empty.
+    ///
+    /// A pool thread waiting inside a render (on a parallel loop's join) runs other pool work
+    /// meanwhile, including the spawns of newer requests: each would start a whole frame render
+    /// on top of the one waiting, with all of its buffers. Dragging a layer asks for a new frame
+    /// every UI frame, so renders piled up on every thread until memory ran out (#647). A spawn
+    /// that lands inside a render returns at once instead; the render below it takes the queued
+    /// jobs when it is done, so each thread renders one frame at a time.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn drain(&self) {
+        if DRAINING.get() {
+            return;
+        }
+        DRAINING.set(true);
+        let _reset = Draining;
+        while self.run_next() {}
+    }
+
     /// Render the queued job that matters most right now. `false` when the queue was empty.
     fn run_next(&self) -> bool {
         let Worker { queue, content_keys, .. } = self;
@@ -1310,6 +1416,96 @@ mod tests {
         assert!(frames.failure(&invalid).is_none());
     }
 
+    #[test]
+    fn checked_registered_plugin_preview_retains_completed_frame_document_and_disk_cache() {
+        use effectcraft_engine::effects::plugin::{EffectPlugin, PluginFrame, PluginManifest, PluginParam, PluginParamKind, PluginParams, register_plugin};
+        use effectcraft_engine::{Session, keyframe::Value, project::LayerId, render::disk_cache::Kind};
+        use serde_json::json;
+        struct Fault(PluginManifest);
+        impl EffectPlugin for Fault {
+            fn manifest(&self) -> &PluginManifest {
+                &self.0
+            }
+            fn render(&self, frame: &mut PluginFrame, params: &PluginParams, _time: f64) -> Result<(), String> {
+                match params.f("mode") as u32 {
+                    1 => {
+                        frame.pixels[0] = [0.0; 4];
+                        Err("synthetic preview plug-in error".into())
+                    }
+                    2 => {
+                        frame.pixels[0] = [0.0; 4];
+                        panic!("synthetic preview plug-in panic")
+                    }
+                    _ => Ok(()),
+                }
+            }
+        }
+        let spec = register_plugin(Arc::new(Fault(PluginManifest {
+            api: 1,
+            id: "org.test.preview-checked-plugin".into(),
+            name: "Checked Preview Plug-in".into(),
+            category: "Test".into(),
+            version: String::new(),
+            author: String::new(),
+            description: String::new(),
+            params: vec![PluginParam { id: "mode".into(), name: "Mode".into(), kind: PluginParamKind::Angle { default: 0.0 } }],
+        })))
+        .unwrap();
+        let mut session = Session::default();
+        let cid = ItemId(session.execute("comp.new", json!({"width": 8, "height": 8, "duration": 1})).unwrap()["comp"].as_u64().unwrap());
+        let lid = session.execute("layer.newSolid", json!({"color": "#ffffff"})).unwrap()["layer"].as_u64().unwrap();
+        session.execute("effect.apply", json!({"layers": [lid], "effect": spec.id})).unwrap();
+        let original = serde_json::to_vec(&session.project).unwrap();
+        let directory = std::env::temp_dir().join(format!("ec-checked-plugin-preview-{}", std::process::id()));
+        let disk = DiskCache::open(&directory, 1024 * 1024).unwrap();
+        let mut source = RenderSource {
+            project: session.project.clone(),
+            footage: session.footage.clone(),
+            expr: None,
+            layer_cache: Arc::default(),
+            gpu: None,
+            gpu_display: false,
+            disk: Some(disk.clone()),
+        };
+        let frames = Frames { remote: Some(Arc::new(ParkedRemote)), ..Default::default() };
+        let good = FrameKey { comp: cid.0, ..key(1, 0, 0) };
+        frames.request_urgent(&source, good, cid, Tick::ZERO, RenderOpts::default());
+        assert!(frames.worker().run_next());
+        let FrameImage::Cpu(previous) = frames.get(&good).unwrap() else { panic!("CPU fixture") };
+        let entries = source.layer_cache.stats().entries;
+        for (revision, mode, reason) in [(2, 1.0, "synthetic preview plug-in error"), (3, 2.0, "Rust plug-in panicked")] {
+            Arc::make_mut(&mut source.project).comp_mut(cid).unwrap().layer_mut(LayerId(lid)).unwrap().props.prop_mut("effects/#1/mode").unwrap().value =
+                Value::Scalar(mode);
+            let before = serde_json::to_vec(&source.project).unwrap();
+            let failed = FrameKey { content: revision, revision, ..good };
+            frames.request_urgent(&source, failed, cid, Tick::ZERO, RenderOpts::default());
+            assert!(frames.worker().run_next());
+            assert!(frames.failure(&failed).unwrap().contains(reason));
+            assert!(!frames.is_cached(&failed));
+            assert_eq!(frames.inflight(), 0);
+            assert_eq!(source.layer_cache.stats().entries, entries);
+            assert!(!disk.contains(Kind::Frame, frame_disk_key(&frames.content_keys, &source.project, &failed, opts_hash(&RenderOpts::default()))));
+            let FrameImage::Cpu(retained) = frames.get(&good).unwrap() else { panic!("CPU fixture") };
+            assert!(Arc::ptr_eq(&previous, &retained));
+            assert_eq!(serde_json::to_vec(&source.project).unwrap(), before);
+            assert_eq!(serde_json::to_vec(&session.project).unwrap(), original);
+            frames.request_urgent(&source, failed, cid, Tick::ZERO, RenderOpts::default());
+            assert!(frames.queue.lock().unwrap().jobs.is_empty());
+        }
+        Arc::make_mut(&mut source.project).comp_mut(cid).unwrap().layer_mut(LayerId(lid)).unwrap().props.prop_mut("effects/#1/mode").unwrap().value =
+            Value::Scalar(0.0);
+        let repaired = FrameKey { content: 4, revision: 4, ..good };
+        frames.request_urgent(&source, repaired, cid, Tick::ZERO, RenderOpts::default());
+        assert!(frames.worker().run_next());
+        let FrameImage::Cpu(actual) = frames.get(&repaired).unwrap() else { panic!("CPU fixture") };
+        assert_eq!(actual.pixels, previous.pixels);
+        disk.flush();
+        drop(source);
+        drop(frames);
+        drop(disk);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     struct ParkedRemote;
     impl RemoteFrames for ParkedRemote {
         fn slots(&self) -> usize {
@@ -1360,6 +1556,53 @@ mod tests {
         // A later revision with the same content finds the frame (an edit elsewhere, an undo).
         assert!(f.is_cached(&FrameKey { revision: 99, ..key(1, 0, 0) }));
         assert!(!f.is_cached(&key(3, 0, 0)));
+    }
+
+    #[test]
+    fn live_edits_present_the_newest_completed_revision_without_going_backwards() {
+        let f = Frames::default();
+        let shown = key(1, 0, 0);
+        let newest = key(3, 0, 0);
+        let wanted = key(5, 0, 0);
+        insert(&f, shown);
+        insert(&f, newest);
+        insert(&f, key(2, 0, 0)); // Older worker finishes after the newer one.
+        let displayed = f.get_for_viewer(&wanted, Some(&shown)).unwrap().0;
+        assert_eq!(displayed, newest);
+        assert!(f.get_for_viewer(&wanted, Some(&displayed)).is_none(), "never replay an older completion");
+        insert(&f, wanted);
+        assert_eq!(f.get_for_viewer(&wanted, Some(&displayed)).unwrap().0, wanted, "settle on the exact final edit");
+        // Undo reuses the content of an earlier revision immediately.
+        let undo = FrameKey { revision: 6, ..shown };
+        let reused = f.get_for_viewer(&undo, Some(&wanted)).unwrap().0;
+        assert_eq!(reused.content, shown.content);
+        assert_eq!(reused.revision, undo.revision);
+    }
+
+    #[test]
+    fn live_edits_do_not_substitute_other_times_views_or_render_settings() {
+        let f = Frames::default();
+        let shown = key(1, 0, 0);
+        let wanted = key(3, 0, 0);
+        let done = key(2, 0, 0);
+        for mismatch in [
+            FrameKey { comp: 9, ..done },
+            FrameKey { frame: 1, ..done },
+            FrameKey { scale: 500, ..done },
+            FrameKey { view: 1, ..done },
+            FrameKey { opts: 1, ..done },
+            FrameKey { revision: 4, ..done },
+        ] {
+            f.clear();
+            insert(&f, mismatch);
+            assert!(f.get_for_viewer(&wanted, Some(&shown)).is_none(), "wrong candidate: {mismatch:?}");
+        }
+        f.clear();
+        insert(&f, done);
+        assert!(f.get_for_viewer(&wanted, None).is_none(), "no stale content on opening a viewer");
+        assert!(f.get_for_viewer(&wanted, Some(&FrameKey { comp: 9, ..shown })).is_none());
+        assert!(f.get_for_viewer(&wanted, Some(&FrameKey { frame: 1, ..shown })).is_none());
+        assert!(f.get_for_viewer(&wanted, Some(&FrameKey { view: 1, ..shown })).is_none());
     }
 
     #[test]
@@ -1455,5 +1698,110 @@ mod tests {
         assert_eq!(at(&s), o1, "a mute after a real edit keeps that edit's frames");
         switch(&mut s, inner, solid, "video", true);
         assert_ne!(at(&s), o1);
+    }
+
+    #[test]
+    fn a_waiting_render_never_starts_another_on_its_thread() {
+        use effectcraft_engine::Session;
+        use effectcraft_engine::project::{Footage, FootageKind};
+        use effectcraft_engine::render::Image;
+        use effectcraft_engine::time::FrameRate;
+        use serde_json::json;
+        use std::cell::Cell;
+        use std::sync::atomic::AtomicUsize;
+        thread_local! {
+            static DEPTH: Cell<usize> = const { Cell::new(0) };
+        }
+        /// A decoder that works in parallel, as the renderer does: its thread joins the loop and
+        /// may wait for the parts other threads took.
+        #[derive(Default)]
+        struct Parallel {
+            calls: AtomicUsize,
+            deepest: AtomicUsize,
+        }
+        impl FootageSource for Parallel {
+            fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<Image>> {
+                let d = DEPTH.get() + 1;
+                DEPTH.set(d);
+                self.deepest.fetch_max(d, Ordering::SeqCst);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                (0..64).into_par_iter().for_each(|_| std::thread::sleep(std::time::Duration::from_millis(1)));
+                DEPTH.set(d - 1);
+                Some(Arc::new(Image::new(4, 4)))
+            }
+        }
+        let mut s = Session::default();
+        let cid = ItemId(s.execute("comp.new", json!({"name": "A", "width": 8, "height": 8, "duration": 10})).unwrap()["comp"].as_u64().unwrap());
+        let clip = Footage {
+            kind: FootageKind::Video,
+            width: 4,
+            height: 4,
+            has_video: true,
+            frame_rate: FrameRate::FPS_30,
+            duration: Tick::from_seconds_f64(10.0),
+            ..Default::default()
+        };
+        let item = Arc::make_mut(&mut s.project).add_item("clip.mov", Default::default(), None, ItemKind::Footage(clip));
+        s.execute("layer.addItem", json!({"item": item.0})).unwrap();
+        let footage = Arc::new(Parallel::default());
+        let src = RenderSource {
+            project: s.project.clone(),
+            footage: footage.clone(),
+            expr: None,
+            layer_cache: Arc::default(),
+            gpu: None,
+            gpu_display: false,
+            disk: None,
+        };
+        let f = Frames::default();
+        let content = f.content_of(&s.project, s.revision, cid);
+        let frames = 60;
+        for frame in 0..frames {
+            let key = FrameKey { revision: s.revision, content, comp: cid.0, frame, scale: 1000, view: 0, opts: 0 };
+            f.request(&src, key, cid, FrameRate::FPS_30.tick_of(frame), RenderOpts::default());
+        }
+        for _ in 0..4000 {
+            if f.inflight() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(f.inflight(), 0, "every queued frame rendered");
+        assert!(footage.calls.load(Ordering::SeqCst) >= frames as usize);
+        assert_eq!(footage.deepest.load(Ordering::SeqCst), 1, "renders nested on a waiting thread");
+    }
+
+    #[test]
+    fn a_newer_viewer_frame_drops_the_ones_still_waiting() {
+        /// Starts nothing, so every request stays queued.
+        struct Idle;
+        impl RemoteFrames for Idle {
+            fn slots(&self) -> usize {
+                0
+            }
+            fn start(&self, _: RemoteJob, _: RemoteDone) {}
+        }
+        let mut f = Frames::default();
+        f.set_remote(Some(Arc::new(Idle)));
+        let src = RenderSource {
+            project: Arc::default(),
+            footage: Arc::new(effectcraft_engine::render::NoFootage),
+            expr: None,
+            layer_cache: Arc::default(),
+            gpu: None,
+            gpu_display: false,
+            disk: None,
+        };
+        let request = |k: FrameKey, urgent: bool| f.request_with(&src, k, ItemId(k.comp), Tick::ZERO, RenderOpts::default(), urgent);
+        let other = FrameKey { comp: 2, ..key(1, 0, 0) };
+        request(other, true);
+        request(key(1, 20, 0), false);
+        for frame in 0..10 {
+            request(key(1, frame, 0), true);
+        }
+        let mut queued: Vec<(u64, i64, bool)> = f.queue.lock().unwrap().jobs.iter().map(|j| (j.key.comp, j.key.frame, j.urgent)).collect();
+        queued.sort();
+        assert_eq!(queued, [(1, 9, true), (1, 20, false), (2, 0, false)]);
+        assert_eq!(f.inflight(), 3, "dropped frames aren't in flight: the viewer can ask again");
     }
 }

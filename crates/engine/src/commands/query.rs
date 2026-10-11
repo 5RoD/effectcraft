@@ -192,7 +192,7 @@ fn capabilities(s: &mut Session, _: &Value) -> Result<Value> {
         "parity": {
             "target": "Adobe After Effects 2026",
             "summary": PARITY,
-            "doc": "docs/parity.md",
+            "doc": "docs/target-app-parity.md",
         },
     }))
 }

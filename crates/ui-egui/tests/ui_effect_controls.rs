@@ -167,6 +167,28 @@ fn crosshair_and_eyedropper_pick_from_the_viewer() {
     assert_eq!(c[3], 1.0);
 }
 
+/// #284: with a Region of Interest the shown frame covers only that region; the eyedropper
+/// samples the composite under the pointer there (it read the frame as if it covered the whole
+/// comp, so it sampled somewhere else).
+#[test]
+fn the_eyedropper_samples_under_the_pointer_in_a_region_of_interest() {
+    let (mut app, x) = app();
+    app.session.execute("view.setRegionOfInterest", json!({"rect": [0.0, 0.0, 320.0, 180.0]})).unwrap();
+    // (Not the red it will pick.)
+    app.session.execute("prop.set", json!({"layer": x.small, "prop": x.color, "value": [0.0, 0.0, 1.0, 1.0]})).unwrap();
+    let mut h = Harness::builder().with_size(egui::vec2(1700.0, 1100.0)).build_eframe(|_| app);
+    settle(&mut h);
+    h.state_mut().ui.fx_pick = Some(FxPick { kind: "color".into(), layer: x.small, prop: x.color, name: "Color".into() });
+    h.step();
+    // (200, 150) is on the red layer (it covers 120..520 × 80..280); read as a frame of the
+    // whole comp, the green background at (100, 75).
+    let pos = effectcraft_ui_egui::panels::viewer::comp_to_screen(&h.ctx, [200.0, 150.0]).unwrap();
+    click(&mut h, pos);
+    let v = layer(&h.state().session, x.small).effects().unwrap().find(x.color).unwrap().value.clone();
+    let KV::Color(c) = v else { panic!("{v:?}") };
+    assert!(c[0] > 0.98 && c[1] < 0.02 && c[2] < 0.02, "{c:?}");
+}
+
 /// Key Light's Screen Colour eyedropper picks from the effect's input: the shown frame is
 /// already keyed (the default screen colour takes most of a green), so sampling it would miss.
 #[test]
@@ -334,4 +356,303 @@ fn right_click_in_effect_controls_shows_the_effect_menu() {
     assert_eq!(names(&h, b), ["Fill", "Gaussian Blur"]);
     assert_eq!(names(&h, a), ["Gaussian Blur"], "every selected layer gets it");
     assert!(h.query_by_label(category).is_none(), "the menu closed");
+}
+
+/// #295: EXtractoR on a multi-layer OpenEXR layer offers the file's layers (a Layer popup that
+/// sets red, green, blue and alpha in one undo step) and its channels (a popup per colour);
+/// there was no way to pick any.
+#[test]
+fn extractor_offers_the_exr_layers_and_channels() {
+    use exr::prelude::*;
+    let (w, hh) = (8usize, 4usize);
+    let ch = |n: &str, v: f32| AnyChannel::new(n, FlatSamples::F32(vec![v; w * hh]));
+    let channels = AnyChannels::sort(
+        vec![ch("diffuse.R", 1.0), ch("diffuse.G", 0.5), ch("diffuse.B", 0.0), ch("spec.R", 0.0), ch("spec.G", 0.0), ch("spec.B", 1.0), ch("depth.Z", 0.25)]
+            .into(),
+    );
+    let path = std::env::temp_dir().join(format!("ec-ui-exr-layers-{}.exr", std::process::id()));
+    Image::from_layer(exr::prelude::Layer::new((w, hh), LayerAttributes::default(), Encoding::FAST_LOSSLESS, channels)).write().to_file(&path).unwrap();
+
+    let mut s = effectcraft_host::session();
+    let item = s.execute("file.import", json!({"paths": [path.to_string_lossy()]})).unwrap()["items"][0].clone();
+    s.execute("comp.new", json!({"name": "EXR", "width": 8, "height": 4, "frameRate": 24, "duration": 1})).unwrap();
+    let l = s.execute("layer.addItem", json!({"item": item})).unwrap()["layer"].as_u64().unwrap();
+    let fx = s.execute("effect.apply", json!({"layers": [l], "effect": "EXtractoR"})).unwrap()["effects"][0].as_u64().unwrap();
+    let uid = |s: &Session, id: &str| layer(s, l).effects().and_then(|f| f.groups().find(|g| g.uid == fx)).and_then(|g| g.get(id)).map(|p| p.uid).unwrap();
+    let red = uid(&s, "red");
+    s.state.selected_layers = vec![LayerId(l)];
+    let mut app = EffectcraftApp::new(s);
+    app.show_panel(PanelKind::EffectControls);
+    let mut h = Harness::builder().with_size(egui::vec2(1700.0, 1100.0)).build_eframe(|_| app);
+    settle(&mut h);
+    let values = |h: &Harness<'_, EffectcraftApp>| -> Vec<String> {
+        let l = layer(&h.state().session, l);
+        let g = l.effects().and_then(|f| f.groups().find(|g| g.uid == fx)).unwrap();
+        ["red", "green", "blue", "alpha"]
+            .iter()
+            .map(|id| {
+                g.get(id)
+                    .map(|p| match &p.value {
+                        KV::Str(s) => s.clone(),
+                        _ => String::new(),
+                    })
+                    .unwrap_or_default()
+            })
+            .collect()
+    };
+    assert_eq!(values(&h), ["R", "G", "B", "A"]);
+
+    // Layer ▸ spec: its channels in red, green and blue (no alpha channel: none).
+    let at = rect_of(&h, &format!("effectControls.effect.{fx}.extractor.layer")).center();
+    click(&mut h, at);
+    for name in ["depth", "diffuse", "spec"] {
+        assert!(h.query_by_label(name).is_some(), "the file's layer {name}");
+    }
+    h.get_by_label("spec").click();
+    h.run_steps(3);
+    assert_eq!(values(&h), ["spec.R", "spec.G", "spec.B", ""]);
+    h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(values(&h), ["R", "G", "B", "A"], "one undo step");
+    h.run_steps(2);
+
+    // Red ▸ depth.Z: every channel of the file is listed.
+    let at = rect_of(&h, &format!("effectControls.prop.{red}.value")).center();
+    click(&mut h, at);
+    assert!(h.query_by_label("diffuse.G").is_some() && h.query_by_label("(none)").is_some());
+    h.get_by_label("depth.Z").click();
+    h.run_steps(3);
+    assert_eq!(values(&h)[0], "depth.Z");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn point_picker_handle_follows_hover_then_commits_once_across_effects() {
+    for (effect, parameter) in [("ec.control.point", "point"), ("ec.blur.ccradialfast", "center"), ("ec.generate.gradientramp", "start")] {
+        let mut s = Session::default();
+        s.execute("comp.new", json!({"width":640,"height":360,"duration":1})).unwrap();
+        let lid = s.execute("layer.newSolid", json!({"width":200,"height":100,"color":"#406080"})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("prop.set", json!({"layer":lid,"path":"transform/scale","value":[200,200]})).unwrap();
+        let fx = s.execute("effect.apply", json!({"layer":lid,"effect":effect})).unwrap()["effects"][0].as_u64().unwrap();
+        let point = layer(&s, lid).effects().unwrap().find_group(fx).unwrap().get(parameter).unwrap().uid;
+        s.execute("prop.set", json!({"layer":lid,"prop":point,"value":[100,50]})).unwrap();
+        let mut app = EffectcraftApp::new(s);
+        app.show_panel(PanelKind::EffectControls);
+        app.ui.viewer.zoom = Some(0.85);
+        app.ui.viewer.pan = [25.0, -10.0];
+        let mut h = Harness::builder().with_size(egui::vec2(1700.0, 1100.0)).build_eframe(|_| app);
+        settle(&mut h);
+        let id = format!("viewer.effectPoint.{point}");
+        let original = rect_of(&h, &id).center();
+        let pick_button = rect_of(&h, &format!("effectControls.prop.{point}.crosshair")).center();
+        click(&mut h, pick_button);
+        assert!(h.state().ui.fx_pick.is_some(), "{effect}: crosshair arms the picker");
+        assert_eq!(rect_of(&h, &id).center(), original, "the handle remains visible before entering the viewer");
+        let undo = h.state().session.history.undo.len();
+        for comp in [[350.0, 200.0], [370.0, 220.0]] {
+            let pos = effectcraft_ui_egui::panels::viewer::comp_to_screen(&h.ctx, comp).unwrap();
+            hover(&mut h, pos);
+            assert!(rect_of(&h, &id).center().distance(pos) < 0.1, "{effect}: handle must follow the pointer before clicking");
+            assert_eq!(layer(&h.state().session, lid).props.find(point).unwrap().value.as_vec2(), [100.0, 50.0], "hover is only a preview");
+            assert_eq!(h.state().session.history.undo.len(), undo, "hover must not add undo entries");
+        }
+        let pos = effectcraft_ui_egui::panels::viewer::comp_to_screen(&h.ctx, [370.0, 220.0]).unwrap();
+        click(&mut h, pos);
+        assert!(h.state().ui.fx_pick.is_none());
+        let after = layer(&h.state().session, lid).props.find(point).unwrap().value.as_vec2();
+        assert!((after[0] - 125.0).abs() < 1.0 && (after[1] - 70.0).abs() < 1.0, "{effect}: click uses layer space: {after:?}");
+        assert_eq!(h.state().session.history.undo.len(), undo + 1, "one click is one edit");
+        h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(layer(&h.state().session, lid).props.find(point).unwrap().value.as_vec2(), [100.0, 50.0]);
+        assert_eq!(layer(&h.state().session, lid).props.prop("transform/position").unwrap().value.as_vec2(), [320.0, 180.0]);
+    }
+}
+
+#[test]
+fn point_picker_preview_cancels_and_works_with_layer_controls_hidden() {
+    let (app, x) = app();
+    let mut h = Harness::builder().with_size(egui::vec2(1700.0, 1100.0)).build_eframe(|_| app);
+    settle(&mut h);
+    let value = layer(&h.state().session, x.small).props.find(x.point).unwrap().value.clone();
+    let undo = h.state().session.history.undo.len();
+    h.state_mut().ui.viewer.show_layer_controls = false;
+    let pick_button = rect_of(&h, &format!("effectControls.prop.{}.crosshair", x.point)).center();
+    click(&mut h, pick_button);
+    let id = format!("viewer.effectPoint.{}", x.point);
+    let original = rect_of(&h, &id).center();
+    let pos = effectcraft_ui_egui::panels::viewer::comp_to_screen(&h.ctx, [370.0, 220.0]).unwrap();
+    hover(&mut h, pos);
+    assert!(rect_of(&h, &id).center().distance(pos) < 0.1, "explicit picks show a handle even with layer controls hidden");
+    hover(&mut h, pick_button);
+    assert_eq!(rect_of(&h, &id).center(), original, "leaving the viewer restores the current position");
+    hover(&mut h, pos);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    assert!(h.state().ui.fx_pick.is_none());
+    assert!(!ids(&h).contains(&id), "cancel removes the temporary handle");
+    assert_eq!(layer(&h.state().session, x.small).props.find(x.point).unwrap().value, value);
+    assert_eq!(h.state().session.history.undo.len(), undo, "cancel leaves the project unchanged");
+}
+
+#[test]
+fn radial_center_stays_draggable_when_its_property_is_selected() {
+    let (mut app, x) = app();
+    app.session.execute("effect.apply", json!({"layer":x.small,"effect":"ec.blur.ccradialfast"})).unwrap();
+    let l = layer(&app.session, x.small);
+    let effect = l.effects().unwrap().groups().find(|g| g.match_id == "ec.blur.ccradialfast").unwrap();
+    let point = effect.get("center").unwrap().uid;
+    app.session.state.selected_props = vec![(LayerId(x.small), point)];
+    let mut h = Harness::builder().with_size(egui::vec2(1700.0, 1100.0)).build_eframe(|_| app);
+    settle(&mut h);
+    let id = format!("viewer.effectPoint.{point}");
+    assert!(ids(&h).contains(&id), "selected point must keep its handle");
+    let from = rect_of(&h, &id).center();
+    let to = from + egui::vec2(40.0, 20.0);
+    h.event(egui::Event::PointerMoved(from));
+    h.step();
+    h.event(egui::Event::PointerButton { pos: from, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() });
+    h.step();
+    for i in 1..=5 {
+        h.event(egui::Event::PointerMoved(from + (to - from) * (i as f32 / 5.0)));
+        h.step();
+    }
+    h.event(egui::Event::PointerButton { pos: to, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() });
+    h.step();
+    let after = layer(&h.state().session, x.small).props.find(point).unwrap().value.as_vec2();
+    assert!(after[0] > 100.0 && after[1] > 50.0, "drag updates Center: {after:?}");
+    let position = layer(&h.state().session, x.small).props.prop("transform/position").unwrap().value.as_vec3();
+    assert_eq!(position[..2], [320.0, 180.0], "dragging the effect must not move the layer");
+    h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(layer(&h.state().session, x.small).props.find(point).unwrap().value.as_vec2(), [100.0, 50.0], "one Undo reverses the gesture");
+}
+
+#[test]
+fn clicking_an_effect_parameter_activates_its_header_and_handles() {
+    let (app, x) = app();
+    let mut h = Harness::builder().with_size(egui::vec2(1700.0, 1100.0)).build_eframe(|_| app);
+    settle(&mut h);
+    let name = rect_of(&h, &format!("effectControls.prop.{}.name", x.point)).center();
+    click(&mut h, name);
+    assert_eq!(h.state().session.state.selected_props, vec![(LayerId(x.small), x.point)]);
+    assert!(ids(&h).contains(&format!("viewer.effectPoint.{}", x.point)), "clicking the parameter activates the owner effect");
+}
+
+#[test]
+fn non_point_parameters_activate_handles_across_effect_families() {
+    for (effect, parameter, points) in [
+        ("ec.distort.cclens", "size", vec!["center"]),
+        ("ec.generate.gradientramp", "startColor", vec!["start", "end"]),
+        ("ec.generate.beam", "length", vec!["startPoint", "endPoint"]),
+    ] {
+        let mut s = Session::default();
+        s.execute("comp.new", json!({"width":320,"height":180,"duration":1})).unwrap();
+        let lid = s.execute("layer.newSolid", json!({"color":"#406080"})).unwrap()["layer"].as_u64().unwrap();
+        let uid = s.execute("effect.apply", json!({"layer":lid,"effect":effect})).unwrap()["effects"][0].as_u64().unwrap();
+        let l = layer(&s, lid);
+        let g = l.effects().unwrap().find_group(uid).unwrap();
+        let prop = g.prop(parameter).unwrap().uid;
+        let point_ids: Vec<_> = points.iter().map(|name| g.prop(name).unwrap().uid).collect();
+        s.state.selected_props.clear();
+        let mut app = EffectcraftApp::new(s);
+        app.show_panel(PanelKind::EffectControls);
+        let mut h = Harness::builder().with_size(egui::vec2(1700.0, 1100.0)).build_eframe(|_| app);
+        settle(&mut h);
+        let name = rect_of(&h, &format!("effectControls.prop.{prop}.name")).center();
+        click(&mut h, name);
+        assert_eq!(h.state().session.state.selected_props, vec![(LayerId(lid), prop)], "{effect}");
+        for point in point_ids {
+            assert!(ids(&h).contains(&format!("viewer.effectPoint.{point}")), "{effect}: all its point handles activate");
+        }
+    }
+}
+
+#[test]
+fn custom_effect_editors_activate_their_owner() {
+    let (app, x) = app();
+    let mut h = Harness::builder().with_size(egui::vec2(1700.0, 1100.0)).build_eframe(|_| app);
+    settle(&mut h);
+    let graph = rect_of(&h, &format!("effectControls.effect.{}.curves.graph", x.curves)).center();
+    click(&mut h, graph);
+    assert!(h.state().session.state.selected_props.contains(&(LayerId(x.small), x.curves)));
+}
+
+/// #514: Apply Color LUT asks for its LUT as it is applied (as in After Effects), Effect
+/// Controls shows the file with a Choose… button that picks another, and the LUT changes the
+/// pixels. #473: a text parameter (Cryptomatte's Selection) has a field that sets it.
+#[test]
+fn file_and_text_parameters_have_widgets() {
+    let dir = std::env::temp_dir().join(format!("ec-ui-lut-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // A 2×2×2 LUT that inverts, and one that does nothing.
+    let cube = |inv: bool| {
+        let mut t = String::from("LUT_3D_SIZE 2\n");
+        for b in 0..2 {
+            for g in 0..2 {
+                for r in 0..2 {
+                    let f = |c: i32| if inv { 1 - c } else { c };
+                    t += &format!("{} {} {}\n", f(r), f(g), f(b));
+                }
+            }
+        }
+        t
+    };
+    let (invert, identity) = (dir.join("invert.cube"), dir.join("identity.cube"));
+    std::fs::write(&invert, cube(true)).unwrap();
+    std::fs::write(&identity, cube(false)).unwrap();
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "LUT", "width": 64, "height": 32, "frameRate": 30, "duration": 1})).unwrap();
+    let l = s.execute("layer.newSolid", json!({"name": "Plate", "color": "#ff0000", "width": 64, "height": 32})).unwrap()["layer"].as_u64().unwrap();
+    s.state.selected_layers = vec![LayerId(l)];
+    let mut app = EffectcraftApp::new(s);
+    app.show_panel(PanelKind::EffectControls);
+    let picked = std::sync::Arc::new(std::sync::Mutex::new(invert.to_string_lossy().to_string()));
+    let pick = picked.clone();
+    app.hooks.pick_files = Some(Box::new(move |exts: &[&str]| {
+        assert_eq!(exts, ["cube"]);
+        vec![pick.lock().unwrap().clone()]
+    }));
+    let mut h = Harness::builder().with_size(egui::vec2(1700.0, 1100.0)).build_eframe(|_| app);
+    settle(&mut h);
+    let ctx = h.ctx.clone();
+    let r = effectcraft_ui_egui::menus::invoke(h.state_mut(), &ctx, "effect.apply", json!({"effect": "Apply Color LUT"})).unwrap();
+    let fx = r["effects"][0].as_u64().unwrap();
+    let lut = |h: &Harness<'_, EffectcraftApp>| {
+        let g = layer(&h.state().session, l).effects().and_then(|f| f.groups().find(|g| g.uid == fx).cloned()).unwrap();
+        let p = g.get("lut").unwrap().clone();
+        (
+            p.uid,
+            match p.value {
+                KV::Str(s) => s,
+                _ => String::new(),
+            },
+        )
+    };
+    assert_eq!(lut(&h).1, invert.to_string_lossy(), "the LUT was asked for on apply");
+    let px = |h: &Harness<'_, EffectcraftApp>| {
+        let s = &h.state().session;
+        s.render(s.active_comp_id().unwrap(), effectcraft_engine::time::Tick::ZERO, Default::default()).get(10, 10)
+    };
+    assert!(px(&h)[0] < 0.05 && px(&h)[1] > 0.95, "red inverted to cyan: {:?}", px(&h));
+    settle(&mut h);
+    let uid = lut(&h).0;
+    assert!(h.state().auto.find(&format!("effectControls.prop.{uid}.value")).is_some_and(|e| e.label == "invert.cube"));
+    *picked.lock().unwrap() = identity.to_string_lossy().to_string();
+    let at = rect_of(&h, &format!("effectControls.prop.{uid}.choose")).center();
+    click(&mut h, at);
+    assert_eq!(lut(&h).1, identity.to_string_lossy());
+    assert!(px(&h)[0] > 0.95, "{:?}", px(&h));
+
+    // A text parameter: type into its field; it is set when the field loses the focus.
+    let crypto = h.state_mut().session.execute("effect.apply", json!({"layers": [l], "effect": "ec.3d.cryptomatte"})).unwrap()["effects"][0].as_u64().unwrap();
+    settle(&mut h);
+    let sel =
+        layer(&h.state().session, l).effects().and_then(|f| f.groups().find(|g| g.uid == crypto).and_then(|g| g.get("selection")).map(|p| p.uid)).unwrap();
+    let at = rect_of(&h, &format!("effectControls.prop.{sel}.value")).center();
+    click(&mut h, at);
+    h.event(egui::Event::Text("left*".into()));
+    h.step();
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    let v = layer(&h.state().session, l).props.find(sel).unwrap().value.clone();
+    assert_eq!(v, KV::Str("left*".into()));
+    let _ = std::fs::remove_dir_all(dir);
 }

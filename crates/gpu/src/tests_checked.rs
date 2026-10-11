@@ -6,6 +6,75 @@ use effectcraft_render::{Accelerator, Backend, LayerCache, RenderOpts, Renderer}
 use effectcraft_time::Tick;
 
 #[test]
+fn checked_registered_plugins_fail_visibly_in_gpu_and_deferred_stacks_and_recover() {
+    use effectcraft_effects::plugin::{EffectPlugin, PluginFrame, PluginManifest, PluginParam, PluginParamKind, PluginParams, register_plugin};
+    struct Fault(PluginManifest);
+    impl EffectPlugin for Fault {
+        fn manifest(&self) -> &PluginManifest {
+            &self.0
+        }
+        fn render(&self, frame: &mut PluginFrame, params: &PluginParams, _time: f64) -> Result<(), String> {
+            match params.f("mode") as u32 {
+                1 => {
+                    frame.pixels[0] = [0.0; 4];
+                    Err("synthetic GPU plug-in error".into())
+                }
+                2 => {
+                    frame.pixels[0] = [0.0; 4];
+                    panic!("synthetic GPU plug-in panic")
+                }
+                _ => Ok(()),
+            }
+        }
+    }
+    let spec = register_plugin(std::sync::Arc::new(Fault(PluginManifest {
+        api: 1,
+        id: "org.test.gpu-checked-plugin".into(),
+        name: "Checked GPU Plug-in".into(),
+        category: "Test".into(),
+        version: String::new(),
+        author: String::new(),
+        description: String::new(),
+        params: vec![PluginParam { id: "mode".into(), name: "Mode".into(), kind: PluginParamKind::Angle { default: 0.0 } }],
+    })))
+    .unwrap();
+    let required = std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|value| value == "1");
+    let blocking = crate::tests::gpu();
+    let deferred = crate::tests_deferred::deferred_gpu();
+    assert!(!required || (blocking.is_some() && deferred.is_some()), "registered plug-in acceptance requires Vulkan and deferred GPU devices");
+    let (Some(blocking), Some((deferred, _guard))) = (blocking, deferred) else { return };
+    eprintln!("checked registered plug-in adapter: {}", blocking.name());
+    for gpu in [blocking, deferred] {
+        for adjustment in [false, true] {
+            let mut scene = Scene::new(BitDepth::Bpc32);
+            let background = scene.solid([0.8, 0.6, 0.2], 97, 61);
+            scene.push(background);
+            let mut layer = scene.solid([0.2, 0.4, 0.8], 97, 61);
+            layer.switches.adjustment = adjustment;
+            scene.effect(&mut layer, spec.id, &[]);
+            let lid = scene.push(layer);
+            let cache = LayerCache::default();
+            cache.set_gate(gpu.miss_gate());
+            let opts = RenderOpts { backend: Backend::Gpu, ..Default::default() };
+            let expected = Renderer::new(&scene.p, &Pattern, opts).comp_frame_cpu_checked(scene.cid, Tick::ZERO).unwrap();
+            for (mode, reason) in [(1.0, "synthetic GPU plug-in error"), (2.0, "Rust plug-in panicked")] {
+                scene.p.comp_mut(scene.cid).unwrap().layer_mut(lid).unwrap().props.prop_mut("effects/#1/mode").unwrap().value = Value::Scalar(mode);
+                let before = scene.p.clone();
+                let renderer = checked_renderer(&scene.p, gpu, &cache, opts);
+                let error = effectcraft_render::passes::block_on(effectcraft_render::passes::comp_frame_checked(&renderer, scene.cid, Tick::ZERO)).unwrap_err();
+                assert_eq!((error.layer, error.effect_id.as_str()), (lid, spec.id));
+                assert!(error.message.contains(reason), "{error}");
+                assert_eq!(scene.p, before);
+            }
+            scene.p.comp_mut(scene.cid).unwrap().layer_mut(lid).unwrap().props.prop_mut("effects/#1/mode").unwrap().value = Value::Scalar(0.0);
+            let renderer = checked_renderer(&scene.p, gpu, &cache, opts);
+            let actual = effectcraft_render::passes::block_on(effectcraft_render::passes::comp_frame_checked(&renderer, scene.cid, Tick::ZERO)).unwrap();
+            assert_eq!(crate::tests::diff(&actual, &expected, 1e-3).over, 0, "repair must not reuse failed pixels");
+        }
+    }
+}
+
+#[test]
 fn checked_bloom_resident_adjustment_and_deferred_completion_are_explicit() {
     let gpu = crate::tests::gpu();
     let required = std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|value| value == "1");

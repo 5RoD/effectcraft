@@ -28,13 +28,18 @@ use effectcraft_keyframe::Value;
 use effectcraft_project::ParamUi;
 use serde::{Deserialize, Serialize};
 
-use crate::{Buf, EffectCtx, EffectSpec, ParamSpec, RenderFn};
+use crate::{Buf, CheckedRenderFn, EffectCtx, EffectSpec, ParamSpec};
 
 /// The plug-in API version this build implements.
 pub const PLUGIN_API_VERSION: u32 = 1;
 
 /// The most plug-in effects one process can register.
 pub const MAX_PLUGINS: usize = 64;
+
+/// Per-frame limits at the plug-in boundary (including padded effect buffers).
+pub const MAX_PLUGIN_DIMENSION: u32 = 16_384;
+pub const MAX_PLUGIN_PIXELS: u64 = 32 * 1024 * 1024;
+pub const MAX_PLUGIN_PARAMS: usize = 256;
 
 /// A plug-in parameter's kind, default and range.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -137,7 +142,6 @@ pub struct PluginManifest {
 impl PluginManifest {
     /// Check the manifest against this API version.
     pub fn validate(&self) -> Result<(), String> {
-        const MAX_PARAMS: usize = 256;
         if self.api != PLUGIN_API_VERSION {
             return Err(format!("plug-in `{}` targets plug-in API {} but this build implements API {PLUGIN_API_VERSION}", self.id, self.api));
         }
@@ -148,8 +152,8 @@ impl PluginManifest {
         if self.name.trim().is_empty() || self.category.trim().is_empty() {
             return Err(format!("plug-in `{}` needs a name and a category", self.id));
         }
-        if self.params.len() > MAX_PARAMS {
-            return Err(format!("plug-in `{}` has {} parameters (at most {MAX_PARAMS})", self.id, self.params.len()));
+        if self.params.len() > MAX_PLUGIN_PARAMS {
+            return Err(format!("plug-in `{}` has {} parameters (at most {MAX_PLUGIN_PARAMS})", self.id, self.params.len()));
         }
         let mut seen = std::collections::HashSet::new();
         for p in &self.params {
@@ -167,13 +171,22 @@ impl PluginManifest {
                     return Err(format!("plug-in `{}`: slider `{}` needs min ≤ default ≤ max (and sliderMin ≤ sliderMax)", self.id, p.id));
                 }
             }
+            let finite = match &p.kind {
+                PluginParamKind::Angle { default } => default.is_finite(),
+                PluginParamKind::Point { default } => default.iter().all(|v| v.is_finite()),
+                PluginParamKind::Color { default } => default.iter().all(|v| v.is_finite()),
+                _ => true,
+            };
+            if !finite {
+                return Err(format!("plug-in `{}`: parameter `{}` needs finite defaults", self.id, p.id));
+            }
         }
         Ok(())
     }
 
     /// Total flattened parameter count.
     pub fn flat_len(&self) -> usize {
-        self.params.iter().map(|p| p.kind.width()).sum()
+        self.params.iter().fold(0usize, |n, p| n.saturating_add(p.kind.width()))
     }
 }
 
@@ -187,6 +200,39 @@ pub struct PluginFrame<'a> {
     pub scale: f64,
 }
 
+impl PluginFrame<'_> {
+    /// Validate host inputs before a native call or WebAssembly transfer allocation.
+    pub fn validate(&self, params: &PluginParams, time: f64) -> Result<(), String> {
+        self.validate_geometry(time)?;
+        if params.manifest.params.len() > MAX_PLUGIN_PARAMS || params.flat.len() != params.manifest.flat_len() {
+            return Err("plug-in flattened parameter count does not match its bounded manifest".into());
+        }
+        if let Some(index) = params.flat.iter().position(|value| !value.is_finite()) {
+            return Err(format!("plug-in flattened parameter {index} must be finite"));
+        }
+        Ok(())
+    }
+
+    fn validate_geometry(&self, time: f64) -> Result<(), String> {
+        if self.width == 0 || self.height == 0 || self.width > MAX_PLUGIN_DIMENSION || self.height > MAX_PLUGIN_DIMENSION {
+            return Err(format!("plug-in frame dimensions must be 1..={MAX_PLUGIN_DIMENSION} pixels"));
+        }
+        let pixels = u64::from(self.width).checked_mul(u64::from(self.height)).ok_or("plug-in frame pixel count overflow")?;
+        if pixels > MAX_PLUGIN_PIXELS {
+            return Err(format!("plug-in frame exceeds the {MAX_PLUGIN_PIXELS}-pixel limit"));
+        }
+        let count = usize::try_from(pixels).map_err(|_| "plug-in frame exceeds the address space")?;
+        let bytes = count.checked_mul(std::mem::size_of::<[f32; 4]>()).ok_or("plug-in frame byte capacity overflow")?;
+        if bytes > isize::MAX as usize || self.pixels.len() != count {
+            return Err("plug-in frame pixel storage does not match its dimensions".into());
+        }
+        if !self.scale.is_finite() || self.scale <= 0.0 || !time.is_finite() {
+            return Err("plug-in scale must be finite and positive; time must be finite".into());
+        }
+        Ok(())
+    }
+}
+
 /// Parameter values for one render, flattened (see the module docs) with typed accessors.
 pub struct PluginParams<'a> {
     pub manifest: &'a PluginManifest,
@@ -195,13 +241,14 @@ pub struct PluginParams<'a> {
 
 impl PluginParams<'_> {
     fn slot(&self, id: &str) -> Option<&[f64]> {
-        let mut at = 0;
+        let mut at = 0usize;
         for p in &self.manifest.params {
             let w = p.kind.width();
+            let end = at.checked_add(w)?;
             if p.id == id {
-                return self.flat.get(at..at + w);
+                return self.flat.get(at..end);
             }
-            at += w;
+            at = end;
         }
         None
     }
@@ -214,18 +261,19 @@ impl PluginParams<'_> {
     }
     /// Point in frame pixels.
     pub fn point(&self, id: &str) -> [f64; 2] {
-        self.slot(id).map(|s| [s[0], s[1]]).unwrap_or([0.0; 2])
+        self.slot(id).and_then(|s| Some([*s.first()?, *s.get(1)?])).unwrap_or([0.0; 2])
     }
     pub fn color(&self, id: &str) -> [f64; 4] {
-        self.slot(id).map(|s| [s[0], s[1], s[2], s[3]]).unwrap_or([1.0; 4])
+        self.slot(id).and_then(|s| Some([*s.first()?, *s.get(1)?, *s.get(2)?, *s.get(3)?])).unwrap_or([1.0; 4])
     }
 }
 
 /// An effect plug-in.
 pub trait EffectPlugin: Send + Sync {
     fn manifest(&self) -> &PluginManifest;
-    /// Process `frame` in place. `time` is layer time in seconds. An error leaves the frame as
-    /// it was (the error is logged once).
+    /// Process `frame` in place. `time` is layer time in seconds. Return an actionable error
+    /// on failure; the host discards this provisional frame instead of publishing/caching it.
+    /// Native code may already have modified the provisional pixels when it fails.
     fn render(&self, frame: &mut PluginFrame, params: &PluginParams, time: f64) -> Result<(), String>;
     /// Where the plug-in came from (a file path, `built-in`…), for listings.
     fn source(&self) -> String {
@@ -281,13 +329,14 @@ pub fn register_plugin(plugin: Arc<dyn EffectPlugin>) -> Result<&'static EffectS
         return Err(format!("an effect with id `{}` is already registered", m.id));
     }
     let slot = SLOTS.iter().position(|s| s.get().is_none()).ok_or_else(|| format!("too many plug-ins (at most {MAX_PLUGINS})"))?;
-    SLOTS[slot].set(plugin).map_err(|_| "plug-in slot taken".to_string())?;
+    let trampoline = *TRAMPOLINES.get(slot).ok_or("plug-in trampoline unavailable")?;
+    SLOTS.get(slot).ok_or("plug-in slot unavailable")?.set(plugin).map_err(|_| "plug-in slot taken".to_string())?;
     let spec: &'static EffectSpec = Box::leak(Box::new(EffectSpec {
         id: leak(&m.id),
         name: leak(&m.name),
         category: leak(&m.category),
         params: m.params.iter().map(param_spec).collect(),
-        render: crate::EffectRender::Legacy(TRAMPOLINES[slot]),
+        render: crate::EffectRender::Checked(trampoline),
         gpu: false,
         float: true,
     }));
@@ -296,15 +345,15 @@ pub fn register_plugin(plugin: Arc<dyn EffectPlugin>) -> Result<&'static EffectS
 }
 
 /// Each slot needs its own `fn` (effect render functions are plain function pointers).
-fn trampoline<const I: usize>(ctx: &EffectCtx, buf: Buf) -> Buf {
+fn trampoline<const I: usize>(ctx: &EffectCtx, buf: Buf) -> Result<Buf, String> {
     run_slot(I, ctx, buf)
 }
 
 macro_rules! trampolines {
-    ($($i:literal)*) => { [$(trampoline::<$i> as RenderFn),*] };
+    ($($i:literal)*) => { [$(trampoline::<$i> as CheckedRenderFn),*] };
 }
 
-const TRAMPOLINES: [RenderFn; MAX_PLUGINS] = trampolines!(
+const TRAMPOLINES: [CheckedRenderFn; MAX_PLUGINS] = trampolines!(
     0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
     32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63
 );
@@ -332,17 +381,143 @@ pub fn flatten(m: &PluginManifest, ctx: &EffectCtx, buf: &Buf) -> Vec<f64> {
     out
 }
 
-fn run_slot(slot: usize, ctx: &EffectCtx, mut buf: Buf) -> Buf {
-    let Some(plugin) = SLOTS[slot].get() else { return buf };
-    let m = plugin.manifest();
-    let flat = flatten(m, ctx, &buf);
-    let params = PluginParams { manifest: m, flat: &flat };
-    let (width, height) = (buf.img.width, buf.img.height);
-    let before = buf.img.data.clone();
-    let mut frame = PluginFrame { width, height, pixels: &mut buf.img.data, scale: buf.scale };
-    if let Err(e) = plugin.render(&mut frame, &params, ctx.time) {
-        log::warn!("plug-in `{}`: {e}", m.id);
-        buf.img.data = before;
+fn run_slot(slot: usize, ctx: &EffectCtx, mut buf: Buf) -> Result<Buf, String> {
+    let plugin = SLOTS.get(slot).and_then(OnceLock::get).ok_or("plug-in slot unavailable")?;
+    // A native plug-in has no sandbox. Keep escaped Rust panics inside the checked boundary;
+    // provisional pixels are discarded by the caller, with no full-frame backup copy.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        PluginFrame { width: buf.img.width, height: buf.img.height, pixels: &mut buf.img.data, scale: buf.scale }.validate_geometry(ctx.time)?;
+        let m = plugin.manifest();
+        m.validate()?;
+        for parameter in &m.params {
+            if ctx.params.get(&parameter.id).is_some_and(|value| value.components().iter().any(|v| !v.is_finite())) {
+                return Err(format!("plug-in parameter `{}` must be finite", parameter.id));
+            }
+        }
+        let flat = flatten(m, ctx, &buf);
+        let params = PluginParams { manifest: m, flat: &flat };
+        let mut frame = PluginFrame { width: buf.img.width, height: buf.img.height, pixels: &mut buf.img.data, scale: buf.scale };
+        frame.validate(&params, ctx.time)?;
+        plugin.render(&mut frame, &params, ctx.time)?;
+        Ok(buf)
+    }))
+    .map_err(|payload| {
+        let message =
+            payload.downcast_ref::<String>().map(String::as_str).or_else(|| payload.downcast_ref::<&str>().copied()).unwrap_or("non-string panic payload");
+        format!("Rust plug-in panicked: {}", message.chars().take(1024).collect::<String>())
+    })?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{EffectEnv, EffectRender, Params};
+    use effectcraft_raster::Image;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Faulting {
+        manifest: PluginManifest,
+        calls: Arc<AtomicUsize>,
     }
-    buf
+
+    impl EffectPlugin for Faulting {
+        fn manifest(&self) -> &PluginManifest {
+            &self.manifest
+        }
+
+        fn render(&self, frame: &mut PluginFrame, params: &PluginParams, _time: f64) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            frame.pixels[0] = [0.1, 0.2, 0.3, 1.0];
+            match params.f("mode") as u32 {
+                1 => Err("synthetic native error after modifying pixels".into()),
+                2 => panic!("synthetic native panic after modifying pixels"),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    fn faulting() -> (&'static EffectSpec, Arc<AtomicUsize>) {
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "api": 1, "id": "org.test.checked-native", "name": "Checked Native", "category": "Test",
+            "params": [
+                {"id": "mode", "name": "Mode", "type": "slider", "default": 0, "min": 0, "max": 2},
+                {"id": "point", "name": "Point", "type": "point"},
+                {"id": "on", "name": "On", "type": "checkbox"},
+                {"id": "choice", "name": "Choice", "type": "popup", "options": ["A"]},
+                {"id": "tint", "name": "Tint", "type": "color"}
+            ]
+        }))
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let spec = register_plugin(Arc::new(Faulting { manifest, calls: calls.clone() })).unwrap();
+        (spec, calls)
+    }
+
+    #[test]
+    fn checked_native_plugin_errors_panics_and_hostile_inputs_do_not_escape_or_invoke_invalid_frames() {
+        let (spec, calls) = faulting();
+        assert!(matches!(spec.render, EffectRender::Checked(_)));
+        let render = |params: &Params, image: Image, time: f64, scale: f64, offset: [f64; 2]| {
+            let context = EffectCtx { params, time, layer_size: [2.0; 2], seed: 0, adjustment: false, env: EffectEnv::default() };
+            crate::apply(spec, &context, Buf { img: image, offset, scale })
+        };
+        let mut params = Params::default();
+        params.values.insert("mode".into(), Value::Scalar(1.0));
+        assert!(render(&params, Image::new(2, 2), 0.0, 1.0, [0.0; 2]).unwrap_err().contains("native error"));
+        params.values.insert("mode".into(), Value::Scalar(2.0));
+        let error = render(&params, Image::new(2, 2), 0.0, 1.0, [0.0; 2]).unwrap_err();
+        assert!(error.contains("Rust plug-in panicked: synthetic native panic"), "{error}");
+        params.values.insert("mode".into(), Value::Scalar(0.0));
+        assert_eq!(render(&params, Image::new(2, 2), 0.0, 1.0, [0.0; 2]).unwrap().img.get(0, 0), [0.1, 0.2, 0.3, 1.0]);
+        let valid_calls = calls.load(Ordering::SeqCst);
+        for image in [
+            Image { width: u32::MAX, height: u32::MAX, data: Vec::new() },
+            Image { width: 8192, height: 8192, data: Vec::new() },
+            Image { width: 0, height: 2, data: Vec::new() },
+            Image { width: 2, height: 2, data: vec![[0.0; 4]; 3] },
+            Image { width: 2, height: 2, data: vec![[0.0; 4]; 5] },
+        ] {
+            assert!(render(&params, image, 0.0, 1.0, [0.0; 2]).is_err());
+        }
+        for scale in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0] {
+            assert!(render(&params, Image::new(2, 2), 0.0, scale, [0.0; 2]).is_err());
+        }
+        for time in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(render(&params, Image::new(2, 2), time, 1.0, [0.0; 2]).is_err());
+        }
+        for id in ["mode", "point", "on", "choice", "tint"] {
+            for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let mut bad = params.clone();
+                bad.values.insert(id.into(), Value::Scalar(value));
+                assert!(render(&bad, Image::new(2, 2), 0.0, 1.0, [0.0; 2]).unwrap_err().contains(id));
+            }
+        }
+        assert!(render(&params, Image::new(2, 2), 0.0, 1.0, [f64::INFINITY, 0.0]).unwrap_err().contains("flattened parameter"));
+        let mut overflow = params.clone();
+        overflow.values.insert("point".into(), Value::Vec2([f64::MAX; 2]));
+        assert!(render(&overflow, Image::new(2, 2), 0.0, 4.0, [0.0; 2]).unwrap_err().contains("flattened parameter"));
+        assert_eq!(calls.load(Ordering::SeqCst), valid_calls, "bad host data never reaches native code");
+        assert!(render(&params, Image::new(2, 2), -7.0, 4.0, [0.0; 2]).is_ok());
+    }
+
+    #[test]
+    fn plugin_typed_accessors_do_not_index_an_incorrect_parameter_kind() {
+        let manifest: PluginManifest = serde_json::from_value(serde_json::json!({
+            "api": 1, "id": "org.test.accessors", "name": "Accessors", "category": "Test",
+            "params": [{"id": "one", "name": "One", "type": "angle"}]
+        }))
+        .unwrap();
+        let params = PluginParams { manifest: &manifest, flat: &[7.0] };
+        assert_eq!(params.point("one"), [0.0; 2]);
+        assert_eq!(params.color("one"), [1.0; 4]);
+        for kind in [
+            PluginParamKind::Angle { default: f64::NAN },
+            PluginParamKind::Point { default: [f64::INFINITY; 2] },
+            PluginParamKind::Color { default: [f64::NAN; 4] },
+        ] {
+            let mut bad = manifest.clone();
+            bad.params[0].kind = kind;
+            assert!(bad.validate().unwrap_err().contains("finite defaults"));
+        }
+    }
 }

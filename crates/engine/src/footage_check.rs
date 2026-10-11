@@ -51,6 +51,7 @@ pub fn start(s: &mut Session, items: Option<Vec<ItemId>>, wait: bool) -> crate::
     }
     let services = s.services.clone();
     let importer = s.importer.clone();
+    let rate = s.sequence_rate();
     let n = jobs.len();
     s.spawn_task("footageCheck", format!("Checking footage ({n} items)"), wait, move |ctl| {
         let mut found: Vec<(ItemId, Found)> = Vec::with_capacity(jobs.len());
@@ -69,7 +70,23 @@ pub fn start(s: &mut Session, items: Option<Vec<ItemId>>, wait: bool) -> crate::
             };
             // Saved without metadata (a hand-written or converted project): probe it now.
             let needs_probe = present && f.width == 0 && f.height == 0 && f.kind != FootageKind::Audio;
-            match importer.as_ref().filter(|_| needs_probe).map(|imp| imp.probe(&f.path)) {
+            let probed = importer.as_ref().filter(|_| needs_probe).map(|imp| match f.kind {
+                // A sequence keeps its files; its first one gives the metadata.
+                FootageKind::Sequence if !f.sequence.is_empty() => imp.probe(&f.path).map(|one| {
+                    let mut nf = Footage {
+                        width: one.width,
+                        height: one.height,
+                        pixel_aspect: one.pixel_aspect,
+                        has_video: one.has_video,
+                        codec: one.codec,
+                        ..f.clone()
+                    };
+                    nf.sync_sequence_duration();
+                    nf
+                }),
+                _ => crate::sequence::probe_path(imp.as_ref(), services.as_ref(), &f.path, rate),
+            });
+            match probed {
                 Some(Ok(mut nf)) => {
                     nf.alpha = f.alpha;
                     nf.loop_count = f.loop_count;
@@ -173,6 +190,32 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(s.project.items.values().all(|i| matches!(&i.kind, ItemKind::Footage(f) if f.missing)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// #652: footage saved with a relative path is found next to the project, wherever the
+    /// app was started (the desktop app doesn't start in the project's folder, the CLI often
+    /// does).
+    #[test]
+    fn relative_footage_is_found_next_to_the_project() {
+        let dir = std::env::temp_dir().join(format!("ec-relative-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("media")).unwrap();
+        let clip = dir.join("media").join("ec-relative-clip.png");
+        std::fs::write(&clip, b"x").unwrap();
+        let mut s = session_with(&["media/ec-relative-clip.png", "/nonexistent/ec/abs.png", "media/ec-relative-gone.png"]);
+        let path = dir.join("p.ecproj");
+        s.execute("file.saveAs", json!({"path": path.to_string_lossy()})).unwrap();
+        let mut o = Session::default();
+        o.execute("file.open", json!({"path": path.to_string_lossy()})).unwrap();
+        let mut paths: Vec<std::path::PathBuf> =
+            o.project.items.values().filter_map(|i| if let ItemKind::Footage(f) = &i.kind { Some(f.path.clone().into()) } else { None }).collect();
+        paths.sort();
+        let mut expected = ["/nonexistent/ec/abs.png", clip.to_str().unwrap(), "media/ec-relative-gone.png"].map(std::path::PathBuf::from);
+        expected.sort();
+        assert_eq!(paths, expected);
+        assert!(!o.is_dirty(), "finding the files is no edit");
+        let r = o.execute("footage.check", json!({"wait": true})).unwrap();
+        assert_eq!(r["missing"], 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 

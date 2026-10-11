@@ -87,6 +87,82 @@ fn prefs_set_validates_keys_types_and_ranges() {
     assert!(p.reset(Some("bogus")).is_err());
 }
 
+/// Settings ▸ Appearance ▸ UI Scale (#284): a percentage, 100 by default, kept within 75–200;
+/// the dialog's choices set it as a number.
+#[test]
+fn ui_scale_is_a_percentage_from_75_to_200() {
+    let mut p = Prefs::default();
+    assert_eq!(p.appearance.ui_scale, 100);
+    p.set("appearance.uiScale", json!("150")).unwrap();
+    assert_eq!(p.appearance.ui_scale, 150);
+    assert_eq!(p.get("appearance.uiScale"), Some(json!(150)));
+    p.set("appearance.uiScale", json!(500)).unwrap();
+    assert_eq!(p.appearance.ui_scale, 200);
+    p.set("appearance.uiScale", json!(10)).unwrap();
+    assert_eq!(p.appearance.ui_scale, 75);
+    let page = crate::prefs::pages().into_iter().find(|pg| pg.id == "appearance").unwrap();
+    let listed = page.items.iter().any(|i| {
+        matches!(i, crate::prefs::Item::Setting { key: "appearance.uiScale", kind: crate::prefs::Kind::Choice(c), live: true, .. } if c.contains(&("200%", "200")))
+    });
+    assert!(listed, "Settings ▸ Appearance offers it");
+    // Older settings files without it get the default.
+    assert_eq!(Prefs::from_json(r#"{"version": 2, "appearance": {"theme": "light"}}"#).appearance.ui_scale, 100);
+}
+
+/// Settings ▸ Appearance: new installs use 5RoD's dark theme (Sync with System is opt-in), and settings saved
+/// with a single theme load as a fixed mode showing that theme.
+#[test]
+fn appearance_defaults_and_legacy_theme_migrate() {
+    let p = Prefs::default();
+    assert_eq!((p.appearance.appearance_mode.as_str(), p.appearance.dark_theme.as_str(), p.appearance.light_theme.as_str()), ("dark", "5rod", "light"));
+    assert_eq!(p.appearance.resolved_theme(Some(true)), "5rod");
+    for (saved, mode, dark, light) in [("darker", "dark", "darker", "light"), ("light", "light", "5rod", "light"), ("dark", "dark", "dark", "light")] {
+        let p = Prefs::from_json(&json!({"version": 2, "appearance": {"theme": saved}}).to_string());
+        assert_eq!(p.appearance.appearance_mode, mode, "{saved}");
+        assert_eq!(p.appearance.dark_theme, dark, "{saved}");
+        assert_eq!(p.appearance.light_theme, light, "{saved}");
+        assert_eq!(p.appearance.theme, saved);
+    }
+    // The flat layout of the earliest builds migrates too.
+    assert_eq!(Prefs::from_json(r#"{"theme": "light"}"#).appearance.appearance_mode, "light");
+    // A file that already has a mode keeps it; garbage falls back to the defaults.
+    let p = Prefs::from_json(r#"{"version": 2, "appearance": {"theme": "dark", "appearanceMode": "auto", "darkTheme": "darker"}}"#);
+    assert_eq!((p.appearance.appearance_mode.as_str(), p.appearance.dark_theme.as_str()), ("auto", "darker"));
+    let p = Prefs::from_json(r#"{"version": 2, "appearance": {"appearanceMode": "sepia", "darkTheme": "light", "lightTheme": 7}}"#);
+    assert_eq!((p.appearance.appearance_mode.as_str(), p.appearance.dark_theme.as_str(), p.appearance.light_theme.as_str()), ("dark", "5rod", "light"));
+}
+
+/// The appearance settings take only their choices, survive a restart, and old clients that set
+/// the single theme still pick a visible theme without losing the other family's choice.
+#[test]
+fn appearance_choices_validate_and_legacy_theme_still_selects() {
+    let mut s = Session::default();
+    s.execute("prefs.set", json!({"values": {"appearance.appearanceMode": "auto", "appearance.darkTheme": "darker", "appearance.lightTheme": "light"}}))
+        .unwrap();
+    assert_eq!(s.prefs.appearance.appearance_mode, "auto");
+    assert_eq!(s.prefs.appearance.dark_theme, "darker");
+    assert_eq!(s.prefs.appearance.resolved_theme(Some(true)), "light");
+    assert_eq!(s.prefs.appearance.resolved_theme(Some(false)), "darker");
+    assert_eq!(s.prefs.appearance.resolved_theme(None), "darker", "no system answer: dark");
+    assert_eq!(Prefs::from_json(&s.prefs.to_json()).appearance, s.prefs.appearance);
+    for (key, bad) in
+        [("appearance.darkTheme", "light"), ("appearance.lightTheme", "darker"), ("appearance.appearanceMode", "sepia"), ("appearance.theme", "neon")]
+    {
+        assert!(s.execute("prefs.set", json!({"key": key, "value": bad})).is_err(), "{key} = {bad}");
+    }
+    s.execute("prefs.set", json!({"key": "appearance.theme", "value": "light"})).unwrap();
+    assert_eq!(s.prefs.appearance.appearance_mode, "light");
+    assert_eq!(s.prefs.appearance.dark_theme, "darker");
+    s.execute("prefs.set", json!({"key": "appearance", "value": {"theme": "dark"}})).unwrap();
+    assert_eq!(s.prefs.appearance.appearance_mode, "dark");
+    assert_eq!(s.prefs.appearance.dark_theme, "dark");
+    // A fixed mode mirrors its theme in the single-theme key for old readers.
+    s.execute("prefs.set", json!({"key": "appearance.appearanceMode", "value": "light"})).unwrap();
+    assert_eq!(s.prefs.get("appearance.theme"), Some(json!("light")));
+    s.prefs.reset(Some("appearance")).unwrap();
+    assert_eq!(s.prefs.appearance, crate::prefs::Appearance::default());
+}
+
 #[test]
 fn every_schema_key_exists_and_docs_list_the_todo_settings() {
     let p = Prefs::default();
@@ -641,12 +717,38 @@ fn interface_language_is_validated_persisted_and_backward_compatible() {
     s.execute("prefs.set", json!({"key": "general.language", "value": "en"})).unwrap();
     s.execute("prefs.set", json!({"key": "general.language", "value": "ja"})).unwrap();
     assert_eq!(s.execute("prefs.get", json!({"key": "general.language"})).unwrap(), json!("ja"));
+    // pt-br is registered alongside en and ja, and round-trips through the file like any other.
+    s.execute("prefs.set", json!({"key": "general.language", "value": "pt-br"})).unwrap();
+    assert_eq!(s.execute("prefs.get", json!({"key": "general.language"})).unwrap(), json!("pt-br"));
+    s.execute("prefs.set", json!({"key": "general.language", "value": "ja"})).unwrap();
     let saved = store.read(PREFS_FILE).unwrap();
     for bad in [json!("fr"), json!(""), json!(17), json!(null)] {
         assert!(s.execute("prefs.set", json!({"key": "general.language", "value": bad})).is_err());
         assert_eq!(s.prefs.general.language, "ja");
         assert_eq!(store.read(PREFS_FILE).unwrap(), saved);
     }
+    // zh-hans is registered alongside en and ja: it is accepted, persisted and read back.
+    s.execute("prefs.set", json!({"key": "general.language", "value": "zh-hans"})).unwrap();
+    let mut zh = Session { config: Some(store.clone()), ..Default::default() };
+    zh.load_settings();
+    assert_eq!(zh.prefs.general.language, "zh-hans");
+    // zh-hant is the same: another language of the registered set, not an error.
+    s.execute("prefs.set", json!({"key": "general.language", "value": "zh-hant"})).unwrap();
+    let mut zh_hant = Session { config: Some(store.clone()), ..Default::default() };
+    zh_hant.load_settings();
+    assert_eq!(zh_hant.prefs.general.language, "zh-hant");
+    s.execute("prefs.set", json!({"key": "general.language", "value": "uk"})).unwrap();
+    assert_eq!(s.execute("prefs.get", json!({"key": "general.language"})).unwrap(), json!("uk"));
+    let mut uk = Session { config: Some(store.clone()), ..Default::default() };
+    uk.load_settings();
+    assert_eq!(uk.prefs.general.language, "uk");
+    assert_eq!(Prefs::from_json(r#"{"general":{"language":"uk"}}"#).general.language, "uk");
+    // es is registered the same way.
+    s.execute("prefs.set", json!({"key": "general.language", "value": "es"})).unwrap();
+    let mut es = Session { config: Some(store.clone()), ..Default::default() };
+    es.load_settings();
+    assert_eq!(es.prefs.general.language, "es");
+    s.execute("prefs.set", json!({"key": "general.language", "value": "ja"})).unwrap();
     let mut reloaded = Session { config: Some(store), ..Default::default() };
     reloaded.load_settings();
     assert_eq!(reloaded.prefs.general.language, "ja");
