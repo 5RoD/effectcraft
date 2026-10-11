@@ -12,6 +12,62 @@ use filmcraft_color::{Matrix, Range};
 use filmcraft_frame::{Chroma, PixelData, VideoFrame};
 use rayon::prelude::*;
 
+use crate::{MediaError, Result};
+
+/// Match the compositor's per-image limits before trusting decoder dimensions.
+pub(crate) fn frame_pixel_count(width: u32, height: u32) -> Result<usize> {
+    effectcraft_render::raster_bounds::solid(width, height, 1.0).map_err(MediaError::Decode)?;
+    usize::try_from(u64::from(width).saturating_mul(u64::from(height))).map_err(|e| MediaError::Decode(format!("frame pixel count: {e}")))
+}
+
+fn filled<T: Clone>(len: usize, value: T) -> Result<Vec<T>> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(len).map_err(|e| MediaError::Decode(format!("frame allocation: {e}")))?;
+    data.resize(len, value);
+    Ok(data)
+}
+
+fn plane_row<T>(plane: &[T], row: usize, width: usize) -> Result<&[T]> {
+    let start = row.checked_mul(width).ok_or_else(|| MediaError::Decode("frame row offset overflow".into()))?;
+    let end = start.checked_add(width).ok_or_else(|| MediaError::Decode("frame row end overflow".into()))?;
+    plane.get(start..end).ok_or_else(|| MediaError::Decode("truncated frame plane".into()))
+}
+
+fn validate_frame(f: &VideoFrame) -> Result<usize> {
+    let len = frame_pixel_count(f.width, f.height)?;
+    let channels = len.checked_mul(4).ok_or_else(|| MediaError::Decode("frame channel count overflow".into()))?;
+    let short = || MediaError::Decode("truncated decoded frame buffer".into());
+    let validate_yuv = |chroma: Chroma, planes: [usize; 3], alpha: Option<usize>| -> Result<()> {
+        let (sx, sy) = chroma.shifts();
+        let dx = 1usize.checked_shl(sx).ok_or_else(short)?;
+        let dy = 1usize.checked_shl(sy).ok_or_else(short)?;
+        let chroma_len = (f.width as usize).div_ceil(dx).checked_mul((f.height as usize).div_ceil(dy)).ok_or_else(short)?;
+        if planes[0] < len || planes[1] < chroma_len || planes[2] < chroma_len || alpha.is_some_and(|n| n < len) {
+            return Err(short());
+        }
+        Ok(())
+    };
+    match &f.data {
+        PixelData::Rgba8(data) => {
+            data.get(..channels).ok_or_else(short)?;
+        }
+        PixelData::RgbaF32(data) => {
+            let data = data.get(..channels).ok_or_else(short)?;
+            if data.iter().any(|v| !v.is_finite()) {
+                return Err(MediaError::Decode("non-finite decoded float frame".into()));
+            }
+        }
+        PixelData::Yuv8 { planes, chroma, alpha } => validate_yuv(*chroma, planes.each_ref().map(|p| p.len()), alpha.as_ref().map(|a| a.len()))?,
+        PixelData::Yuv16 { planes, chroma, bits, alpha } => {
+            if !(8..=16).contains(bits) {
+                return Err(MediaError::Decode(format!("invalid decoded YUV bit depth: {bits}; expected 8–16")));
+            }
+            validate_yuv(*chroma, planes.each_ref().map(|p| p.len()), alpha.as_ref().map(|a| a.len()))?;
+        }
+    }
+    Ok(len)
+}
+
 /// How to turn a (colour, alpha) sample into a premultiplied pixel.
 #[derive(Clone, Copy)]
 pub(crate) struct AlphaOp {
@@ -52,27 +108,24 @@ impl AlphaOp {
     }
 }
 
-/// Convert a FilmCraft frame to an [`Image`].
-#[cfg(test)]
-pub(crate) fn frame_to_image(f: &VideoFrame, op: AlphaOp) -> Image {
-    frame_to_image_in(f, op, Vec::new())
-}
-
 /// Convert a FilmCraft frame to an [`Image`], reusing `buf`'s allocation when it is large enough
 /// (every pixel is overwritten, so a recycled frame's contents do not matter).
-pub(crate) fn frame_to_image_in(f: &VideoFrame, op: AlphaOp, mut buf: Vec<Px>) -> Image {
+pub(crate) fn frame_to_image_in(f: &VideoFrame, op: AlphaOp, mut buf: Vec<Px>) -> Result<Image> {
+    let len = validate_frame(f)?;
+    if op.matte.iter().any(|v| !v.is_finite()) {
+        return Err(MediaError::Decode("non-finite footage alpha matte".into()));
+    }
     let (w, h) = (f.width as usize, f.height as usize);
-    if buf.len() != w * h {
-        buf = vec![[0.0; 4]; w * h];
+    if buf.len() != len {
+        buf = filled(len, [0.0; 4])?;
     }
     let mut img = Image { width: f.width, height: f.height, data: buf };
     if w == 0 || h == 0 {
-        return img;
+        return Ok(img);
     }
     match &f.data {
         PixelData::Rgba8(d) => {
-            img.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
-                let src = &d[y * w * 4..(y + 1) * w * 4];
+            img.data.par_chunks_mut(w).zip(d.par_chunks(w * 4)).for_each(|(row, src)| {
                 for (o, s) in row.iter_mut().zip(src.as_chunks::<4>().0.iter()) {
                     *o = op.apply([U8[s[0] as usize], U8[s[1] as usize], U8[s[2] as usize]], U8[s[3] as usize]);
                 }
@@ -80,28 +133,31 @@ pub(crate) fn frame_to_image_in(f: &VideoFrame, op: AlphaOp, mut buf: Vec<Px>) -
         }
         PixelData::RgbaF32(d) => {
             // linear premultiplied → encoded premultiplied
-            img.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
-                let src = &d[y * w * 4..(y + 1) * w * 4];
+            img.data.par_chunks_mut(w).zip(d.par_chunks(w * 4)).try_for_each(|(row, src)| -> Result<()> {
                 for (o, s) in row.iter_mut().zip(src.as_chunks::<4>().0.iter()) {
                     let a = s[3];
                     let inv = if a > 0.0 { 1.0 / a } else { 0.0 };
                     let c = [op.float(s[0] * inv) * a, op.float(s[1] * inv) * a, op.float(s[2] * inv) * a];
                     *o = if op.mode == AlphaMode::Ignore { [c[0], c[1], c[2], 1.0] } else { [c[0], c[1], c[2], a] };
+                    if o.iter().any(|v| !v.is_finite()) {
+                        return Err(MediaError::Decode("float footage conversion produced non-finite pixels".into()));
+                    }
                 }
-            });
+                Ok(())
+            })?;
         }
         PixelData::Yuv8 { planes, chroma, alpha } => {
             let yuv = Yuv::new(f.color.matrix, f.color.range, 8);
             let amax = 255.0;
-            convert_yuv(&mut img, w, h, *chroma, [&planes[0][..], &planes[1][..], &planes[2][..]], alpha.as_deref().map(|a| &a[..]), amax, &yuv, op);
+            convert_yuv(&mut img, w, h, *chroma, [&planes[0][..], &planes[1][..], &planes[2][..]], alpha.as_deref().map(|a| &a[..]), amax, &yuv, op)?;
         }
         PixelData::Yuv16 { planes, chroma, bits, alpha } => {
             let yuv = Yuv::new(f.color.matrix, f.color.range, *bits);
             let amax = ((1u32 << *bits) - 1) as f32;
-            convert_yuv(&mut img, w, h, *chroma, [&planes[0][..], &planes[1][..], &planes[2][..]], alpha.as_deref().map(|a| &a[..]), amax, &yuv, op);
+            convert_yuv(&mut img, w, h, *chroma, [&planes[0][..], &planes[1][..], &planes[2][..]], alpha.as_deref().map(|a| &a[..]), amax, &yuv, op)?;
         }
     }
-    img
+    Ok(img)
 }
 
 /// A FilmCraft frame for a render that shows it at `w` × `h`, at most half its size each way:
@@ -110,11 +166,12 @@ pub(crate) fn frame_to_image_in(f: &VideoFrame, op: AlphaOp, mut buf: Vec<Px>) -
 /// and the [1 6 1]/8 neighbourhood of its chroma sample: the mean of the upsampled chroma its
 /// pixels get), then resampled the rest of the way. Conversion is linear until it clips, so
 /// this is the RGB box filter `resample` starts with, except in blocks where some colours clip.
-/// `None` for other frames.
-pub(crate) fn frame_to_image_scaled(f: &VideoFrame, w: u32, h: u32) -> Option<Image> {
+/// `Ok(None)` for other valid frames; malformed decoded data is an error.
+pub(crate) fn frame_to_image_scaled(f: &VideoFrame, w: u32, h: u32) -> Result<Option<Image>> {
+    validate_frame(f)?;
     let (fw, fh) = (f.width as usize, f.height as usize);
     if w == 0 || h == 0 || fw % 2 != 0 || fh % 2 != 0 || (w as usize).saturating_mul(2) > fw || (h as usize).saturating_mul(2) > fh {
-        return None;
+        return Ok(None);
     }
     let half = match &f.data {
         PixelData::Yuv8 { planes, chroma: Chroma::C420, alpha: None } => {
@@ -123,46 +180,49 @@ pub(crate) fn frame_to_image_scaled(f: &VideoFrame, w: u32, h: u32) -> Option<Im
         PixelData::Yuv16 { planes, chroma: Chroma::C420, bits, alpha: None } => {
             half_420(fw, fh, [&planes[0][..], &planes[1][..], &planes[2][..]], &Yuv::new(f.color.matrix, f.color.range, *bits))?
         }
-        _ => return None,
+        _ => return Ok(None),
     };
-    Some(if (half.width, half.height) == (w, h) { half } else { effectcraft_raster::resample(&half, w, h) })
+    Ok(Some(if (half.width, half.height) == (w, h) { half } else { effectcraft_raster::resample(&half, w, h) }))
 }
 
 /// An opaque 4:2:0 frame of even size `w` × `h` converted at half that size (see
-/// [`frame_to_image_scaled`]); `None` when the planes are too short.
-fn half_420<T: Sample>(w: usize, h: usize, [luma, cb, cr]: [&[T]; 3], k: &Yuv) -> Option<Image> {
-    /// Row `r` of a plane `n` samples wide (empty past its end).
-    fn row_of<T>(p: &[T], r: usize, n: usize) -> &[T] {
-        p.get(r.saturating_mul(n)..(r + 1).saturating_mul(n)).unwrap_or_default()
-    }
+/// [`frame_to_image_scaled`]); row bounds and scratch allocation remain fallible.
+fn half_420<T: Sample>(w: usize, h: usize, [luma, cb, cr]: [&[T]; 3], k: &Yuv) -> Result<Image> {
     let (cw, ch) = (w / 2, h / 2);
-    if luma.len() < w.checked_mul(h)? || cb.len() < cw * ch || cr.len() < cw * ch {
-        return None;
-    }
-    let mut img = Image::new(cw as u32, ch as u32);
-    img.data.par_chunks_mut(cw).enumerate().for_each_init(
+    let mut img = Image { width: cw as u32, height: ch as u32, data: filled(cw * ch, [0.0; 4])? };
+    img.data.par_chunks_mut(cw).enumerate().try_for_each_init(
         // Chroma rows with their edge samples repeated on both ends, for the horizontal [1 6 1].
-        || (vec![0f32; cw + 2], vec![0f32; cw + 2]),
-        |(uc, vc), (cy, row)| {
+        || -> Result<_> { Ok((filled(cw + 2, 0f32)?, filled(cw + 2, 0f32)?)) },
+        |scratch, (cy, row)| -> Result<()> {
+            let (uc, vc) = scratch.as_mut().map_err(|e| MediaError::Decode(e.to_string()))?;
             // The chroma rows above and below weigh 1/8, as `centred` upsampling averages out.
             let rows = [cy.saturating_sub(1), cy, (cy + 1).min(ch - 1)];
             for (dst, plane) in [(&mut *uc, cb), (&mut *vc, cr)] {
-                let [above, at, below] = rows.map(|r| row_of(plane, r, cw));
-                for (d, ((a, b), c)) in dst[1..=cw].iter_mut().zip(above.iter().zip(at).zip(below)) {
+                let [above, at, below] = rows.map(|r| plane_row(plane, r, cw));
+                let (above, at, below) = (above?, at?, below?);
+                let middle = dst.get_mut(1..=cw).ok_or_else(|| MediaError::Decode("chroma scratch row too short".into()))?;
+                for (d, ((a, b), c)) in middle.iter_mut().zip(above.iter().zip(at).zip(below)) {
                     *d = ((a.f() + c.f()) * 0.125 + b.f() * 0.75 - k.c_off) * k.c_scale;
                 }
-                (dst[0], dst[cw + 1]) = (dst[1], dst[cw]);
+                let (Some(left), Some(right)) = (dst.get(1).copied(), dst.get(cw).copied()) else {
+                    return Err(MediaError::Decode("empty chroma scratch row".into()));
+                };
+                let Some((first, rest)) = dst.split_first_mut() else { return Err(MediaError::Decode("empty chroma scratch row".into())) };
+                *first = left;
+                let Some(last) = rest.last_mut() else { return Err(MediaError::Decode("empty chroma scratch row".into())) };
+                *last = right;
             }
-            let (top, bottom) = (row_of(luma, 2 * cy, w), row_of(luma, 2 * cy + 1, w));
+            let (top, bottom) = (plane_row(luma, 2 * cy, w)?, plane_row(luma, 2 * cy + 1, w)?);
             let pixels = top.as_chunks::<2>().0.iter().zip(bottom.as_chunks::<2>().0).zip(uc.windows(3).zip(vc.windows(3)));
             for (o, ((a, b), (u, v))) in row.iter_mut().zip(pixels) {
                 let (u, v) = ((u[0] + u[2]) * 0.125 + u[1] * 0.75, (v[0] + v[2]) * 0.125 + v[1] * 0.75);
                 let yy = ((a[0].f() + a[1].f() + b[0].f() + b[1].f()) * 0.25 - k.y_off) * k.y_scale;
                 *o = [(yy + k.cr_r * v).clamp(0.0, 1.0), (yy - k.cr_g * v - k.cb_g * u).clamp(0.0, 1.0), (yy + k.cb_b * u).clamp(0.0, 1.0), 1.0];
             }
+            Ok(())
         },
-    );
-    Some(img)
+    )?;
+    Ok(img)
 }
 
 /// 0..255 → 0..1.
@@ -245,14 +305,25 @@ fn centred(i: usize, n: usize) -> (usize, usize) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn convert_yuv<T: Sample>(img: &mut Image, w: usize, h: usize, chroma: Chroma, planes: [&[T]; 3], alpha: Option<&[T]>, amax: f32, k: &Yuv, op: AlphaOp) {
+fn convert_yuv<T: Sample>(
+    img: &mut Image,
+    w: usize,
+    h: usize,
+    chroma: Chroma,
+    planes: [&[T]; 3],
+    alpha: Option<&[T]>,
+    amax: f32,
+    k: &Yuv,
+    op: AlphaOp,
+) -> Result<()> {
     let (sx, sy) = chroma.shifts();
     let cw = w.div_ceil(1 << sx);
     let ch = h.div_ceil(1 << sy);
     let inv_amax = 1.0 / amax;
-    img.data.par_chunks_mut(w).enumerate().for_each_init(
-        || (vec![0f32; cw], vec![0f32; cw], vec![0f32; w], vec![0f32; w]),
-        |(uc, vc, uf, vf), (y, row)| {
+    img.data.par_chunks_mut(w).enumerate().try_for_each_init(
+        || -> Result<_> { Ok((filled(cw, 0f32)?, filled(cw, 0f32)?, filled(w, 0f32)?, filled(w, 0f32)?)) },
+        |scratch, (y, row)| -> Result<()> {
+            let (uc, vc, uf, vf) = scratch.as_mut().map_err(|e| MediaError::Decode(e.to_string()))?;
             // vertical chroma interpolation into normalised rows (Cb, Cr in −0.5..0.5)
             let (r0, r1, t) = if sy == 1 {
                 let (c, o) = centred(y, ch);
@@ -261,8 +332,8 @@ fn convert_yuv<T: Sample>(img: &mut Image, w: usize, h: usize, chroma: Chroma, p
                 (y, y, 0.0)
             };
             for (dst, plane) in [(&mut *uc, planes[1]), (&mut *vc, planes[2])] {
-                let a = &plane[r0 * cw..r0 * cw + cw];
-                let b = &plane[r1 * cw..r1 * cw + cw];
+                let a = plane_row(plane, r0, cw)?;
+                let b = plane_row(plane, r1, cw)?;
                 for ((d, a), b) in dst.iter_mut().zip(a).zip(b) {
                     let v = a.f() * (1.0 - t) + b.f() * t;
                     *d = (v - k.c_off) * k.c_scale;
@@ -270,38 +341,42 @@ fn convert_yuv<T: Sample>(img: &mut Image, w: usize, h: usize, chroma: Chroma, p
             }
             // horizontal
             if sx == 1 {
-                for x in 0..w {
+                for (x, (u, v)) in uf.iter_mut().zip(vf.iter_mut()).enumerate() {
                     let (c, o) = centred(x, cw);
-                    uf[x] = uc[c] * 0.75 + uc[o] * 0.25;
-                    vf[x] = vc[c] * 0.75 + vc[o] * 0.25;
+                    let sample = |plane: &[f32]| -> Result<f32> {
+                        let (Some(a), Some(b)) = (plane.get(c), plane.get(o)) else { return Err(MediaError::Decode("chroma sample outside frame".into())) };
+                        Ok(a * 0.75 + b * 0.25)
+                    };
+                    *u = sample(uc)?;
+                    *v = sample(vc)?;
                 }
             } else {
-                uf.copy_from_slice(&uc[..w]);
-                vf.copy_from_slice(&vc[..w]);
+                uf.copy_from_slice(plane_row(uc, 0, w)?);
+                vf.copy_from_slice(plane_row(vc, 0, w)?);
             }
-            let yrow = &planes[0][y * w..y * w + w];
-            let rgb = |x: usize| {
-                let (u, v) = (uf[x], vf[x]);
-                let yy = (yrow[x].f() - k.y_off) * k.y_scale;
+            let yrow = plane_row(planes[0], y, w)?;
+            let rgb = |luma: T, u: f32, v: f32| {
+                let yy = (luma.f() - k.y_off) * k.y_scale;
                 [(yy + k.cr_r * v).clamp(0.0, 1.0), (yy - k.cr_g * v - k.cb_g * u).clamp(0.0, 1.0), (yy + k.cb_b * u).clamp(0.0, 1.0)]
             };
             match alpha {
                 // opaque: every alpha interpretation gives the colour itself
                 None => {
-                    for (x, o) in row.iter_mut().enumerate() {
-                        let c = rgb(x);
+                    for (o, ((yy, u), v)) in row.iter_mut().zip(yrow.iter().zip(uf.iter()).zip(vf.iter())) {
+                        let c = rgb(*yy, *u, *v);
                         *o = [c[0], c[1], c[2], 1.0];
                     }
                 }
                 Some(al) => {
-                    let arow = &al[y * w..y * w + w];
-                    for (x, o) in row.iter_mut().enumerate() {
-                        *o = op.apply(rgb(x), (arow[x].f() * inv_amax).clamp(0.0, 1.0));
+                    let arow = plane_row(al, y, w)?;
+                    for (o, (((yy, u), v), a)) in row.iter_mut().zip(yrow.iter().zip(uf.iter()).zip(vf.iter()).zip(arow.iter())) {
+                        *o = op.apply(rgb(*yy, *u, *v), (a.f() * inv_amax).clamp(0.0, 1.0));
                     }
                 }
             }
+            Ok(())
         },
-    );
+    )
 }
 
 /// Convert a still decoded by the `image` crate. Float images (OpenEXR, float TIFF) hold linear
@@ -379,6 +454,75 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    fn frame_to_image(f: &VideoFrame, op: AlphaOp) -> Image {
+        frame_to_image_in(f, op, Vec::new()).expect("valid decoded test frame")
+    }
+
+    #[test]
+    fn malformed_rgba_frame_does_not_panic() {
+        let frame = VideoFrame {
+            width: 1,
+            height: 1,
+            data: PixelData::Rgba8(Arc::new(vec![255; 3])),
+            color: filmcraft_color::ColorInfo::REC709,
+            par: (1, 1),
+            pts: filmcraft_time::Tick::ZERO,
+        };
+        let result = std::panic::catch_unwind(|| frame_to_image_in(&frame, AlphaOp::new(AlphaMode::Straight, [0.0; 3]), Vec::new()));
+        assert!(result.is_ok(), "a truncated decoded frame must return an error, not panic");
+        assert!(result.unwrap().unwrap_err().to_string().contains("truncated"));
+    }
+
+    fn frame_to_image_scaled(f: &VideoFrame, w: u32, h: u32) -> Option<Image> {
+        super::frame_to_image_scaled(f, w, h).expect("valid decoded test frame")
+    }
+
+    #[test]
+    fn malformed_yuv_planes_alpha_and_bit_depth_return_errors() {
+        let op = AlphaOp::new(AlphaMode::Straight, [0.0; 3]);
+        for plane in 0..3 {
+            let mut f = yuv_frame(126, 128, 128, filmcraft_color::ColorInfo::REC709);
+            if let PixelData::Yuv8 { planes, .. } = &mut f.data {
+                planes[plane] = Arc::new(Vec::new());
+            }
+            assert!(frame_to_image_in(&f, op, Vec::new()).is_err());
+            assert!(super::frame_to_image_scaled(&f, 2, 1).is_err());
+        }
+        let mut f = yuv_frame(126, 128, 128, filmcraft_color::ColorInfo::REC709);
+        if let PixelData::Yuv8 { alpha, .. } = &mut f.data {
+            *alpha = Some(Arc::new(vec![255; 7]));
+        }
+        assert!(frame_to_image_in(&f, op, Vec::new()).is_err());
+        for bits in [0, 1, 7, 17, 31, 32, u32::MAX] {
+            f.data =
+                PixelData::Yuv16 { planes: [Arc::new(vec![512; 8]), Arc::new(vec![512; 2]), Arc::new(vec![512; 2])], chroma: Chroma::C420, bits, alpha: None };
+            let outcome = std::panic::catch_unwind(|| frame_to_image_in(&f, op, Vec::new()));
+            assert!(outcome.unwrap().unwrap_err().to_string().contains("bit depth"), "bits {bits}");
+            assert!(super::frame_to_image_scaled(&f, 2, 1).is_err());
+        }
+        // A failed conversion leaves the next valid conversion intact.
+        assert!(frame_to_image_in(&yuv_frame(235, 128, 128, filmcraft_color::ColorInfo::REC709), op, Vec::new()).unwrap().data.iter().all(|p| p[3] == 1.0));
+    }
+
+    #[test]
+    fn hostile_frame_dimensions_and_non_finite_float_pixels_are_bounded_errors() {
+        let op = AlphaOp::new(AlphaMode::Straight, [0.0; 3]);
+        let mut f = yuv_frame(126, 128, 128, filmcraft_color::ColorInfo::REC709);
+        for (width, height) in [(u32::MAX, u32::MAX), (16_385, 1), (8192, 8192), (0, 1)] {
+            f.width = width;
+            f.height = height;
+            assert!(frame_to_image_in(&f, op, Vec::new()).is_err());
+        }
+        f.width = 1;
+        f.height = 1;
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            f.data = PixelData::RgbaF32(Arc::new(vec![value, 0.0, 0.0, 1.0]));
+            assert!(frame_to_image_in(&f, op, Vec::new()).is_err());
+        }
+        f.data = PixelData::RgbaF32(Arc::new(vec![f32::MAX, 0.0, 0.0, 1e-40]));
+        assert!(frame_to_image_in(&f, op, Vec::new()).is_err());
+    }
+
     fn yuv_frame(y: u8, u: u8, v: u8, color: filmcraft_color::ColorInfo) -> VideoFrame {
         VideoFrame {
             width: 4,
@@ -431,11 +575,18 @@ mod tests {
         }
         // More than half the size, odd sizes, other chroma layouts: convert the full frame.
         assert!(frame_to_image_scaled(&f, 49, 32).is_none());
-        assert!(frame_to_image_scaled(&smooth_420(95, 64), 40, 30).is_none());
+        let mut odd = smooth_420(95, 64);
+        if let PixelData::Yuv8 { planes, .. } = &mut odd.data {
+            planes[1] = Arc::new(vec![128; 48 * 32]);
+            planes[2] = Arc::new(vec![128; 48 * 32]);
+        }
+        assert!(frame_to_image_scaled(&odd, 40, 30).is_none());
         assert!(frame_to_image_scaled(&yuv_frame(100, 128, 128, filmcraft_color::ColorInfo::REC709), 2, 1).is_some());
         let mut f444 = smooth_420(96, 64);
-        if let PixelData::Yuv8 { chroma, .. } = &mut f444.data {
+        if let PixelData::Yuv8 { planes, chroma, .. } = &mut f444.data {
             *chroma = Chroma::C444;
+            planes[1] = Arc::new(vec![128; 96 * 64]);
+            planes[2] = Arc::new(vec![128; 96 * 64]);
         }
         assert!(frame_to_image_scaled(&f444, 48, 32).is_none());
     }

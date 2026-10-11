@@ -20,6 +20,9 @@ pub struct FrameFailure {
 
 impl fmt::Display for FrameFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.effect_id == "render.media" {
+            return write!(f, "Render failed in comp {} / layer {} / footage at {:.6}s: {}", self.comp.0, self.layer.0, self.time.seconds(), self.message);
+        }
         if self.effect_id == "render.raster" {
             write!(f, "Render failed in comp {}", self.comp.0)?;
             if self.layer.0 != 0 {

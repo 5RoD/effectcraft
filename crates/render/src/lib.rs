@@ -43,12 +43,20 @@ use rayon::prelude::*;
 pub trait FootageSource: Send + Sync {
     /// The frame of `item` at source time `t`, straight from the file (any size).
     fn frame(&self, item: ItemId, footage: &Footage, t: Tick) -> Option<Arc<Image>>;
+    /// Checked media boundary: unavailable footage is `Ok(None)`, a failed decode is `Err`.
+    /// Sources without a fallible decoder retain their existing frame implementation.
+    fn frame_checked(&self, item: ItemId, footage: &Footage, t: Tick) -> Result<Option<Arc<Image>>, String> {
+        Ok(self.frame(item, footage, t))
+    }
     /// [`FootageSource::frame`] for a render that shows it at `width` × `height`, at most half its
     /// size: either that frame or, when the source can make it more cheaply than the whole frame
     /// (movies, see `effectcraft-media`), the frame already resampled to that size as
     /// [`effectcraft_raster::resample`] would.
     fn frame_at_size(&self, item: ItemId, footage: &Footage, t: Tick, _width: u32, _height: u32) -> Option<Arc<Image>> {
         self.frame(item, footage, t)
+    }
+    fn frame_at_size_checked(&self, item: ItemId, footage: &Footage, t: Tick, width: u32, height: u32) -> Result<Option<Arc<Image>>, String> {
+        Ok(self.frame_at_size(item, footage, t, width, height))
     }
     /// `frames` interleaved stereo sample frames of `item`'s audio from source time `t` at
     /// `rate` Hz (`None` when unavailable). The first sample is `t.to_units_floor(rate)`;
@@ -1307,7 +1315,7 @@ impl<'a> Renderer<'a> {
                 if let Some(pf) = self.proxy_for(*item)
                     && let Some(nc) = self.project.comp(*item)
                 {
-                    let img = self.footage.frame(*item, pf, lt)?;
+                    let img = self.read_footage_frame(ctx, layer, *item, pf, lt, None)?;
                     return Some(self.footage_buf(&img, pf, nc.width, nc.height));
                 }
                 // Essential Properties overrides render the nested comp with this instance's
@@ -1416,9 +1424,16 @@ impl<'a> Renderer<'a> {
     fn footage_frame(&self, ctx: &EvalCtx, layer: &Layer, item: ItemId, f: &Footage, t: Tick, size: Option<(u32, u32)>) -> Option<Arc<Image>> {
         // Interpret Footage ▸ Separate Fields: each field is a frame at twice the rate.
         if f.fields != effectcraft_project::FieldOrder::Off && matches!(f.kind, FootageKind::Video | FootageKind::Sequence) {
-            let field_rate = FrameRate::new(f.frame_rate.num * 2, f.frame_rate.den);
+            let num = self.checked_raster(
+                f.frame_rate.num.checked_mul(2).ok_or_else(|| "field frame rate overflow".to_string()),
+                ctx.comp_id,
+                layer.id,
+                ctx.time,
+                "footage fields",
+            )?;
+            let field_rate = FrameRate::new(num, f.frame_rate.den);
             let i = field_rate.frame_at(t).max(0);
-            let img = self.footage.frame(item, f, f.frame_rate.tick_of(i / 2))?;
+            let img = self.read_footage_frame(ctx, layer, item, f, f.frame_rate.tick_of(i / 2), None)?;
             let dominant_upper = f.fields == effectcraft_project::FieldOrder::UpperFirst;
             // Upper field = even lines (0, 2, …).
             let parity = if (i % 2 == 0) == dominant_upper { 0 } else { 1 };
@@ -1447,8 +1462,15 @@ impl<'a> Renderer<'a> {
                 {
                     return Some(Arc::new(b.img.clone()));
                 }
-                let a = self.footage.frame(item, f, f.frame_rate.tick_of(i));
-                let b = self.footage.frame(item, f, f.frame_rate.tick_of(i + 1));
+                let a = self.read_footage_frame(ctx, layer, item, f, f.frame_rate.tick_of(i), None);
+                let next = self.checked_raster(
+                    i.checked_add(1).ok_or_else(|| "blended frame index overflow".to_string()),
+                    ctx.comp_id,
+                    layer.id,
+                    ctx.time,
+                    "footage blending",
+                )?;
+                let b = self.read_footage_frame(ctx, layer, item, f, f.frame_rate.tick_of(next), None);
                 if let (Some(a), Some(b)) = (a, b) {
                     let img = blend_frames(mode, &a, &b, w as f32);
                     if let (Some(c), Some(k)) = (self.cache, key)
@@ -1460,9 +1482,42 @@ impl<'a> Renderer<'a> {
                 }
             }
         }
-        match size {
-            Some((w, h)) => self.footage.frame_at_size(item, f, t, w, h),
-            None => self.footage.frame(item, f, t),
+        self.read_footage_frame(ctx, layer, item, f, t, size)
+    }
+
+    fn read_footage_frame(&self, ctx: &EvalCtx, layer: &Layer, item: ItemId, f: &Footage, t: Tick, size: Option<(u32, u32)>) -> Option<Arc<Image>> {
+        let result = match size {
+            Some((w, h)) => self.footage.frame_at_size_checked(item, f, t, w, h),
+            None => self.footage.frame_checked(item, f, t),
+        }
+        .and_then(|image| {
+            if let Some(image) = &image {
+                raster_bounds::solid(image.width, image.height, 1.0)?;
+                let pixels = u64::from(image.width).saturating_mul(u64::from(image.height));
+                if u64::try_from(image.data.len()).ok() != Some(pixels) {
+                    return Err("decoded image buffer does not match its dimensions".into());
+                }
+            }
+            Ok(image)
+        });
+        match result {
+            Ok(image) => image,
+            Err(message) => {
+                let failure = FrameFailure {
+                    comp: ctx.comp_id,
+                    layer: layer.id,
+                    time: ctx.time,
+                    effect_uid: 0,
+                    effect_id: "render.media".into(),
+                    message: format!("{} at source {:.6}s: {message}", f.path, t.seconds()),
+                };
+                if let Some(diagnostics) = self.diagnostics {
+                    diagnostics.record(failure);
+                } else {
+                    log::error!("{failure}");
+                }
+                None
+            }
         }
     }
 

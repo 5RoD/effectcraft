@@ -10,7 +10,7 @@ use effectcraft_render::FootageSource;
 use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
 use filmcraft_media::{FrameRequest, SharedSource};
 
-use crate::convert::{AlphaOp, dynamic_to_image, frame_to_image_in, frame_to_image_scaled};
+use crate::convert::{AlphaOp, dynamic_to_image, frame_pixel_count, frame_to_image_in, frame_to_image_scaled};
 use crate::gif_anim::{self, Anim};
 use crate::{MediaError, Result};
 
@@ -350,16 +350,20 @@ impl MediaPool {
 
     /// [`FootageSource::frame`] / [`FootageSource::frame_at_size`]: `None` (logged) on errors.
     fn frame_sized(&self, _item: ItemId, footage: &Footage, t: Tick, size: Option<(u32, u32)>) -> Option<Arc<Image>> {
-        if footage.missing {
-            return None;
-        }
-        match Inner::frame_at(&self.inner, footage, t, true, size) {
-            Ok(img) => Some(img),
+        match self.frame_sized_checked(footage, t, size) {
+            Ok(img) => img,
             Err(e) => {
                 log::warn!("media: frame of {} at {:?}: {e}", footage.path, t);
                 None
             }
         }
+    }
+
+    fn frame_sized_checked(&self, footage: &Footage, t: Tick, size: Option<(u32, u32)>) -> Result<Option<Arc<Image>>> {
+        if footage.missing {
+            return Ok(None);
+        }
+        Inner::frame_at(&self.inner, footage, t, true, size).map(Some)
     }
 
     /// Settings ▸ Disk ▸ Conformed Audio Folder: write each footage file's decoded audio there
@@ -758,12 +762,12 @@ impl Inner {
                 let (w, h) = loc.key.size;
                 if w > 0
                     && (vf.width, vf.height) == (footage.width, footage.height)
-                    && let Some(img) = frame_to_image_scaled(&vf, w, h)
+                    && let Some(img) = frame_to_image_scaled(&vf, w, h)?
                 {
                     return Ok(img);
                 }
-                let buf = lock(&self.cache).lru.take_spare(vf.width as usize * vf.height as usize);
-                Ok(frame_to_image_in(&vf, op, buf))
+                let buf = lock(&self.cache).lru.take_spare(frame_pixel_count(vf.width, vf.height)?);
+                frame_to_image_in(&vf, op, buf)
             }
         }
     }
@@ -796,6 +800,14 @@ impl FootageSource for MediaPool {
     }
     fn frame_at_size(&self, item: ItemId, footage: &Footage, t: Tick, width: u32, height: u32) -> Option<Arc<Image>> {
         self.frame_sized(item, footage, t, Some((width, height)))
+    }
+
+    fn frame_checked(&self, _item: ItemId, footage: &Footage, t: Tick) -> std::result::Result<Option<Arc<Image>>, String> {
+        self.frame_sized_checked(footage, t, None).map_err(|e| e.to_string())
+    }
+
+    fn frame_at_size_checked(&self, _item: ItemId, footage: &Footage, t: Tick, width: u32, height: u32) -> std::result::Result<Option<Arc<Image>>, String> {
+        self.frame_sized_checked(footage, t, Some((width, height))).map_err(|e| e.to_string())
     }
 
     fn vector_frame(&self, _item: ItemId, footage: &Footage, scale: f64) -> Option<Arc<Image>> {
@@ -852,6 +864,19 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_media_distinguishes_missing_footage_from_a_failed_decode() {
+        let pool = MediaPool::new();
+        let mut footage = Footage { path: "broken.png".into(), kind: FootageKind::Still, width: 1, height: 1, has_video: true, ..Default::default() };
+        pool.add_bytes(&footage.path, Arc::from(&b"not a PNG"[..]));
+        assert!(pool.frame_checked(ItemId(1), &footage, Tick::ZERO).is_err());
+        assert!(pool.frame_at_size_checked(ItemId(1), &footage, Tick::ZERO, 1, 1).is_err());
+        assert_eq!(pool.stats().frames, 0);
+        footage.missing = true;
+        assert!(pool.frame_checked(ItemId(1), &footage, Tick::ZERO).unwrap().is_none());
+        assert!(pool.frame_at_size_checked(ItemId(1), &footage, Tick::ZERO, 1, 1).unwrap().is_none());
+    }
 
     /// Conforming a long file's audio reads every chunk at its own time: the sample index times
     /// ticks per second overflowed `i64` past 12:36 at 48 kHz, and later chunks came out silent

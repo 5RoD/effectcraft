@@ -13,6 +13,64 @@ use effectcraft_time::{FrameRate, Tick};
 
 use crate::{FootageSource, Image, RenderOpts, Renderer};
 
+struct BrokenClip {
+    repaired: std::sync::atomic::AtomicBool,
+    malformed: bool,
+}
+
+impl FootageSource for BrokenClip {
+    fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<Image>> {
+        None
+    }
+    fn frame_checked(&self, _: ItemId, f: &Footage, _: Tick) -> Result<Option<Arc<Image>>, String> {
+        if self.repaired.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(Some(Arc::new(Image::filled(f.width, f.height, [0.25, 0.5, 0.75, 1.0]))));
+        }
+        if self.malformed {
+            return Ok(Some(Arc::new(Image { width: f.width, height: f.height, data: Vec::new() })));
+        }
+        Err("synthetic decode failure".into())
+    }
+    fn frame_at_size_checked(&self, item: ItemId, f: &Footage, t: Tick, _: u32, _: u32) -> Result<Option<Arc<Image>>, String> {
+        self.frame_checked(item, f, t)
+    }
+}
+
+#[test]
+fn checked_footage_failures_do_not_publish_or_cache_transparent_frames() {
+    for malformed in [false, true] {
+        for scale in [1.0, 0.5] {
+            for mode in [effectcraft_project::FrameBlend::Off, effectcraft_project::FrameBlend::FrameMix, effectcraft_project::FrameBlend::PixelMotion] {
+                for fields in [effectcraft_project::FieldOrder::Off, effectcraft_project::FieldOrder::UpperFirst] {
+                    let (mut p, cid) = project(BitDepth::Bpc32, false);
+                    let layer = &mut p.comp_mut(cid).unwrap().layers[0];
+                    layer.switches.frame_blend = mode;
+                    let lid = layer.id;
+                    let LayerSource::Footage { item } = &layer.source else { panic!("footage fixture") };
+                    let item = *item;
+                    let ItemKind::Footage(f) = &mut p.item_mut(item).unwrap().kind else { panic!("footage fixture") };
+                    f.fields = fields;
+                    let before = p.clone();
+                    let source = BrokenClip { repaired: false.into(), malformed };
+                    let cache = crate::LayerCache::default();
+                    let mut renderer = Renderer::new(&p, &source, RenderOpts { scale, ..Default::default() });
+                    renderer.cache = Some(&cache);
+                    let time = Tick::from_seconds_f64(0.05);
+                    let error = renderer.comp_frame_checked(cid, time).unwrap_err();
+                    assert_eq!((error.comp, error.layer, error.time, error.effect_id.as_str()), (cid, lid, time, "render.media"));
+                    assert!(error.to_string().contains("footage"));
+                    assert!(error.message.contains("clip.mp4"));
+                    assert_eq!(cache.stats().entries, 0, "failed provisional pixels must not enter the layer cache");
+                    assert_eq!(p, before);
+                    source.repaired.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let frame = renderer.comp_frame_checked(cid, time).unwrap();
+                    assert!(frame.data.iter().all(|p| p[3] == 1.0), "repair must render real footage");
+                }
+            }
+        }
+    }
+}
+
 /// Footage with a textured frame; `sizes` (when set) resamples it itself and records the sizes
 /// it was asked for.
 struct Clip {

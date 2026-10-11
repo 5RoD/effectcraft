@@ -10,6 +10,80 @@ use effectcraft_render::{NoFootage, RenderOpts, Renderer};
 use effectcraft_time::{FrameRate, Tick};
 
 #[test]
+fn checked_media_late_decode_failure_preserves_completed_export() {
+    use effectcraft_project::{Footage, FootageKind, ItemId};
+    use effectcraft_render::{FootageSource, Image};
+    use std::sync::Arc;
+
+    struct FailingMovie;
+    impl FootageSource for FailingMovie {
+        fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<Image>> {
+            None
+        }
+        fn frame_checked(&self, _: ItemId, f: &Footage, t: Tick) -> Result<Option<Arc<Image>>, String> {
+            if t >= Tick::from_seconds_f64(1.0) {
+                return Err("synthetic late decode failure".into());
+            }
+            Ok(Some(Arc::new(Image::filled(f.width, f.height, [0.5, 0.25, 1.0, 1.0]))))
+        }
+    }
+    let mut project = Project::default();
+    let mut comp = Comp::new(8, 8, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+    let fid = project.add_item(
+        "Broken movie",
+        Label::Aqua,
+        None,
+        ItemKind::Footage(Footage {
+            path: "broken.mp4".into(),
+            kind: FootageKind::Video,
+            width: 8,
+            height: 8,
+            frame_rate: FrameRate::FPS_30,
+            duration: Tick::from_seconds_f64(2.0),
+            has_video: true,
+            ..Default::default()
+        }),
+    );
+    let layer = build::layer(&mut project, &comp, "Movie", LayerSource::Footage { item: fid }, (8, 8), None);
+    comp.layers.push(layer);
+    let cid = project.add_item("Media export", Label::Sandstone, None, ItemKind::Comp(comp.into()));
+    let before = project.clone();
+    let settings = RenderSettings { time_span: TimeSpan::Custom { start: Tick::ZERO, end: Tick::from_seconds_f64(2.0) }, ..Default::default() };
+    let output = OutputModule::for_format(OutputFormat::Gif);
+    let dir = std::env::temp_dir().join(format!("ec-checked-media-export-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let destination = dir.join("completed.gif");
+    std::fs::write(&destination, b"previous successful export").unwrap();
+    let job = Job {
+        project: &project,
+        footage: &FailingMovie,
+        expr: None,
+        accel: None,
+        comp: cid,
+        settings: &settings,
+        output: &output,
+        path: destination.to_str().unwrap(),
+        sink: None,
+        nested_switches: true,
+        options: JobOptions::default(),
+    };
+    let mut rendered = 0;
+    let error = export(&job, &mut |progress| {
+        rendered = rendered.max(progress.done);
+        true
+    })
+    .unwrap_err();
+    assert!(matches!(error, ExportError::Render(_)));
+    assert!(error.to_string().contains("footage"));
+    assert!(error.to_string().contains("broken.mp4"));
+    assert!(rendered > 0, "the error occurs after a completed earlier batch");
+    assert_eq!(std::fs::read(&destination).unwrap(), b"previous successful export");
+    assert_eq!(project, before);
+    assert!(std::fs::read_dir(&dir).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with(".effectcraft-export-")));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn checked_raster_export_rejects_capacity_overflow_before_codec_setup_and_preserves_destination() {
     let mut project = Project::default();
     let comp = Comp::new(u32::MAX, u32::MAX, FrameRate::FPS_30, Tick::from_seconds_f64(1.0));
