@@ -15,6 +15,7 @@
 //! - `ui.viewer.locate {x, y}`: screen point of a comp pixel; `ui.viewer.hit {x, y}`: comp pixel at a screen point
 //! - `ui.timeline.locate {layer, time?}`: screen point of a layer bar (at a comp time)
 //! - `ui.playback {action: play|stop|toggle}`
+//! - `ui.viewer.observe {action?: start|stop|reset|status|read, maxSamples?, seconds?, offset?, count?}`
 //! - `ui.screenshot {path?, panel?, id?}`: PNG of the window (or one panel / element)
 //! - `render.frame {comp?, time?, max_side?, path?, base64?}`: PNG of a comp frame rendered by the session
 //! - `ui.resize {width, height}` / `ui.focus` / `app.quit {force?}` (a modified project asks to save first unless `force`)
@@ -404,6 +405,10 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
                 None => Outcome::Retry("layer not visible in the timeline".into()),
             }
         }
+        "ui.viewer.observe" => match app.viewer_observer.control(p, ctx.input(|i| i.time)) {
+            Ok(result) => ok(result),
+            Err(error) => err(error),
+        },
         "ui.playback" => {
             let now = ctx.input(|i| i.time);
             match s("action").unwrap_or("toggle") {

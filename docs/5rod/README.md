@@ -13,6 +13,12 @@ application and Desktop shortcut have not been removed or replaced.
   Channel, exposure, region and nonidentity display-color conversions retain their existing
   processing. Cache planning includes every display mip and both RAM and GPU budgets, so
   Cache Before Playback cannot wait for a range larger than its GPU cache can retain.
+- A bounded viewer observer records the texture actually drawn and its requested frame key,
+  separating repeated or stale textures from new frames, planned skips and discontinuities.
+  Hidden viewers and discarded layout passes add no samples. Observing native textures adds
+  no compositor readback; explicit paged reads calculate summaries outside the paint path.
+  This measures application painting, not physical monitor presentation. See
+  [`ui.viewer.observe`](../control-protocol.md) for limits and interpretation.
 - Grouped commands catch escaped panics inside their transaction and restore the existing
   project, undo/redo and abandoned history. Navigating deeply branched history uses an iterative
   walk; recursive command callbacks fail at a checked 64-level limit.
@@ -125,8 +131,8 @@ and the inherited [gap assessment](../gaps.md).
 ## Validation
 
 The complete repository gate is `cargo xtask ci`: formatting, clippy, workspace tests, dependency
-layering, licensed assets and WebAssembly checks. The exact retiming frame-identity increment passed
-on 2026-10-12 (local date): 2,991 tests passed, 27 explicitly optional tests were ignored, all 31 assets were attributed,
+layering, licensed assets and WebAssembly checks. The viewer-observer increment passed
+on 2026-10-12 (local date): 2,999 tests passed, 27 explicitly optional tests were ignored, all 31 assets were attributed,
 dependency layering passed, and 32 crates passed the WebAssembly check. Formatting and native
 clippy with warnings denied also passed. The WebAssembly check reports an inherited dead-code
 warning for the native shortcut-suspension state.
@@ -135,7 +141,10 @@ Earlier integration checks corrected a duplicate shortcut, missing Japanese menu
 assumption about variable-font advances, and timing-dependent test expectations. The viewer GPU
 test uses the desktop application's device policy instead of preferring software adapters. It
 requires a native texture on the RTX 3050 Vulkan device, drains paused prefetch, checks settled
-repaints for additional compositor readbacks, and compares pixels with the CPU viewer. The new
+repaints and observer reads for additional compositor readbacks, and compares pixels with the CPU viewer.
+Observer regressions cover stale textures despite advancing clocks, bounded recordings, invalid
+requests preserving recordings, hidden/minimized viewers and discarded layout passes. These
+checks do not establish sustained 1440p/120 timeline throughput. The new
 history regressions preserve the old project/history after a synthetic grouped-operation panic
 and exercise 10,000 nested abandoned branches without recursive repacking.
 Media regressions cover truncated planes, hostile dimensions/bit depths, nonfinite pixels,

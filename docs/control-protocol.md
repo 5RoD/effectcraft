@@ -58,6 +58,7 @@ panel registers an element id; both are enforced by `crates/ui-egui/tests/ui_age
 | `ui.set` | `{tool?, workspace?, theme?, focused?, viewer?, timeline?, menuBar?, home?}` | `viewer: {zoom (null = fit), res: Full\|Half\|Third\|Quarter\|Auto, pan: [x,y], grid, rulers, safeMargins, transparencyGrid}`; `timeline: {pps (null = fit), start, graphEditor, showModes, openLayers: [ids], openGroups: [uids]}`. |
 | `ui.panel.show` / `ui.panel.close` | `{panel}` | Panels: `Project`, `Composition`, `Timeline`, `EffectControls`, `EffectsPresets`, `Info`, `Preview`, `Character`, `Paragraph`, `Align` and others. |
 | `ui.playback` | `{action: play\|stop\|toggle\|status}` | `{playing, time, audio, levelsDb, peaksDb}` (audio: an audio preview is running; L/R meter levels and held peaks in dBFS) |
+| `ui.viewer.observe` | `{action?: start\|stop\|reset\|status\|read, maxSamples?, seconds?, offset?, count?}` | Opt-in active composition viewer draw observations and summary. See limits below. |
 | `ui.resize` | `{width, height}` | Resizes the window (points). |
 | `ui.focus` | `{}` | Activates the window and takes keyboard focus. Agents normally avoid this, because the app is started without stealing focus. |
 | `app.quit` | `{force?}` | Closes the app. A modified project shows the Save / Don't Save / Cancel prompt first (automation ids `dialog.unsaved.save`, `dialog.unsaved.dontSave`, `dialog.unsaved.cancel`) unless `force: true`. |
@@ -69,6 +70,29 @@ rectangle matches. Candidates alone do not establish widget identity. Header, to
 dock-tab controls register their response identity. `ui.focused` continues to identify the
 focused panel; it is separate from keyboard widget focus. `windowFocused` reports the native
 window focus received by egui, which can differ from the retained widget focus.
+
+`ui.viewer.observe` records the requested and actually drawn frame keys, monotonic UI time,
+native texture status and playback/caching/waiting state. It is disabled until `start`, does
+not read pixels or acquire the frame cache, and preserves the existing playback scheduler.
+Only the final, undiscarded UI pass of a visible active viewer produces a sample. Hidden,
+minimized, occluded and mirror-only viewers produce none; snapshot and wireframe draws are
+reported separately from video frames. This measures viewer drawing, **not Windows scanout**.
+
+`maxSamples` is an integer from 1 through 120,000 (default 8,192); `seconds` is finite and
+from 0.001 through 300 (default 30). Recording stops at either bound and retains its samples.
+`stop` preserves them, `reset` discards them, and `status`/`read` never restart timing. Invalid
+start parameters preserve the previous observation. `offset` and `count` select a raw page;
+both are nonnegative integers, `count` defaults to zero and is capped at 2,048. Summary
+calculation occurs only on an explicit control request; avoid polling it during a benchmark.
+
+The summary separates distinct frames, repeated textures, stale keys, missing textures,
+loops, reverse/series transitions and the minimum skipped selected frames. Gap estimates
+respect the preview's configured skip step. Stale draws, changed plans, implausible cursor
+jumps and intervals spanning a whole loop are not classified as dropped selected frames.
+Completed texture-hold intervals include p50/p95/p99/max and their count; the last unfinished
+hold is separate. The raw page retains phase flags. Start while playing to isolate sustained
+playback, or start before play to include cold startup. A synthetic/headless clock establishes
+bookkeeping; actual footage, display presentation and audio need separate acceptance.
 
 When a configuration store is available, current dock and floating geometry, focused and
 maximized panels, and named workspace snapshots persist in `workspaces.json`. The current

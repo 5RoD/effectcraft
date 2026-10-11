@@ -360,13 +360,24 @@ pub(crate) fn display_key(app: &EffectcraftApp, has_conversion: bool) -> String 
 /// Draw the frame into `comp_rect`: the rendered frame (covering the region of interest when one
 /// is set), or the snapshot while Show Snapshot is on / F5 is held, through Show Channel and the
 /// exposure. Fast Previews ▸ Wireframe draws layer outlines instead.
-pub(crate) fn draw_frame(app: &mut EffectcraftApp, ctx: &egui::Context, painter: &egui::Painter, comp_rect: Rect, cid: ItemId, ectx: &EvalCtx) {
+pub(crate) fn draw_frame(
+    app: &mut EffectcraftApp,
+    ctx: &egui::Context,
+    painter: &egui::Painter,
+    comp_rect: Rect,
+    cid: ItemId,
+    ectx: &EvalCtx,
+) -> Option<crate::viewer_cadence::Paint> {
+    use crate::viewer_cadence::Paint;
+    if ctx.input(|i| i.viewport().minimized == Some(true) || i.viewport().occluded == Some(true)) || !painter.clip_rect().intersects(comp_rect) {
+        return None;
+    }
     let opts = app.session.state.viewer.clone();
     let snap = showing_snapshot(app, ctx);
     // Settings ▸ Video ▸ Mirror on Computer Monitor off: playback goes to Video Preview only.
     if crate::prefs_live::main_viewer_hidden(app) && !snap {
         painter.text(comp_rect.center(), Align2::CENTER_CENTER, crate::i18n::tr("Playing on Video Preview"), Tokens::ui(13.0), Color32::from_gray(150));
-        return;
+        return None;
     }
     if opts.fast_previews == FastPreviews::Wireframe && !snap {
         let zoom = comp_rect.width() / ectx.comp.width.max(1) as f32;
@@ -383,14 +394,14 @@ pub(crate) fn draw_frame(app: &mut EffectcraftApp, ctx: &egui::Context, painter:
                 .collect();
             painter.add(egui::Shape::closed_line(q, Stroke::new(1.0, app.tokens.label(l.label))));
         }
-        return;
+        return Some(Paint::Wireframe);
     }
     let dc = vw::DisplayColor::of(&app.session);
     let dc_key = display_key(app, dc.is_some());
     let plain = opts.channel == Channel::Rgb && opts.exposure == 0.0 && dc.is_none();
     let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
     if snap {
-        let Some(s) = app.session.snapshot.clone() else { return };
+        let Some(s) = app.session.snapshot.clone() else { return Some(Paint::Missing) };
         let key = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -410,25 +421,26 @@ pub(crate) fn draw_frame(app: &mut EffectcraftApp, ctx: &egui::Context, painter:
         };
         painter.image(tex.id(), comp_rect, uv, Color32::WHITE);
         painter.text(comp_rect.left_top() + vec2(6.0, 6.0), Align2::LEFT_TOP, crate::i18n::tr("Snapshot"), Tokens::ui(11.0), SNAP_COLOR);
-        return;
+        return Some(Paint::Snapshot);
     }
     // A GPU frame: drawn straight from its texture; Show Channel / exposure
     // read it back first (asynchronously in the browser: from the next frame on).
+    let painted_key = app.viewer_shown.map(|(_, key)| key);
     let gpu = matches!((&app.viewer_shown, &app.viewer_native), (Some(s), Some(n)) if s.0 == n.0 && s.1 == n.1 && n.1.comp == cid.0);
     let rect = if gpu {
-        let Some(id) = app.viewer_shown.map(|s| s.0) else { return };
+        let Some(id) = app.viewer_shown.map(|s| s.0) else { return Some(Paint::Missing) };
         if plain || app.viewer_pixels().is_none() {
             if !plain {
                 ctx.request_repaint();
             }
             painter.image(id, comp_rect, uv, Color32::WHITE);
-            return;
+            return Some(painted_key.map_or(Paint::Missing, |key| Paint::Frame { key, native: true }));
         }
         comp_rect
     } else {
-        let Some((tex, k, minify)) = app.viewer_tex.clone() else { return };
+        let Some((tex, k, minify)) = app.viewer_tex.clone() else { return Some(Paint::Missing) };
         if k.comp != cid.0 {
-            return;
+            return Some(Paint::Missing);
         }
         let zoom = comp_rect.width() as f64 / ectx.comp.width.max(1) as f64;
         let rect = match texture_roi(ctx) {
@@ -438,11 +450,11 @@ pub(crate) fn draw_frame(app: &mut EffectcraftApp, ctx: &egui::Context, painter:
         if plain {
             let uv = app.viewer_image.as_ref().map_or(uv, |src| fitted_uv(ctx, src.size, minify));
             painter.image(tex.id(), rect, uv, Color32::WHITE);
-            return;
+            return Some(Paint::Frame { key: k, native: false });
         }
         rect
     };
-    let Some(src) = app.viewer_image.clone() else { return };
+    let Some(src) = app.viewer_image.clone() else { return Some(Paint::Missing) };
     let smooth = app.session.prefs.viewer_zoom_smooth();
     // Averaged down for the magnification, as the frame's own texture is (#417).
     let minify = super::viewer::minify_factor(smooth, src.size[0] as f64, (rect.width() * ctx.pixels_per_point()) as f64);
@@ -464,6 +476,7 @@ pub(crate) fn draw_frame(app: &mut EffectcraftApp, ctx: &egui::Context, painter:
         }
     };
     painter.image(tex.id(), rect, fitted_uv(ctx, src.size, minify), Color32::WHITE);
+    Some(painted_key.map_or(Paint::Missing, |key| Paint::Frame { key, native: false }))
 }
 
 /// The texture coordinates of a frame of `size` in its texture, fitted with at least `minify`

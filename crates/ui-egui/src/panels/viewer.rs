@@ -807,7 +807,21 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let snap_expr = app.session.expr.clone();
     let ectx = EvalCtx { project: &snap_project, comp_id: cid, comp: &comp, time, expr: snap_expr.as_deref(), footage: None };
     // The frame (or snapshot) through Show Channel and exposure; ROI frames cover the region.
-    vt::draw_frame(app, &ctx, &painter, comp_rect, cid, &ectx);
+    let paint = vt::draw_frame(app, &ctx, &painter, comp_rect, cid, &ectx);
+    if app.viewer_observer.active()
+        && let Some(paint) = paint
+    {
+        app.viewer_observer.stage(crate::viewer_cadence::Sample {
+            update: ctx.cumulative_frame_nr(),
+            now: ctx.input(|i| i.time),
+            requested: key,
+            paint,
+            playing: app.playback.playing,
+            caching: app.playback.caching,
+            waiting: app.playback.waiting,
+            plan: app.playback.plan,
+        });
+    }
     if app.ui.viewer.extended.is_some() {
         // The comp frame outlined over the extended render.
         painter.rect_stroke(comp_rect, 0.0, Stroke::new(1.0, Color32::from_gray(150)), StrokeKind::Outside);

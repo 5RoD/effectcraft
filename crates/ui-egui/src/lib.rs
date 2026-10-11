@@ -29,6 +29,7 @@ mod pointer_wrap;
 pub mod prefs_live;
 pub mod state;
 pub mod theme;
+pub mod viewer_cadence;
 pub mod widgets;
 mod workspace_state;
 
@@ -260,6 +261,7 @@ pub struct EffectcraftApp {
     pub auto: automation::Registry,
     pub frames: Frames,
     pub playback: Playback,
+    pub viewer_observer: viewer_cadence::Observer,
     pub dialog: Option<Dialog>,
     pub hooks: Hooks,
     pub fps: f32,
@@ -369,6 +371,7 @@ impl EffectcraftApp {
             auto: Default::default(),
             frames: Frames::default(),
             playback: Playback::default(),
+            viewer_observer: viewer_cadence::Observer::default(),
             dialog: None,
             hooks: Hooks::default(),
             fps: 60.0,
@@ -1846,6 +1849,7 @@ impl eframe::App for EffectcraftApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.viewer_observer.begin_pass();
         if self.gpu_failure_applied == Some(true) {
             self.close_after_device_loss(ui.ctx());
             return;
@@ -1863,6 +1867,7 @@ impl eframe::App for EffectcraftApp {
         if cfg!(target_arch = "wasm32") && self.frames.pump(std::time::Duration::from_millis(if self.playback.playing { 24 } else { 40 })) {
             ctx.request_repaint();
         }
+        self.viewer_observer.finish_pass(ctx.will_discard());
         self.last_ui_time = ctx.input(|i| i.time);
         if !self.synthetic.is_empty() {
             ctx.request_repaint();
