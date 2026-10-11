@@ -23,9 +23,9 @@ checked errors; a completed output is never fabricated from unwritten scratch.
 - Finite evaluated controls within their documented effect ranges. Scaled vector spacing and
   matching windows must not exceed 16,384 pixels. Crops must fit their integer representation.
 - Finite source/comp times within the supported `Tick` range and frame rates through 1,000 fps
-  (zero denotes an unknown rate and retains the existing 30 fps fallback). Source reads retain
-  the existing microsecond quantization with exact Tick keys; auxiliary layers retain the
-  original unrounded source instants.
+  (zero denotes an unknown rate and retains the existing 30 fps fallback). Broadcast source
+  boundaries use exact Tick keys. Source, matte and warp reads use the same keys; auxiliary
+  layers add the existing composition/layer-time offset in Tick arithmetic.
 - A conservative per-effect peak of 1,536 MiB across source placement, current input, unique
   source/derived frames, fitted mattes/warps, matching scratch, vector storage, GPU uploads,
   fixed sample/accumulator scratch and output/readback staging.
@@ -42,7 +42,32 @@ allocations; this increment is not a general allocator/OOM redesign.
 
 The checked effect follows the existing renderer diagnostics: preview keeps its last good
 frame, failed results are not cached, and export fails visibly. The fork render salt advances
-to `effectcraft-5rod-render-5`; the disk cache file format remains `v1`.
+to `effectcraft-5rod-render-6`; the disk cache file format remains `v1`.
+
+## Exact source-frame identity
+
+The separate memory increment (render salt 5) preserved the historical microsecond source
+rounding for its old/new comparisons. This fidelity increment (salt 6) removes that rounding
+and the frame-selection epsilon. At 60/120 fps and rational broadcast boundaries these could
+select the preceding decoded frame, or advance a legitimate instant one Tick before a boundary.
+Whole Frames now floors the exact source Tick. Frame Mix and Pixel Motion use that same pair;
+an exactly aligned instant has zero fraction and does not estimate motion.
+
+`EffectHost::self_at_tick`, `layer_at_tick` and `time_ticks` are additive exact-time hooks.
+The native renderer overrides them, keeping individual Ticks distinct at long and negative
+times and preserving the exact current layer/comp offset. Existing custom hosts need no change:
+the defaults delegate to their seconds methods without a nudge. A float-only host cannot
+distinguish every neighbouring Tick at long durations; it must override the hooks for exact
+temporal identity. Ordinary and reversed 100% speed retain the exact current Tick. Other
+evaluated speeds use the scalar's f64 arithmetic and round to a Tick. Custom frame rates are
+not snapped to broadcast rates; their f64 boundary uses the first representable Tick at or
+after it. No codec or source-rate interpretation changes are included.
+
+Small generated tests cover one-pixel frame identity at 60/120 fps, rational rates, interpreted
+and shifted sources, reverse speed, three-day timelines, animated matte/warp reads, exact
+boundaries and +/-1/7 Tick or neighbouring f64 ULPs. The native host tests check the Tick reaching
+the footage source directly. These correctness checks are separate from frozen memory A/B
+measurements; they are not new playback or export-throughput evidence.
 
 ## Acceptance to run after the build window
 

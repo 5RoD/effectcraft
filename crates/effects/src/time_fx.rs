@@ -453,11 +453,6 @@ fn time_displacement(ctx: &EffectCtx, b: Buf) -> Buf {
 
 // ---------------------------------------------------------------- Timewarp
 
-/// Source layer time Timewarp shows at layer time `t`.
-pub fn timewarp_source_time(t: f64, by_frame: bool, speed: f64, source_frame: f64, fps: f64) -> f64 {
-    if by_frame { source_frame / fps } else { t * speed / 100.0 }
-}
-
 /// Timewarp's Pixel Motion settings (the Tuning group and Source Crops).
 #[derive(Clone, Copy, Debug)]
 pub struct PixelMotion {

@@ -202,13 +202,24 @@ impl EffectHost for FxHost<'_, '_, '_> {
     }
 
     fn self_at(&self, layer_time: f64, effects: usize) -> Option<Buf> {
+        if !layer_time.is_finite() {
+            return None;
+        }
+        self.self_at_tick(Tick::from_seconds_f64(layer_time), effects)
+    }
+
+    fn self_at_tick(&self, layer_time: Tick, effects: usize) -> Option<Buf> {
         if self.r.depth > MAX_FX_DEPTH || self.layer.switches.adjustment {
             return None;
         }
         let n = effects.min(self.index.load(std::sync::atomic::Ordering::Relaxed));
-        let t = self.layer.comp_time(Tick::from_seconds_f64(layer_time));
+        let t = self.layer.comp_time(layer_time);
         let sub = self.r.nested();
         sub.layer_input(&self.ctx.at(t), self.layer, n).map(|b| (*b).clone())
+    }
+
+    fn time_ticks(&self) -> Option<(Tick, Tick)> {
+        Some((self.layer.layer_time(self.ctx.time), self.ctx.time))
     }
 
     fn aux(&self) -> Option<Arc<effectcraft_raster::AuxChannels>> {
@@ -246,11 +257,18 @@ impl EffectHost for FxHost<'_, '_, '_> {
     }
 
     fn layer_at(&self, id: u64, comp_time: f64, masks_and_effects: bool) -> Option<LayerPixels> {
-        let other = self.ctx.layer(effectcraft_project::LayerId(id))?;
-        if (other.id == self.layer.id && masks_and_effects) || !comp_time.is_finite() || self.r.depth > MAX_FX_DEPTH {
+        if !comp_time.is_finite() {
             return None;
         }
-        let ctx = self.ctx.at(Tick::from_seconds_f64(comp_time));
+        self.layer_at_tick(id, Tick::from_seconds_f64(comp_time), masks_and_effects)
+    }
+
+    fn layer_at_tick(&self, id: u64, comp_time: Tick, masks_and_effects: bool) -> Option<LayerPixels> {
+        let other = self.ctx.layer(effectcraft_project::LayerId(id))?;
+        if (other.id == self.layer.id && masks_and_effects) || self.r.depth > MAX_FX_DEPTH {
+            return None;
+        }
+        let ctx = self.ctx.at(comp_time);
         let sub = self.r.nested();
         Some(if masks_and_effects {
             self.pixels(other, (*sub.content_buf(&ctx, other)?).clone(), true)

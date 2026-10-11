@@ -37,6 +37,65 @@ impl effectcraft_effects::EffectHost for Clock {
     }
 }
 
+#[test]
+fn exact_timewarp_source_boundaries_reach_gpu_without_float_host_roundtrips() {
+    use effectcraft_effects::{Buf, EffectHost, LayerPixels};
+    use effectcraft_raster::Image;
+    struct Identity {
+        rate: FrameRate,
+        time: Tick,
+    }
+    impl EffectHost for Identity {
+        fn layer(&self, _: u64, _: bool) -> Option<LayerPixels> {
+            None
+        }
+        fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+            None
+        }
+        fn self_at(&self, _: f64, _: usize) -> Option<Buf> {
+            panic!("native Timewarp must use exact Tick transport")
+        }
+        fn self_at_tick(&self, time: Tick, _: usize) -> Option<Buf> {
+            let frame = self.rate.frame_at(time);
+            Some(Buf { img: Image::filled(1, 1, [frame.rem_euclid(65_536) as f32, frame.div_euclid(65_536) as f32, 0.0, 1.0]), offset: [0.0; 2], scale: 1.0 })
+        }
+        fn time_ticks(&self) -> Option<(Tick, Tick)> {
+            Some((self.time, self.time))
+        }
+    }
+    let gpu = crate::tests::gpu();
+    assert!(std::env::var("EFFECTCRAFT_REQUIRE_GPU").as_deref() != Ok("1") || gpu.is_some());
+    let Some(gpu) = gpu else { return };
+    let spec = effectcraft_effects::find(effectcraft_effects::timewarp::ID).unwrap();
+    let input = Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: 1.0 };
+    for rate in [FrameRate::FPS_60, FrameRate::FPS_120, FrameRate::FPS_59_94, FrameRate::FPS_119_88] {
+        for frame in [-31_000_003, -5, -1, 0, 1, 5, 31_000_003] {
+            let time = rate.tick_of(frame);
+            let host = Identity { rate, time };
+            for method in 0..=2 {
+                let mut parameters = timewarp_parameters(method, 1);
+                parameters.values.insert("adjustTimeBy".into(), e(0));
+                parameters.values.insert("speed".into(), n(100.0));
+                parameters.values.insert("motionBlur/enableMotionBlur".into(), Value::Bool(false));
+                let ctx = effectcraft_effects::EffectCtx {
+                    params: &parameters,
+                    time: time.seconds(),
+                    layer_size: [1.0; 2],
+                    seed: 1,
+                    adjustment: false,
+                    env: effectcraft_effects::EffectEnv { host: Some(&host), frame_rate: rate.as_f64(), comp_time: time.seconds(), ..Default::default() },
+                };
+                let expected = host.self_at_tick(time, 0).unwrap();
+                let cpu = effectcraft_effects::apply(spec, &ctx, input.clone()).unwrap();
+                let step = effectcraft_render::FxStep { spec, ctx };
+                let output = effectcraft_render::Accelerator::effect_checked(gpu, &step, &input, None).unwrap().unwrap();
+                assert_eq!(cpu.img.data, expected.img.data);
+                assert_eq!(output.img.data, expected.img.data, "rate={rate:?}, frame={frame}, method={method}");
+            }
+        }
+    }
+}
+
 fn timewarp_parameters(method: u32, samples: usize) -> effectcraft_effects::Params {
     let spec = effectcraft_effects::find(effectcraft_effects::timewarp::ID).unwrap();
     let mut parameters = effectcraft_effects::Params {

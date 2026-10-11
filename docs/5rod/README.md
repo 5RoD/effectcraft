@@ -28,8 +28,10 @@ application and Desktop shortcut have not been removed or replaced.
   in their original order, and reuses private GPU scratch textures. Checked controls, geometry,
   storage/work budgets and kernels produce actionable errors. The renderer cache version
   excludes older unchecked-media/Timewarp pixels. The measured retiming increment preserves
-  each backend's previous output; source-frame boundary precision and an existing Pixel Motion
-  CPU/GPU difference remain separate correctness work. See [retiming measurements](retiming-performance.md).
+  each backend's previous output. A subsequent correction uses exact Tick reads in the native
+  renderer, removing source-fetch microsecond rounding and frame-selection epsilon. Float-only
+  custom hosts retain their precision limit. An existing Pixel Motion CPU/GPU difference
+  remains separate correctness work. See [retiming measurements](retiming-performance.md).
 - Native and WebAssembly plug-ins render into provisional frames. Invalid geometry, parameters,
   transfer bounds and trapped execution return checked errors; failed frames cannot become valid
   previews or replace an existing export. Time-dependent API 1 plug-ins keep their layer clock in
@@ -123,8 +125,8 @@ and the inherited [gap assessment](../gaps.md).
 ## Validation
 
 The complete repository gate is `cargo xtask ci`: formatting, clippy, workspace tests, dependency
-layering, licensed assets and WebAssembly checks. The retiming memory/safety increment passed
-on 2026-10-12 (local date): 2,980 tests passed, 27 explicitly optional tests were ignored, all 31 assets were attributed,
+layering, licensed assets and WebAssembly checks. The exact retiming frame-identity increment passed
+on 2026-10-12 (local date): 2,991 tests passed, 27 explicitly optional tests were ignored, all 31 assets were attributed,
 dependency layering passed, and 32 crates passed the WebAssembly check. Formatting and native
 clippy with warnings denied also passed. The WebAssembly check reports an inherited dead-code
 warning for the native shortcut-suspension state.
@@ -139,6 +141,10 @@ and exercise 10,000 nested abandoned branches without recursive repacking.
 Media regressions cover truncated planes, hostile dimensions/bit depths, nonfinite pixels,
 failed full/reduced/field/blended reads, cache exclusion and recovery after repair. A decode
 failure after successful export frames preserves the previous destination and removes provisional output.
+Retiming regressions cover exact frame boundaries and neighbouring Ticks at negative and
+multi-day times, rational rates, interpreted sources and auxiliary matte/warp reads. Actual
+renderer-host and required GPU identity checks exercise the native Tick path; float-only
+custom hosts retain their documented precision limit.
 
 Windows validation uses release optimization with Thin LTO disabled for the large test suite;
 the production build and comparable performance measurements use the repository's normal release

@@ -4,10 +4,10 @@
 use effectcraft_keyframe::Value;
 use effectcraft_project::ParamUi;
 use effectcraft_raster::{Image, flow::Flow};
-use effectcraft_time::{TICKS_PER_SECOND, Tick};
+use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
 use rayon::prelude::*;
 
-use crate::time_fx::{PixelMotion, layered, matte_image, matte_of, times_mask, timewarp_flow, timewarp_interpolate, timewarp_source_time};
+use crate::time_fx::{PixelMotion, layered, matte_image, matte_of, times_mask, timewarp_flow, timewarp_interpolate};
 use crate::{Buf, EffectCtx, LayerPixels};
 
 pub const ID: &str = "ec.time.timewarp";
@@ -95,16 +95,20 @@ fn checked_time(seconds: f64) -> Result<(), String> {
     Ok(())
 }
 
-/// Retain the existing source fetch's microsecond quantization, represented by exact Tick
-/// keys rather than unchecked NaN/overflow casts. The host sees the same rounded seconds.
-fn time_key(seconds: f64) -> Result<Tick, String> {
+/// Broadcast boundaries are exact Tick keys. Do not snap custom frame rates to a nearby
+/// broadcast rate: their first representable boundary is the ceiling of frame / fps.
+fn frame_key(frame: f64, fps: f64) -> Result<Tick, String> {
+    let seconds = frame / fps;
     checked_time(seconds)?;
-    let microseconds = (seconds * 1e6).round();
-    let ticks_per_microsecond = TICKS_PER_SECOND / 1_000_000;
-    if microseconds < (Tick::MIN.0 / ticks_per_microsecond) as f64 || microseconds > (Tick::MAX.0 / ticks_per_microsecond) as f64 {
-        return Err(invalid("rounded source time exceeds the supported Tick range"));
+    let key = if let Some(rate) = broadcast_rate(fps) { rate.tick_of(frame as i64) } else { Tick((seconds * TICKS_PER_SECOND as f64).ceil() as i64) };
+    if !(Tick::MIN..=Tick::MAX).contains(&key) {
+        return Err(invalid("source frame boundary exceeds the supported Tick range"));
     }
-    Ok(Tick((microseconds as i64).checked_mul(ticks_per_microsecond).ok_or_else(|| invalid("source time overflow"))?))
+    Ok(key)
+}
+
+fn broadcast_rate(fps: f64) -> Option<FrameRate> {
+    FrameRate::COMMON.into_iter().find(|rate| rate.as_f64() == fps)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -482,16 +486,46 @@ impl TimewarpPlan {
     }
 }
 
-fn split(source: f64, fps: f64) -> (f64, f32) {
-    let frame = source * fps;
-    let before = (frame + 1e-6).floor();
-    (before, ((frame - before) as f32).max(0.0))
+fn split_tick(source: Tick, fps: f64) -> Result<(f64, f32), String> {
+    if let Some(rate) = broadcast_rate(fps) {
+        let before = rate.frame_at(source);
+        let elapsed = source.0.checked_sub(rate.tick_of(before).0).ok_or_else(|| invalid("source frame fraction overflows"))?;
+        return Ok((before as f64, (elapsed as f64 / rate.frame_duration().0 as f64) as f32));
+    }
+    // Correct the floating estimate with Tick boundaries, without an epsilon that could
+    // advance a legitimate instant just before a frame boundary.
+    let mut before = (source.seconds() * fps).floor();
+    for _ in 0..4 {
+        if frame_key(before, fps)? > source {
+            before -= 1.0;
+        } else if frame_key(before + 1.0, fps)? <= source {
+            before += 1.0;
+        } else {
+            let start = frame_key(before, fps)?;
+            let end = frame_key(before + 1.0, fps)?;
+            let duration = end.0.checked_sub(start.0).filter(|duration| *duration > 0).ok_or_else(|| invalid("source frame duration is unsupported"))?;
+            let elapsed = source.0.checked_sub(start.0).ok_or_else(|| invalid("source frame fraction overflows"))?;
+            return Ok((before, (elapsed as f64 / duration as f64) as f32));
+        }
+    }
+    Err(invalid("source frame position cannot be represented"))
+}
+
+fn checked_tick(ticks: f64) -> Result<Tick, String> {
+    if !ticks.is_finite() || ticks < Tick::MIN.0 as f64 || ticks > Tick::MAX.0 as f64 {
+        return Err(invalid("retimed source exceeds the supported finite Tick range"));
+    }
+    let tick = Tick(ticks.round() as i64);
+    if !(Tick::MIN..=Tick::MAX).contains(&tick) {
+        return Err(invalid("retimed source exceeds the supported Tick range"));
+    }
+    Ok(tick)
 }
 
 struct Instants {
-    values: Vec<(f64, f32)>,
+    /// (Interpolation fraction, shutter weight); integer keys are kept separately.
+    values: Vec<(f32, f32)>,
     keys: Vec<Tick>,
-    times: Vec<f64>,
     indices: Vec<[usize; 2]>,
 }
 
@@ -499,31 +533,48 @@ fn instants(ctx: &EffectCtx) -> Result<Instants, String> {
     let fps = ctx.fps();
     let by_frame = ctx.params.e("adjustTimeBy") == 1;
     let speed = ctx.params.f("speed");
-    let source = timewarp_source_time(ctx.time, by_frame, speed, ctx.params.f("sourceFrame"), fps);
-    checked_time(source)?;
+    let current = ctx.env.host.and_then(|host| host.time_ticks()).map(|(layer, _)| layer).unwrap_or_else(|| Tick::from_seconds_f64(ctx.time));
+    if !(Tick::MIN..=Tick::MAX).contains(&current) {
+        return Err(invalid("host layer time exceeds the supported Tick range"));
+    }
+    let source = if by_frame || speed == 100.0 {
+        current
+    } else if speed == -100.0 {
+        Tick(current.0.checked_neg().ok_or_else(|| invalid("reverse source time overflows"))?)
+    } else {
+        checked_tick(current.0 as f64 * speed / 100.0)?
+    };
     let enabled = ctx.params.b("motionBlur/enableMotionBlur");
     let samples = if enabled { ctx.params.f("motionBlur/shutterSamples").round().clamp(1.0, MAX_SAMPLES as f64) as usize } else { 1 };
     let angle = if ctx.params.e("motionBlur/shutterControl") == 1 { ctx.params.f("motionBlur/shutterAngle") } else { 180.0 };
-    let span = if enabled { angle / 360.0 * if by_frame { 1.0 } else { speed / 100.0 } / fps } else { 0.0 };
+    let span = if enabled { angle / 360.0 * if by_frame { 1.0 } else { speed / 100.0 } } else { 0.0 };
     if !span.is_finite() {
         return Err(invalid("shutter span is non-finite"));
     }
     let mut instants = Vec::with_capacity(samples);
     let mut keys = Vec::with_capacity(samples * 2);
     let mut sample_keys = Vec::with_capacity(samples);
-    let mut raw_times = Vec::with_capacity(samples * 2);
     for sample in 0..samples {
-        let instant = source + if samples > 1 { span * sample as f64 / (samples - 1) as f64 } else { 0.0 };
-        checked_time(instant)?;
-        let (frame, _) = split(instant, fps);
+        let offset = if samples > 1 { span * sample as f64 / (samples - 1) as f64 } else { 0.0 };
+        let (frame, fraction) = if by_frame {
+            let position = ctx.params.f("sourceFrame") + offset;
+            let before = position.floor();
+            (before, (position - before) as f32)
+        } else {
+            let delta = checked_tick(offset / fps * TICKS_PER_SECOND as f64)?;
+            let instant = Tick(source.0.checked_add(delta.0).ok_or_else(|| invalid("shutter source time overflows"))?);
+            if !(Tick::MIN..=Tick::MAX).contains(&instant) {
+                return Err(invalid("shutter source time exceeds the supported Tick range"));
+            }
+            split_tick(instant, fps)?
+        };
         if !frame.is_finite() || frame.abs() > (1_u64 << 52) as f64 {
             return Err(invalid("source frame arithmetic exceeds exact integer precision"));
         }
-        let pair = [time_key(frame / fps)?, time_key((frame + 1.0) / fps)?];
-        raw_times.extend([(pair[0], frame / fps), (pair[1], (frame + 1.0) / fps)]);
+        let pair = [frame_key(frame, fps)?, frame_key(frame + 1.0, fps)?];
         keys.extend(pair);
         sample_keys.push(pair);
-        instants.push((instant, 1.0 / samples as f32));
+        instants.push((fraction, 1.0 / samples as f32));
     }
     keys.sort_unstable();
     keys.dedup();
@@ -536,26 +587,25 @@ fn instants(ctx: &EffectCtx) -> Result<Instants, String> {
             ])
         })
         .collect::<Result<Vec<_>, String>>()?;
-    // Auxiliary layers previously saw the unrounded source frame seconds. Keep those
-    // instants while sharing duplicate pairs, so animated mattes keep the same pixels.
-    let times = keys
-        .iter()
-        .map(|key| raw_times.iter().find_map(|(candidate, time)| (candidate == key).then_some(*time)).ok_or_else(|| invalid("source instant is missing")))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Instants { values: instants, keys, times, indices })
+    Ok(Instants { values: instants, keys, indices })
 }
 
-fn fetch_layer(ctx: &EffectCtx, id: &str, times: &[f64], grid: TimewarpGrid, budget: &mut TimewarpBudget) -> Result<Option<Vec<Image>>, String> {
+fn fetch_layer(ctx: &EffectCtx, id: &str, keys: &[Tick], grid: TimewarpGrid, budget: &mut TimewarpBudget) -> Result<Option<Vec<Image>>, String> {
     let Some(layer) = ctx.params.get(id).and_then(Value::as_layer) else { return Ok(None) };
     let Some(host) = ctx.env.host else { return Ok(None) };
     let masks = ctx.params.get(&crate::layer_source_id(id)).is_none_or(|value| value.as_enum() != 0);
-    let shift = ctx.env.comp_time - ctx.time;
-    times
-        .iter()
-        .map(|source_time| {
-            let time = source_time + shift;
-            checked_time(time)?;
-            match host.layer_at(layer, time, masks) {
+    let (local, comp) = host.time_ticks().unwrap_or_else(|| (Tick::from_seconds_f64(ctx.time), Tick::from_seconds_f64(ctx.env.comp_time)));
+    if !(Tick::MIN..=Tick::MAX).contains(&local) || !(Tick::MIN..=Tick::MAX).contains(&comp) {
+        return Err(invalid("host current times exceed the supported Tick range"));
+    }
+    let shift = comp.0.checked_sub(local.0).ok_or_else(|| invalid("layer time shift overflows"))?;
+    keys.iter()
+        .map(|key| {
+            let time = Tick(key.0.checked_add(shift).ok_or_else(|| invalid("shifted source time overflows"))?);
+            if !(Tick::MIN..=Tick::MAX).contains(&time) {
+                return Err(invalid("shifted source time exceeds the supported Tick range"));
+            }
+            match host.layer_at_tick(layer, time, masks) {
                 Some(source) => {
                     validate_input(&source.buf)?;
                     let peak = add(budget.preparation_bytes, mul(area(source.buf.img.width, source.buf.img.height)?, 16)?)?;
@@ -584,12 +634,12 @@ pub fn plan_for_input(ctx: &EffectCtx, size: [u32; 2]) -> Result<Option<Timewarp
 
 fn prepare(ctx: &EffectCtx, input_pixels: u64) -> Result<Option<TimewarpPlan>, String> {
     validate_controls(ctx)?;
-    let Instants { values: instants, keys, times, indices } = instants(ctx)?;
+    let Instants { values: instants, keys, indices } = instants(ctx)?;
     let Some(host) = ctx.env.host else { return Ok(None) };
     let mut raw_bytes = 0;
     let mut sources = Vec::with_capacity(keys.len());
     for key in &keys {
-        let source = host.self_at(key.seconds(), 0);
+        let source = host.self_at_tick(*key, 0);
         if let Some(source) = &source {
             validate_input(source)?;
             raw_bytes = add(raw_bytes, mul(area(source.img.width, source.img.height)?, 16)?)?;
@@ -618,16 +668,15 @@ fn prepare(ctx: &EffectCtx, input_pixels: u64) -> Result<Option<TimewarpPlan>, S
     let warp = ctx.params.get("warpLayer").and_then(Value::as_layer).is_some();
     let show = ctx.params.e("show");
     // Integer-aligned/Whole samples do not estimate motion, even with expensive tuning.
-    let mut pairs: Vec<_> =
-        instants.iter().zip(&indices).filter_map(|((source, _), pair)| (method == 2 && split(*source, ctx.fps()).1 >= 1e-4).then_some(*pair)).collect();
+    let mut pairs: Vec<_> = instants.iter().zip(&indices).filter_map(|((fraction, _), pair)| (method == 2 && *fraction >= 1e-4).then_some(*pair)).collect();
     pairs.sort_unstable();
     pairs.dedup();
     let mut budget =
         budget(grid, raw_bytes, &pm, BudgetRequest { input_pixels, unique: keys.len(), pairs: pairs.len(), steps: instants.len(), method, matte, warp, show })?;
     let mut frames = sources.into_iter().map(|source| grid.place(source)).collect::<Result<Vec<_>, _>>()?;
-    let mattes = fetch_layer(ctx, "matteLayer", &times, grid, &mut budget)?
+    let mattes = fetch_layer(ctx, "matteLayer", &keys, grid, &mut budget)?
         .map(|images| images.iter().map(|image| matte_of(image, ctx.params.e("matteChannel"))).collect::<Vec<_>>());
-    let warps = fetch_layer(ctx, "warpLayer", &times, grid, &mut budget)?;
+    let warps = fetch_layer(ctx, "warpLayer", &keys, grid, &mut budget)?;
     let mut derived: Vec<((usize, u32), usize)> = Vec::new();
     let mut flows: Vec<KeyedFlow> = Vec::new();
     let mut steps = Vec::with_capacity(instants.len());
@@ -645,8 +694,7 @@ fn prepare(ctx: &EffectCtx, input_pixels: u64) -> Result<Option<TimewarpPlan>, S
         cache.push(((index, mode), derived));
         Ok(derived)
     };
-    for ((source, weight), [a, b]) in instants.into_iter().zip(indices) {
-        let (_, fraction) = split(source, ctx.fps());
+    for ((fraction, weight), [a, b]) in instants.into_iter().zip(indices) {
         let step = if method == 0 || fraction < 1e-4 || (one && method == 1) {
             let pick = if method == 0 || fraction < 1e-4 || fraction < 0.5 { a } else { b };
             TwStep::Whole(if show > 0 { derive(&mut frames, &mut derived, pick, show)? } else { pick })
@@ -703,6 +751,45 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const SIZE: [f64; 2] = [32.0, 20.0];
+
+    #[test]
+    fn exact_tick_split_never_advances_instants_before_a_boundary() {
+        for rate in FrameRate::COMMON {
+            for frame in [-31_000_003, -37, -1, 0, 1, 37, 31_000_003] {
+                let boundary = rate.tick_of(frame);
+                for delta in [-7, -1, 0, 1, 7] {
+                    let time = Tick(boundary.0 + delta);
+                    let (before, fraction) = split_tick(time, rate.as_f64()).unwrap();
+                    assert_eq!(before as i64, frame - i64::from(delta < 0), "rate={rate:?}, frame={frame}, delta={delta}");
+                    assert_eq!(fraction == 0.0, delta == 0);
+                }
+                let mut seconds = boundary.seconds();
+                for _ in 0..4 {
+                    seconds = seconds.next_down();
+                }
+                for _ in 0..9 {
+                    let time = Tick::from_seconds_f64(seconds);
+                    let (before, _) = split_tick(time, rate.as_f64()).unwrap();
+                    assert_eq!(before as i64, rate.frame_at(time), "float ULP neighbour at {rate:?}, {frame}");
+                    seconds = seconds.next_up();
+                }
+                assert_eq!(frame_key(frame as f64, rate.as_f64()).unwrap(), boundary);
+            }
+        }
+    }
+
+    #[test]
+    fn custom_rate_boundaries_do_not_snap_to_broadcast_rates() {
+        for fps in [59.999, 60.001, 119.999, 120.001, 10.0] {
+            for frame in [-10001, -5, -1, 0, 1, 5, 10001] {
+                let boundary = frame_key(frame as f64, fps).unwrap();
+                assert_eq!(boundary.0, (frame as f64 / fps * TICKS_PER_SECOND as f64).ceil() as i64);
+                for delta in [-1, 0, 1] {
+                    assert_eq!(split_tick(Tick(boundary.0 + delta), fps).unwrap().0 as i64, frame - i64::from(delta < 0));
+                }
+            }
+        }
+    }
 
     #[derive(Default)]
     struct Host {

@@ -328,10 +328,26 @@ pub trait EffectHost: Sync {
     fn self_at(&self, _layer_time: f64, _effects: usize) -> Option<Buf> {
         None
     }
+    /// Exact layer-time transport for frame-sensitive effects. The default preserves existing
+    /// hosts, whose seconds API can lose individual Ticks at long project times. Native hosts
+    /// override this method to keep boundaries and their neighbouring Ticks distinct.
+    fn self_at_tick(&self, layer_time: effectcraft_time::Tick, effects: usize) -> Option<Buf> {
+        self.self_at(layer_time.seconds(), effects)
+    }
+    /// Exact current (layer time, composition time), when the host retains Tick time. Used to
+    /// avoid converting the current time or auxiliary-layer offset through seconds.
+    fn time_ticks(&self) -> Option<(effectcraft_time::Tick, effectcraft_time::Tick)> {
+        None
+    }
     /// Layer `id` of the same composition at comp time `comp_time` (seconds), like
     /// [`EffectHost::layer`] but at another time.
     fn layer_at(&self, _id: u64, _comp_time: f64, _masks_and_effects: bool) -> Option<LayerPixels> {
         None
+    }
+    /// Exact composition-time counterpart of [`EffectHost::layer_at`]. Float-only hosts keep
+    /// their existing precision; renderers should override it when exact time is available.
+    fn layer_at_tick(&self, id: u64, comp_time: effectcraft_time::Tick, masks_and_effects: bool) -> Option<LayerPixels> {
+        self.layer_at(id, comp_time.seconds(), masks_and_effects)
     }
     /// Auxiliary 3D channels (depth, object / material IDs, normals, Cryptomatte, any named
     /// EXR channel) of the effect's own layer source at the current time, in layer space (see

@@ -7,6 +7,64 @@ use effectcraft_project::build::{self, Ids};
 use effectcraft_project::{Comp, ItemId, ItemKind, LayerSource, MaskMode, Project, Solid};
 use effectcraft_time::{FrameRate, Tick};
 
+/// The native effect host must retain exact temporal identity, even when seconds cannot
+/// distinguish a boundary from one Tick before it. No codecs or large fixtures are needed.
+#[test]
+fn exact_effect_host_preserves_boundaries_neighbour_ticks_and_float_ulp_inputs() {
+    use effectcraft_effects::EffectHost;
+    use effectcraft_project::{BitDepth, Footage};
+    use std::sync::{Arc, Mutex, atomic::AtomicUsize};
+    struct Source(Mutex<Vec<Tick>>);
+    impl crate::FootageSource for Source {
+        fn frame(&self, _: ItemId, _: &Footage, time: Tick) -> Option<Arc<crate::Image>> {
+            self.0.lock().unwrap().push(time);
+            Some(Arc::new(crate::Image::filled(1, 1, [0.2, 0.3, 0.4, 1.0])))
+        }
+    }
+    for rate in FrameRate::COMMON {
+        let mut p = Project::default();
+        p.settings.bit_depth = BitDepth::Bpc32;
+        let comp = Comp::new(1, 1, rate, Tick::MAX);
+        let cid = p.add_item("Exact host", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+        let fid = p.add_item(
+            "Generated frame",
+            Label::Aqua,
+            None,
+            ItemKind::Footage(Footage { width: 1, height: 1, duration: Tick::MAX, has_video: true, frame_rate: rate, ..Default::default() }),
+        );
+        for name in ["self", "auxiliary"] {
+            let mut layer = build::layer(&mut p, &comp, name, LayerSource::Footage { item: fid }, (1, 1), None);
+            layer.start_time = rate.tick_of(-37);
+            p.comp_mut(cid).unwrap().layers.push(layer);
+        }
+        let source = Source(Mutex::new(Vec::new()));
+        let renderer = crate::Renderer::new(&p, &source, crate::RenderOpts::default());
+        let comp = p.comp(cid).unwrap();
+        for frame in [-31_000_003, -37, -1, 0, 1, 37, 31_000_003] {
+            let boundary = rate.tick_of(frame);
+            let mut times: Vec<_> = [-7, -1, 0, 1, 7].into_iter().map(|delta| Tick(boundary.0 + delta)).collect();
+            let mut seconds = boundary.seconds();
+            for _ in 0..4 {
+                seconds = seconds.next_down();
+            }
+            for _ in 0..9 {
+                times.push(Tick::from_seconds_f64(seconds));
+                seconds = seconds.next_up();
+            }
+            for time in times {
+                let ctx = crate::EvalCtx { project: &p, comp_id: cid, comp, time: comp.layers[0].comp_time(time), expr: None, footage: None };
+                let host = crate::FxHost { r: &renderer, ctx: &ctx, layer: &comp.layers[0], origin: [0.0; 2], index: AtomicUsize::new(0), original: None };
+                assert_eq!(host.time_ticks(), Some((time, ctx.time)));
+                source.0.lock().unwrap().clear();
+                assert!(host.self_at_tick(time, 0).is_some());
+                assert!(host.layer_at_tick(comp.layers[1].id.0, comp.layers[1].comp_time(time), false).is_some());
+                assert_eq!(*source.0.lock().unwrap(), vec![time, time], "rate={rate:?}, frame={frame}, time={time:?}");
+                assert_eq!(rate.frame_at(source.0.lock().unwrap()[0]), rate.frame_at(time));
+            }
+        }
+    }
+}
+
 fn render(p: &Project, cid: ItemId, t: f64, cache: Option<&crate::LayerCache>) -> crate::Image {
     let mut r = crate::Renderer::new(p, &crate::NoFootage, crate::RenderOpts::default());
     r.cache = cache;
