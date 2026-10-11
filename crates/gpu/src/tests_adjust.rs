@@ -87,6 +87,10 @@ impl FxTarget for Probe {
     fn cpu(&mut self, _f: &mut dyn FnMut(effectcraft_effects::Buf) -> effectcraft_effects::Buf) {
         self.cpu += 1;
     }
+    fn cpu_checked(&mut self, _f: &mut dyn FnMut(effectcraft_effects::Buf) -> Result<effectcraft_effects::Buf, String>) -> Result<bool, String> {
+        self.cpu += 1;
+        Ok(true)
+    }
 }
 
 #[test]

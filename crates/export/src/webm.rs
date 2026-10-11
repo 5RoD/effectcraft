@@ -259,7 +259,7 @@ pub(crate) async fn webm(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut Sta
         // Frames render in parallel; the VP9 streams (inter-coded) encode in order, colour and
         // alpha side by side.
         let pixels: Vec<Vec<u8>> =
-            job.frames(comp, (i..end).collect(), |_, img| job.pixels(&img, comp, if alpha { Channels::Rgba } else { colour_channels }, w, h)).await;
+            job.frames(comp, (i..end).collect(), |_, img| job.pixels(&img, comp, if alpha { Channels::Rgba } else { colour_channels }, w, h)).await?;
         let mut frames: Vec<Frame> = Vec::with_capacity(pixels.len());
         for (j, px) in pixels.iter().enumerate() {
             let (color, a) = rayon::join(

@@ -12,7 +12,7 @@ use crate::util::{Plane, gauss_plane, premul, unpremul};
 use crate::{Buf, EffectCtx, EffectSpec, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
-    EffectSpec { id, name, category: "Blur & Sharpen", params, render, gpu: false, float: true }
+    EffectSpec { id, name, category: "Blur & Sharpen", params, render: crate::EffectRender::Legacy(render), gpu: false, float: true }
 }
 
 #[inline]
@@ -776,7 +776,7 @@ mod tests {
         }
         let ctx =
             EffectCtx { params: &params, time: 0.0, layer_size: [img.width as f64, img.height as f64], seed: 1, adjustment: false, env: Default::default() };
-        (s.render)(&ctx, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 })
+        crate::apply(s, &ctx, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 }).unwrap()
     }
 
     fn edge_img() -> Image {

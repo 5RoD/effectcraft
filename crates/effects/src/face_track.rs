@@ -39,7 +39,23 @@ pub fn specs() -> Vec<EffectSpec> {
         .collect();
     let measurements: Vec<ParamSpec> = MEASUREMENTS.iter().map(|(id, name)| p(id, name, num(0.0), measurement_ui(id))).collect();
     vec![
-        EffectSpec { id: POINTS_ID, name: "Face Track Points", category: "Utility", params: points, render: passthrough, gpu: false, float: true },
-        EffectSpec { id: MEASUREMENTS_ID, name: "Face Measurements", category: "Utility", params: measurements, render: passthrough, gpu: false, float: true },
+        EffectSpec {
+            id: POINTS_ID,
+            name: "Face Track Points",
+            category: "Utility",
+            params: points,
+            render: crate::EffectRender::Legacy(passthrough),
+            gpu: false,
+            float: true,
+        },
+        EffectSpec {
+            id: MEASUREMENTS_ID,
+            name: "Face Measurements",
+            category: "Utility",
+            params: measurements,
+            render: crate::EffectRender::Legacy(passthrough),
+            gpu: false,
+            float: true,
+        },
     ]
 }

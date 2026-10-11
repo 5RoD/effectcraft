@@ -435,19 +435,33 @@ fn aux_views(
         };
         let id = egui::Id::new(("viewer-aux", i));
         let cached: Option<(u64, egui::TextureHandle)> = ctx.data(|d| d.get_temp(id));
+        let failure_key = auxiliary_failure_key(app.session.revision, cid.0, key, comp.frame_rate.frame_at(t), scale);
+        let previous = cached.as_ref().map(|(_, texture)| texture.clone());
         let tex = match cached {
-            Some((k, tex)) if k == key => tex,
+            Some((k, tex)) if k == key => Some(tex),
+            _ if app.frames.failure(&failure_key).is_some() => previous,
             _ => {
                 let opts = effectcraft_engine::render::RenderOpts { scale, view: comp.has_3d().then_some(cam), draft: true, ..Default::default() };
-                let img = app.session.render(cid, t, opts);
-                let tex = crate::frames::load_fitted(&ctx, format!("viewer-aux-{i}"), crate::frames::to_color_image(&img), egui::TextureOptions::LINEAR);
-                ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
-                tex
+                match app.session.render_checked(cid, t, opts) {
+                    Ok(image) => {
+                        let tex =
+                            crate::frames::load_fitted(&ctx, format!("viewer-aux-{i}"), crate::frames::to_color_image(&image), egui::TextureOptions::LINEAR);
+                        ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
+                        Some(tex)
+                    }
+                    Err(error) => {
+                        app.frames.record_failure(failure_key, error.to_string());
+                        previous
+                    }
+                }
             }
         };
         let b = comp.background;
         p.rect_filled(cr, 0.0, Color32::from_rgb((b[0] * 255.0) as u8, (b[1] * 255.0) as u8, (b[2] * 255.0) as u8));
-        p.image(tex.id(), cr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        if let Some(tex) = tex {
+            p.image(tex.id(), cr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        }
+        render_error_banner(app, ui, r, failure_key);
         p.rect_stroke(cr, 0.0, Stroke::new(1.0, Color32::from_black_alpha(160)), StrokeKind::Outside);
         if share && app.ui.viewer.safe_margins {
             for k in [0.9, 0.8] {
@@ -491,25 +505,38 @@ fn locked_pane(app: &mut EffectcraftApp, ui: &mut egui::Ui, full: Rect, bg: Colo
     };
     let id = egui::Id::new("viewer-locked");
     let cached: Option<(u64, egui::TextureHandle)> = ctx.data(|d| d.get_temp(id));
+    let failure_key = auxiliary_failure_key(app.session.revision, lv.comp.0, key, comp.frame_rate.frame_at(t), scale);
+    let previous = cached.as_ref().map(|(_, texture)| texture.clone());
     let tex = match cached {
-        Some((k, tex)) if k == key => tex,
+        Some((k, tex)) if k == key => Some(tex),
+        _ if app.frames.failure(&failure_key).is_some() => previous,
         _ => {
             let opts = effectcraft_engine::render::RenderOpts { scale, view: cam, ..Default::default() };
-            let img = app.session.render(lv.comp, t, opts);
-            let mut ci = crate::frames::to_color_image(&img);
-            if let Some(dc) = dc {
-                let mut px: Vec<[u8; 4]> = ci.pixels.iter().map(|c| c.to_array()).collect();
-                dc.apply(&mut px);
-                ci = egui::ColorImage::new(ci.size, px.into_iter().map(|a| Color32::from_rgba_premultiplied(a[0], a[1], a[2], a[3])).collect());
+            match app.session.render_checked(lv.comp, t, opts) {
+                Ok(img) => {
+                    let mut ci = crate::frames::to_color_image(&img);
+                    if let Some(dc) = dc {
+                        let mut px: Vec<[u8; 4]> = ci.pixels.iter().map(|c| c.to_array()).collect();
+                        dc.apply(&mut px);
+                        ci = egui::ColorImage::new(ci.size, px.into_iter().map(|a| Color32::from_rgba_premultiplied(a[0], a[1], a[2], a[3])).collect());
+                    }
+                    let tex = crate::frames::load_fitted(&ctx, "viewer-locked", ci, egui::TextureOptions::LINEAR);
+                    ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
+                    Some(tex)
+                }
+                Err(error) => {
+                    app.frames.record_failure(failure_key, error.to_string());
+                    previous
+                }
             }
-            let tex = crate::frames::load_fitted(&ctx, "viewer-locked", ci, egui::TextureOptions::LINEAR);
-            ctx.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
-            tex
         }
     };
     let b = comp.background;
     p.rect_filled(cr, 0.0, Color32::from_rgb((b[0] * 255.0) as u8, (b[1] * 255.0) as u8, (b[2] * 255.0) as u8));
-    p.image(tex.id(), cr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+    if let Some(tex) = tex {
+        p.image(tex.id(), cr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+    }
+    render_error_banner(app, ui, r, failure_key);
     p.rect_stroke(cr, 0.0, Stroke::new(1.0, Color32::from_black_alpha(160)), StrokeKind::Outside);
     let label = format!("Locked: {name} \u{2014} {}", if comp.has_3d() { lv.view.label() } else { "Active Camera" });
     p.text(r.left_top() + vec2(8.0, 8.0), Align2::LEFT_TOP, &label, Tokens::ui(11.0), Color32::from_white_alpha(210));
@@ -869,6 +896,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
 
     super::expr_editor::error_banner(app, ui, area);
+    render_error_banner(app, ui, area, key);
 
     // Track points of the current track (Tracker panel) on its layer, while that layer is selected.
     let mut track_hits = vec![];
@@ -2011,5 +2039,56 @@ fn show_frame(app: &mut EffectcraftApp, ctx: &egui::Context, key: crate::frames:
             // Pixels are read back on demand (viewer_pixels).
             app.viewer_image = None;
         }
+    }
+}
+
+/// A render failure remains visible independently of expression-banner preferences. Keep the
+/// last completed texture; the failed content key is retried only after editing or Retry.
+pub(super) fn render_error_banner(app: &mut EffectcraftApp, ui: &egui::Ui, area: Rect, key: crate::frames::FrameKey) {
+    let Some(message) = app.frames.failure(&key) else { return };
+    let height = 44.0_f32.min(area.height().max(0.0));
+    let rect = Rect::from_min_max(pos2(area.min.x, area.max.y - height), area.max);
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.rect_filled(rect, 0.0, Color32::from_rgb(70, 24, 27));
+    let button = Rect::from_min_max(pos2((rect.max.x - 60.0).max(rect.min.x), rect.min.y + 6.0), pos2(rect.max.x - 6.0, rect.max.y - 6.0));
+    let response = ui.interact(button, egui::Id::new(("render-failure-retry", key.comp, key.view)), Sense::click());
+    painter.rect_filled(button, 3.0, if response.hovered() { Color32::from_rgb(116, 48, 52) } else { Color32::from_rgb(92, 36, 40) });
+    painter.text(button.center(), Align2::CENTER_CENTER, "Retry", Tokens::ui(11.0), Color32::WHITE);
+    app.auto.add(&format!("viewer.renderErrorRetry.{}.{}", key.comp, key.view), button, "Retry the failed frame");
+    let text = Rect::from_min_max(pos2(rect.min.x + 8.0, rect.min.y + 3.0), pos2((button.min.x - 6.0).max(rect.min.x + 8.0), rect.max.y));
+    let clipped = painter.with_clip_rect(text);
+    clipped.text(text.min, Align2::LEFT_TOP, "Render failed · last completed image retained", Tokens::ui(11.0), Color32::WHITE);
+    clipped.text(pos2(text.min.x, text.min.y + 18.0), Align2::LEFT_TOP, &message, Tokens::ui(10.5), Color32::from_rgb(255, 205, 206));
+    ui.interact(text, egui::Id::new(("render-failure-details", key.comp, key.view)), Sense::hover()).on_hover_text(&message);
+    app.auto.add(&format!("viewer.renderError.{}.{}", key.comp, key.view), rect, &message);
+    if response.clicked() {
+        app.frames.retry(&key);
+    }
+}
+
+fn auxiliary_failure_key(revision: u64, comp: u64, view: u64, frame: i64, scale: f64) -> crate::frames::FrameKey {
+    crate::frames::FrameKey { revision, content: view, comp, frame, scale: (scale * 1000.0).round() as u32, view, opts: view }
+}
+
+#[cfg(test)]
+mod checked_render_tests {
+    use super::*;
+
+    #[test]
+    fn checked_render_banner_and_retry_are_discoverable_without_expression_banner() {
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        app.session.prefs.scripting.error_banner = false;
+        let key = crate::frames::FrameKey { revision: 1, content: 1, comp: 3, frame: 0, scale: 1000, view: 0, opts: 0 };
+        app.frames.record_failure(key, "Native Bloom: reduce Radius or resolution".into());
+        let context = egui::Context::default();
+        let area = Rect::from_min_size(pos2(20.0, 20.0), vec2(800.0, 500.0));
+        let _ = context.run_ui(Default::default(), |ui| render_error_banner(&mut app, ui, area, key));
+        for id in ["viewer.renderError.3.0", "viewer.renderErrorRetry.3.0"] {
+            let element = app.auto.find(id).unwrap();
+            let [x, y, width, height] = element.rect;
+            assert!(width > 0.0 && height > 0.0);
+            assert!(area.contains(pos2(x, y)) && area.contains(pos2(x + width, y + height)));
+        }
+        assert!(app.frames.failure(&key).is_some());
     }
 }

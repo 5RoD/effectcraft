@@ -30,6 +30,7 @@ thiserror = { workspace = true }
 log = { workspace = true }
 
 [dev-dependencies]
+effectcraft-effects = { workspace = true }
 effectcraft-media = { workspace = true }
 effectcraft-color = { workspace = true }
 filmcraft-opus = { workspace = true }

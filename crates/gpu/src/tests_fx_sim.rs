@@ -36,7 +36,7 @@ pub(crate) fn direct(id: &str, vals: &[(&str, Value)], t: f64, allow: f64) {
         let img = pattern(7, (size[0] * scale) as u32, (size[1] * scale) as u32);
         let buf = effectcraft_effects::Buf { img, offset: [0.0, 0.0], scale };
         let ctx = || effectcraft_effects::EffectCtx { params: &params, time: t, layer_size: size, seed: 11, adjustment: false, env: Default::default() };
-        let cpu = (spec.render)(&ctx(), buf.clone());
+        let cpu = effectcraft_effects::apply(spec, &ctx(), buf.clone()).unwrap();
         let out = effectcraft_render::Accelerator::effects(g, &[effectcraft_render::FxStep { spec, ctx: ctx() }], &buf, None).expect("the GPU runs the effect");
         assert_eq!((out.offset, out.scale), (cpu.offset, cpu.scale), "{id}: geometry");
         let d = diff(&cpu.img, &out.img, 1e-3);

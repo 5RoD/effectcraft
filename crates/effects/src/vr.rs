@@ -26,7 +26,7 @@ use crate::{Buf, EffectCtx, EffectSpec, col, num, p, popup, slider};
 type V3 = [f64; 3];
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
-    EffectSpec { id, name, category: "Immersive Video", params, render, gpu: false, float: true }
+    EffectSpec { id, name, category: "Immersive Video", params, render: crate::EffectRender::Legacy(render), gpu: false, float: true }
 }
 
 pub const FRAME_LAYOUTS: [&str; 3] = ["Monoscopic", "Stereo - Over/Under", "Stereo - Side by Side"];

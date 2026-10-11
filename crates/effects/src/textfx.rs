@@ -18,7 +18,7 @@ use crate::util::{Plane, gauss_plane, hash1, poly_length, poly_point_at};
 use crate::{Buf, EffectCtx, EffectSpec, col, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, category: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
-    EffectSpec { id, name, category, params, render, gpu: false, float: true }
+    EffectSpec { id, name, category, params, render: crate::EffectRender::Legacy(render), gpu: false, float: true }
 }
 
 fn pct() -> ParamUi {
@@ -1092,7 +1092,7 @@ mod tests {
             params.values.insert(k.to_string(), v.clone());
         }
         let ctx = EffectCtx { params: &params, time, layer_size: ls, seed: 3, adjustment: false, env };
-        crate::apply(s, &ctx, Buf { img, offset: [0.0, 0.0], scale: 1.0 })
+        crate::apply(s, &ctx, Buf { img, offset: [0.0, 0.0], scale: 1.0 }).unwrap()
     }
 
     fn run(id: &str, set: &[(&str, Value)], img: Image, time: f64) -> Buf {

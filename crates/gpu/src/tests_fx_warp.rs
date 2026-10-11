@@ -106,7 +106,7 @@ fn direct_with_masks(id: &str, vals: &[(&str, Value)]) {
                 adjustment,
                 env: effectcraft_effects::EffectEnv { masks: &masks, ..Default::default() },
             };
-            let cpu = (spec.render)(&ctx(), buf.clone());
+            let cpu = effectcraft_effects::apply(spec, &ctx(), buf.clone()).unwrap();
             let out =
                 effectcraft_render::Accelerator::effects(g, &[effectcraft_render::FxStep { spec, ctx: ctx() }], &buf, None).expect("the GPU runs the effect");
             assert_eq!((out.offset, out.scale), (cpu.offset, cpu.scale), "{id}: geometry");

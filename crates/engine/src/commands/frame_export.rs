@@ -27,7 +27,7 @@ struct Isolated {
     image: Image,
 }
 
-fn render_with(s: &Session, project: &Project, comp: ItemId, t: Tick, scale: f64) -> Image {
+fn render_with(s: &Session, project: &Project, comp: ItemId, t: Tick, scale: f64) -> Result<Image> {
     let opts = RenderOpts {
         scale,
         backend: Backend::Auto,
@@ -38,13 +38,13 @@ fn render_with(s: &Session, project: &Project, comp: ItemId, t: Tick, scale: f64
     let mut r = Renderer::new(project, s.footage.as_ref(), opts);
     r.expr = s.expr.as_deref();
     r.accel = s.accel.as_deref();
-    r.comp_frame(comp, t)
+    r.comp_frame_checked(comp, t).map_err(|error| EngineError::Other(error.to_string()))
 }
 
 /// The comp frame and each visible layer rendered alone (top layer first).
 fn isolate(s: &Session, cid: ItemId, t: Tick, scale: f64) -> Result<(Image, Vec<Isolated>)> {
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
-    let full = render_with(s, &s.project, cid, t, scale);
+    let full = render_with(s, &s.project, cid, t, scale)?;
     let any_solo = comp.layers.iter().any(|l| l.switches.solo && l.has_video());
     let ids: Vec<LayerId> = comp
         .layers
@@ -72,7 +72,7 @@ fn isolate(s: &Session, cid: ItemId, t: Tick, scale: f64) -> Result<(Image, Vec<
             }
         }
         let Some((name, blend, opacity)) = info else { continue };
-        let image = render_with(s, &p, cid, t, scale);
+        let image = render_with(s, &p, cid, t, scale)?;
         out.push(Isolated { name, blend, opacity, image });
     }
     Ok((full, out))

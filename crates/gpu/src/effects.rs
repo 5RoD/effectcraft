@@ -48,6 +48,10 @@ impl GBuf {
 /// Run a chain of GPU effects (one upload, one readback), quantising after each when `levels`
 /// is set. `None` when anything cannot run here.
 pub(crate) fn run_chain(e: &mut Enc, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<Buf> {
+    // Checked kernels must never have their error collapsed into legacy Option fallback.
+    if chain.iter().any(|step| matches!(step.spec.render, effectcraft_effects::EffectRender::Checked(_))) {
+        return None;
+    }
     if !e.g.can_readback() || buf.img.is_empty() {
         return None;
     }
@@ -96,6 +100,72 @@ fn readback_buf(r: crate::deferred::Readback) -> Option<Buf> {
     Some(Buf { img, offset: r.offset, scale: r.scale })
 }
 
+/// A checked effect over host pixels: validate before uploading or consulting deferred
+/// results. A pending keyed readback returns the input placeholder and raises the miss gate.
+pub(crate) fn run_checked(e: &mut Enc, step: &FxStep, input: &Buf, levels: Option<f32>) -> Result<Option<Buf>, String> {
+    if step.spec.id != effectcraft_effects::bloom::ID {
+        return Ok(None);
+    }
+    let plan = effectcraft_effects::bloom::plan(&step.ctx, [input.img.width, input.img.height], input.scale).map_err(|error| error.to_string())?;
+    effectcraft_effects::bloom::validate_input(input, &plan).map_err(|error| error.to_string())?;
+    e.g.check_health()?;
+    if !e.g.can_readback() {
+        return Err("checked GPU effect cannot return a completed image".into());
+    }
+    let ready = |readback: Option<crate::deferred::Readback>| -> Result<Option<Buf>, String> {
+        let readback = readback.ok_or("checked GPU effect readback failed")?;
+        if [readback.width, readback.height] != plan.output {
+            return Err("checked GPU effect readback dimensions differ from the validated plan".into());
+        }
+        if readback.offset != input.offset.map(|value| value + plan.pad as f64) || readback.scale != input.scale {
+            return Err("checked GPU effect readback geometry differs from the validated plan".into());
+        }
+        let count = usize::try_from(u64::from(readback.width) * u64::from(readback.height)).map_err(|_| "checked readback exceeds address space")?;
+        if count.checked_mul(16) != Some(readback.bytes.len()) {
+            return Err("checked GPU effect readback storage is malformed".into());
+        }
+        let mut data = Vec::new();
+        data.try_reserve_exact(count).map_err(|error| format!("checked readback allocation: {error}"))?;
+        data.resize(count, [0.0; 4]);
+        bytemuck::cast_slice_mut(&mut data).copy_from_slice(&readback.bytes);
+        Ok(Some(Buf {
+            img: effectcraft_raster::Image { width: readback.width, height: readback.height, data },
+            offset: readback.offset,
+            scale: readback.scale,
+        }))
+    };
+    let deferred = e.g.deferred.clone();
+    let key = deferred.as_ref().map(|_| crate::deferred::chain_key(std::slice::from_ref(step), input, levels));
+    if let (Some(deferred), Some(key)) = (&deferred, key) {
+        match deferred.lookup(key) {
+            crate::deferred::Lookup::Ready(readback) => return ready(readback),
+            crate::deferred::Lookup::InFlight => {
+                deferred.miss();
+                return Ok(Some(input.clone()));
+            }
+            crate::deferred::Lookup::Absent => {}
+        }
+    }
+    let misses = deferred.as_ref().map(|deferred| deferred.misses());
+    let image = e.g.upload_image(&input.img).ok_or("checked GPU effect cannot upload its validated input")?;
+    let mut output = crate::bloom::resident(e, &step.ctx, GBuf { img: image, offset: input.offset, scale: input.scale }).map_err(|error| error.to_string())?;
+    if let Some(levels) = levels {
+        output.img = ops::quantize(e, &output.img, levels);
+    }
+    if let (Some(deferred), Some(key)) = (&deferred, key) {
+        if Some(deferred.misses()) != misses {
+            deferred.miss();
+            return Ok(Some(input.clone()));
+        }
+        return match e.read_keyed(&output.img, key, output.offset, output.scale) {
+            Some(readback) => ready(readback),
+            None => Ok(Some(input.clone())),
+        };
+    }
+    let image = e.download(&output.img).ok_or("checked GPU effect cannot read back its completed output")?;
+    Ok(Some(Buf { img: image, offset: output.offset, scale: output.scale }))
+}
+
 /// An effect stack running on a GPU-resident image (adjustment layers): GPU chains stay on
 /// the device; CPU effects read the image back, run, and upload the result.
 pub(crate) struct GpuFx<'e, 'g> {
@@ -117,6 +187,9 @@ impl<'e, 'g> GpuFx<'e, 'g> {
 
 impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
     fn gpu(&mut self, steps: &[FxStep]) -> bool {
+        if steps.iter().any(|step| matches!(step.spec.render, effectcraft_effects::EffectRender::Checked(_))) {
+            return false;
+        }
         let Some(b) = &self.b else { return false };
         let mut cur = GBuf { img: b.img.clone(), offset: b.offset, scale: b.scale };
         for step in steps {
@@ -135,6 +208,42 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
         let Some(img) = self.e.download(&b.img) else { return };
         let out = f(Buf { img, offset: b.offset, scale: b.scale });
         self.b = self.e.g.upload_image(&out.img).map(|img| GBuf { img, offset: out.offset, scale: out.scale });
+    }
+    fn gpu_checked(&mut self, step: &FxStep) -> Result<bool, String> {
+        if step.spec.id != effectcraft_effects::bloom::ID {
+            return Ok(false);
+        }
+        let input = self.b.as_ref().ok_or("checked effect has no resident input")?;
+        let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let input = GBuf { img: input.img.clone(), offset: input.offset, scale: input.scale };
+            let mut output = crate::bloom::resident(self.e, &step.ctx, input).map_err(|error| error.to_string())?;
+            if let Some(levels) = self.levels {
+                output.img = ops::quantize(self.e, &output.img, levels);
+            }
+            Ok::<_, String>(output)
+        }))
+        .map_err(|_| "checked resident GPU effect was rejected by the driver".to_owned())??;
+        self.b = Some(output);
+        Ok(true)
+    }
+    fn cpu_checked(&mut self, f: &mut dyn FnMut(Buf) -> Result<Buf, String>) -> Result<bool, String> {
+        // An unkeyed CPU stage cannot enqueue a deferred readback. Decline this GPU
+        // attempt explicitly: the checked frame boundary retries on CPU with a fresh sink.
+        // It must not publish a placeholder or report a pending readback that never started.
+        if !self.e.g.can_wait() {
+            return Err("checked CPU effect requires a Software Only frame on this device".into());
+        }
+        let input = self.b.take().ok_or("checked effect has no GPU input buffer")?;
+        let Some(image) = self.e.download(&input.img) else {
+            if self.e.g.deferred().is_some_and(|deferred| deferred.missed()) {
+                return Ok(false);
+            }
+            return Err("checked effect cannot read back its GPU input; use Software Only or retry after GPU recovery".into());
+        };
+        let output = f(Buf { img: image, offset: input.offset, scale: input.scale })?;
+        let image = self.e.g.upload_image(&output.img).ok_or("checked effect cannot upload its completed output")?;
+        self.b = Some(GBuf { img: image, offset: output.offset, scale: output.scale });
+        Ok(true)
     }
 }
 

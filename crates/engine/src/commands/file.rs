@@ -82,6 +82,7 @@ fn save_to(s: &mut Session, path: &str) -> Result<Value> {
     s.mark_saved();
     s.note_project_path(path);
     s.toast(format!("Saved {path}"));
+    s.recovery_journal.reset();
     Ok(json!({"path": path, "bytes": json.len()}))
 }
 

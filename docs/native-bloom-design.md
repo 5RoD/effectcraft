@@ -1,8 +1,12 @@
-# Native Bloom proposal
+# Native Bloom checked renderer
 
-Status: design only; this effect has not been implemented or benchmarked. It would be an
-original EffectCraft effect, separate from the existing Glow. It does not load commercial
-After Effects plug-ins or claim Deep Glow look, speed, preset, or binary compatibility.
+Status: the integration registers **Native Bloom** through checked CPU and GPU runners.
+Adjustment-layer dispatch stays on resident textures; ordinary layers use a checked keyed
+upload/readback, with deferred passes in browser workers. Production benchmarks, moving-text visual
+acceptance and the complete repository gate remain required before release. The existing
+Glow renderer keeps its previous behavior. This is original EffectCraft code; it does not
+load commercial After Effects plug-ins or claim Deep Glow look, speed, preset or binary
+compatibility.
 
 ## Public workflow references
 
@@ -40,16 +44,67 @@ The separate Glow optimization/safety patch removes per-pixel arbitrary-map allo
 avoids clearing fully overwritten GPU bright textures, and bounds radius arithmetic. It
 does not introduce the proposed Native Bloom renderer or establish visual parity.
 
-## First implementation
+## Checked integration and controls
 
-Proposed registry id: `ec.stylize.bloom`; display name: **Native Bloom**. Registration should
-make it available in the effect menu, search, and ordinary effect commands. All controls
-are normal animatable properties. Existing Glow projects retain their existing effect.
+Registry id: `ec.stylize.bloom`; display name: **Native Bloom**; category: **Stylize**.
+The usual Effect menu, effect controls and `effect.apply` command expose the same animatable
+parameters. Registration uses `EffectRender::Checked`; existing effect functions remain
+`Legacy` runners without changing their output arithmetic. Both standalone
+`effects::bloom::render_checked` and `gpu::bloom::render_checked` still return
+`Result<Buf, BloomError>`.
 
-Start with Radius, Exposure in stops, HDR Threshold (1 = reference white), Soft Knee,
-Halo Spread, Draft/Balanced/Final Quality, and Source/Glow/Final views. Add and Screen
-compositing and a glow-only result should be explicit. Defaults and parameter limits are
-to be chosen from the acceptance scenes, rather than copied from a commercial product.
+The frame-local diagnostics slot preserves the first failure's comp, layer, effect uid/id,
+exact Tick and bounded message across nested/collapsed compositions and motion blur. The
+checked frame boundary tries a fresh CPU render with no shared layer cache after a GPU
+limitation. It returns a terminal error if the reference renderer also rejects the request.
+A completed CPU retry is explicit, so deferred workers do not repeat 24 obsolete GPU passes.
+Caches and GPU displays refuse a failed attempt. The public legacy image boundary logs the
+failure and supplies a tiny internal placeholder, rather than caching partially evaluated
+pixels; user-facing preview, frame/alpha APIs, saved-frame, PSD/EXR and export callers use the
+checked boundary and reject that placeholder.
+
+Preview retains its last completed image and presents a render-error strip with hover
+details and **Retry**. This error is independent of the expression-banner preference.
+Failures are remembered for the content/time/view/options key, so repaint and prefetch do
+not create an automatic retry loop; an edit creates a new key. Browser frame-worker failures
+reach the same state through their contextual error message. Render Queue errors become a
+failed item, including offloaded worker jobs; unfinished movies never reach a download sink.
+File-system encoders write an exclusively created adjacent temporary file and replace the
+destination only after encoding, flush, sync and close all succeed. A failed image sequence
+can retain earlier, individually completed frame files; it is not a transaction over the
+entire sequence. Existing files are never replaced with unfinished encoder output.
+
+Renderer cache keys use the fork salt `effectcraft-5rod-render-2`, including footage/layer
+and comp/frame identities. The cache file format stays `v1`; upstream-rendered pixels cannot
+bypass the changed expression/effect semantics or the checked evaluation path.
+
+The registered renderer is `gpu: true`. Checked kernels use their own explicit dispatch hooks
+and never enter the legacy infallible batch runner. Adjustment layers reuse the GPU core's
+exact kernels on resident textures, with no effect-stage upload/readback. Ordinary source
+layers currently require one checked upload/readback for Bloom, separately from adjacent
+legacy effect batches; this increment does not claim an entire ordinary layer stack stays
+resident. Deferred readbacks validate controls before cache lookup, dimensions, geometry and
+byte length before fallible image allocation, and raise the existing miss gate while pending.
+Failures still select a fresh checked CPU frame retry; neither backend lowers export quality
+to satisfy a rejected memory/work request. The standalone GPU helper requires synchronous
+readback, while the registered dispatcher supports deferred devices.
+
+| Control | Default | Accepted values |
+| --- | --- | --- |
+| Radius (outer sigma) | 32 | 0–1024 layer pixels; radius × render scale must be finite and at most 4096 rendered pixels |
+| Exposure | 0 | −16 to 16 stops; affects Glow/Final, not the emission debug view |
+| Amount | 100% | 0–1000%; an explicit fade-to-zero control |
+| HDR Threshold | 1 | 0–1,000,000 in linear working-space reference-white units |
+| Soft Knee | 0.5 | 0–1; knee half-width is Threshold × Soft Knee |
+| Halo Spread | 0.5 | 0–1; interpolates two normalized component weight sets |
+| Quality | Balanced | Draft / Balanced / Final |
+| View | Final | Source Emission / Glow Only / Final |
+| Composite | Add | Add / Screen |
+
+Control values with the wrong type, nonfinite numbers, fractional choices, invalid scales or
+values outside the stated ranges return an error. Alpha is restricted to 0–1; nonfinite pixel
+channels become zero, and straight input/decoded RGB is capped to magnitude `1e12` before
+scattering. This is a documented malformed-input bound, not an HDR reference-white clamp.
 
 1. Create a bounded shared plan before any casts, dimensions, texture creation, or loops.
    It defines the effective radius, support/padding, pyramid dimensions, normalized weights,
@@ -75,9 +130,105 @@ to be chosen from the acceptance scenes, rather than copied from a commercial pr
    composite the final result once, in linear light, then encode back to the working space
    if necessary. GPU and CPU fallback implement the same plan and color semantics.
 
-Draft/Balanced/Final must have documented sampling/work limits and deterministic results.
-Quality is independent of the viewer's Full/Half/Quarter resolution. Final exports use the
-selected export quality; preview-quality shortcuts must not silently reach exported frames.
+## Implemented profile, color and budgets
+
+For nonzero radius, the original profile is a four-component normalized Gaussian mixture
+with nominal sigmas `Radius/8`, `Radius/4`, `Radius/2`, and `Radius`. At Spread zero, weights
+are `[0.55, 0.30, 0.12, 0.03]`; at Spread one they are `[0.05, 0.15, 0.30, 0.50]`. The last
+weight is the remaining normalized mass. Each Gaussian uses the existing three-box
+approximation. This is not a physical scattering model or a vendor profile.
+
+| Quality | Minimum reduction factor for the smallest component | Maximum local sigma |
+| --- | --- | --- |
+| Draft | 4 | 4 pixels |
+| Balanced | 2 | 8 pixels |
+| Final | 1 | 16 pixels |
+
+The first reduction factor doubles until the local sigma fits; subsequent components each
+double it again. Thus every component uses the same bounded local box radii. Radius zero
+uses one unblurred component at full resolution. Emission is extracted before reductions.
+Odd missing reduction cells are transparent, and bilinear reconstruction uses cell centers.
+This preserves integrated energy; it introduces grid-dependent profile/position error at
+coarse quality, which still needs measured visual acceptance. Quality is independent of
+Full/Half/Quarter render scale. No preview/export quality shortcut is implemented.
+
+Extraction decodes straight RGB only when the working space is encoded, uses that space's
+XYZ Y coefficients for an absolute HDR threshold, and multiplies emission by input alpha
+once. A quadratic knee connects to the linear excess above threshold. Scattering and
+compositing remain in the same linear working-space primaries, followed by one encode.
+Add sums premultiplied radiance. Screen uses the original HDR extension
+`S + G - clamp(S, 0, alphaS) × clamp(G, 0, alphaG)` per channel: the interaction is bounded
+to reference white while excess HDR radiance survives. Both final operations use union alpha
+`alphaS + alphaG × (1 - alphaS)`; Glow Only preserves the halo's premultiplied alpha.
+Source Emission shows the extracted source before gain or scattering. Adjustment-layer
+output stays in its input bounds; ordinary layer output grows to the shared support.
+
+Before allocation, the shared plan caps every image/atlas dimension at 16,384 pixels and
+every individual area at 32 × 1024 × 1024 pixels. Its conservative total byte estimate is
+limited to 1536 MiB, including six input-sized buffers, four buffers per padded component,
+all downsample levels, the atlas, and three output-sized copies at 16 bytes per pixel. This
+covers CPU blur accumulators and GPU upload/readback/staging headroom for one render; it
+does not account for unrelated renderer caches or concurrent layers. A second limit of
+2,000,000,000 work units charges 32 per input pixel, 48 per padded component pixel, four
+per reduced pixel, and 64 per output pixel. These are deterministic planning units, not a
+latency guarantee. Device texture limits and readback capability are checked separately.
+
+CPU image/blur/column-accumulator allocations use fallible reservation. GPU extraction,
+reduction, finish and box passes write every output texel and may use uncleared scratch;
+padded levels and the partially copied atlas are explicitly cleared. Neither backend
+allocates a separate full-resolution padded emission image per component. Larger supported
+numeric radii can still be rejected when output support or aggregate budgets exceed the
+limits; rejection never silently lowers quality. Total application memory and allocation
+failure outside this checked core remain separate renderer work.
+
+## Focused verification and remaining checks
+
+Eight CPU tests cover hostile controls/dimensions/storage/offsets, deterministic normalized
+plans, continuous monotone thresholds, exact single alpha application, HDR impulse energy,
+an independent full-resolution Gaussian-mixture energy/second-moment reference, odd edges
+and preview scales, equivalent physical colors across working spaces, explicit views and
+compositing, zero Amount and adjustment bounds. Two raster tests compare checked box passes
+to the existing filter and reject malformed images/radii. Three GPU tests cover checked
+CPU parity across four working-space cases, all qualities and views, Add/Screen, HDR,
+alpha, odd dimensions, nonfinite hidden pixels, cold/warm NaN-poisoned scratch, transparent
+reuse, rejected hostile requests, zero Radius/Amount and adjustment-layer bounds. The eight
+CPU and two raster tests pass in the release test profile with Thin LTO disabled. All three
+GPU tests pass on NVIDIA GeForce RTX 3050 (Vulkan), with `EFFECTCRAFT_REQUIRE_GPU=1` and
+`WGPU_BACKEND=vulkan`. The 48-case comparison matrix passed both cold and warm scratch
+plus transparent reuse, without changing the RGB/alpha tolerances. The required-GPU setting
+prevents unavailable devices or kernel initialization errors from silently taking a skip path.
+The focused GPU run passed 3/3 in 1.48 seconds; this is test duration, not a performance claim.
+
+The resident dispatch increment passes seven GPU tests on the same required NVIDIA/Vulkan
+adapter, plus the registry badge audit and the eight CPU core tests. The original 48-case
+HDR/color/quality/view matrix remains unchanged. New resident tests verify input preservation
+and zero effect-stage host transfers, Source Emission/Glow Only/Final, ordinary versus
+adjustment bounds, deferred readback failure and malformed dimensions/geometry/storage,
+rejected nonfinite/enormous controls before transfers, transformed ordinary mixed stacks at
+8/16/32 bpc and half resolution, warm-cache equality, contextual rejection and cache repair.
+The adjustment scene uses only the final frame readback and completes deferred rendering in
+two passes without a CPU retry. These are correctness/transfer checks, not timing benchmarks.
+
+The independent profile test initially allows 25% error in radial second moment for the
+three-box/multiresolution approximation; it is not a pixel-exact Gaussian claim. Energy
+retains the 1% target, and GPU parity uses the tolerances below. Moving text, transformed
+layers, masks, whole-renderer fallback/export error presentation and performance acceptance
+remain outside the core matrix. The integration adds checked fallback/preview/export/cache
+regressions; full production visual and performance acceptance is still outstanding.
+
+The integration's focused regressions pass for frame-local diagnostic bounds, nested/collapsed
+and motion-blurred failures, failed-pixel cache rejection and repair, fork cache identity,
+legacy frame equality, Session frame/alpha/PSD/EXR/snapshot rejection, remote worker errors,
+immediate completion after a CPU retry, real synchronous/deferred GPU adjustment behavior,
+preview terminal-state recovery, error/Retry automation rectangles, JSON browser-frame
+failure/recovery, offloaded CPU/deferred-GPU Render Queue failure, late movie failure and
+preserved destinations, failed final rename, and finished-file-only sinks. A failed export may
+publish its completed `.txt` failure log; it cannot publish an unfinished movie. Browser
+worker tests run natively with actual protocol round trips and the NVIDIA Vulkan adapter;
+this increment has not run browser automation in a real browser. Selected-crate release
+all-target clippy is clean with `-D warnings`; the full repository gate remains the parent
+integration's responsibility. Local checks disable Thin LTO for compiler throughput, so
+none of these results are production performance measurements.
 
 ## Additional controls after the core passes
 
@@ -125,5 +276,6 @@ full-frame footage so a sparse-scene optimization cannot hide the expensive case
 
 Require all quality scenes to pass before treating a faster result as an improvement. Set
 performance targets from those measurements and the existing Glow baseline; there are no
-speed or real-time claims yet. General image-allocation budgeting remains a renderer task
-and is a prerequisite for accepting extreme-size bloom requests safely.
+speed or real-time claims yet. The checked core's per-render budget is implemented in source;
+general whole-renderer image budgeting remains separate work. The checked integration
+surfaces supported-core rejection through preview and export, without a speed claim.

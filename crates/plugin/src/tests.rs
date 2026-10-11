@@ -122,7 +122,7 @@ fn render(spec: &effectcraft_effects::EffectSpec, gain: f64, on: bool) -> Image 
     params.values.insert("on".into(), effectcraft_keyframe::Value::Bool(on));
     let ctx = EffectCtx { params: &params, time: 0.0, layer_size: [4.0, 2.0], seed: 1, adjustment: false, env: EffectEnv::default() };
     let buf = Buf { img: Image::filled(4, 2, [0.8, 0.6, 0.2, 1.0]), offset: [0.0; 2], scale: 1.0 };
-    (spec.render)(&ctx, buf).img
+    effectcraft_effects::apply(spec, &ctx, buf).unwrap().img
 }
 
 #[test]
@@ -279,7 +279,7 @@ fn render_failures_leave_the_frame_and_recover() {
     let at = |time: f64| {
         let ctx = EffectCtx { params: &params, time, layer_size: [4.0, 2.0], seed: 1, adjustment: false, env: EffectEnv::default() };
         let buf = Buf { img: Image::filled(4, 2, orig), offset: [0.0; 2], scale: 1.0 };
-        (trap.render)(&ctx, buf).img
+        effectcraft_effects::apply(trap, &ctx, buf).unwrap().img
     };
     assert_eq!(at(1.0).get(0, 0), orig, "trapped");
     assert_eq!(at(0.0).get(0, 0), [0.4, 0.3, 0.1, 1.0], "a fresh instance after the trap");

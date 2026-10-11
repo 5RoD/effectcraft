@@ -16,7 +16,53 @@ use effectcraft_project::ItemId;
 use effectcraft_raster::Image;
 use effectcraft_time::Tick;
 
-use crate::{Accelerator, AutoKey, Backend, Renderer};
+use crate::{Accelerator, AutoKey, Backend, FrameFailure, Renderer};
+
+/// Checked user-facing pass boundary. A terminal effect error returns immediately; a genuine
+/// deferred miss retains the existing bounded retry/CPU fallback behavior.
+pub async fn comp_frame_checked(r: &Renderer<'_>, comp: ItemId, time: Tick) -> Result<Image, FrameFailure> {
+    let Some(accel) = r.accel.filter(|a| a.miss_gate().is_some()) else { return r.comp_frame_checked(comp, time) };
+    let mut opts = r.opts;
+    let mut auto = None;
+    if opts.backend == Backend::Auto {
+        if !r.project.settings.gpu_acceleration {
+            opts.backend = Backend::Cpu;
+        } else if opts.roi.is_none()
+            && let Some(pick) = accel.auto_pick()
+        {
+            let key = AutoKey::new(comp, opts.scale, false);
+            let gpu = pick.choose(key);
+            opts.backend = if gpu { Backend::Gpu } else { Backend::Cpu };
+            auto = Some((key, gpu));
+        }
+    }
+    let start = web_time::Instant::now();
+    let renderer = Renderer { opts, ..*r };
+    let image = if opts.backend == Backend::Cpu {
+        renderer.with_accel(None).comp_frame_checked(comp, time)?
+    } else {
+        accel.frame_begin();
+        let mut complete = None;
+        for _ in 0..MAX_PASSES {
+            accel.pass_begin();
+            let frame = renderer.comp_frame_attempt(comp, time)?;
+            if frame.cpu_retry || !accel.pass_missed() {
+                complete = Some(frame.image);
+                break;
+            }
+            let Some(settle) = accel.settle() else { break };
+            settle.await;
+        }
+        match complete {
+            Some(image) => image,
+            None => renderer.with_accel(None).comp_frame_checked(comp, time)?,
+        }
+    };
+    if let (Some((key, gpu)), Some(pick)) = (auto, accel.auto_pick()) {
+        pick.record(key, gpu, start.elapsed().as_secs_f64() * 1e3);
+    }
+    Ok(image)
+}
 
 /// Passes before a frame gives up on deferred readbacks and renders on the CPU.
 pub const MAX_PASSES: u32 = 24;

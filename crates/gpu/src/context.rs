@@ -369,6 +369,7 @@ impl GpuContext {
         let src = [
             include_str!("shaders/common.wgsl"),
             include_str!("shaders/kernels.wgsl"),
+            include_str!("shaders/bloom.wgsl"),
             include_str!("shaders/classic3d.wgsl"),
             include_str!("shaders/fx_color.wgsl"),
             include_str!("shaders/fx_distort.wgsl"),
@@ -451,6 +452,7 @@ impl GpuContext {
         let pipelines = ENTRIES
             .iter()
             .chain(crate::fx_color::KERNELS)
+            .chain(crate::bloom::KERNELS)
             .chain(crate::fx_distort::KERNELS)
             .chain(crate::fx_generate::KERNELS)
             .chain(crate::fx_key::KERNELS)

@@ -9,6 +9,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod audio_fx;
+pub mod bloom;
 mod blur2;
 mod blur3;
 pub mod camera_tracker;
@@ -391,13 +392,22 @@ impl EffectCtx<'_> {
 }
 
 pub type RenderFn = fn(&EffectCtx, Buf) -> Buf;
+pub type CheckedRenderFn = fn(&EffectCtx, Buf) -> Result<Buf, String>;
+
+/// Legacy kernels retain their existing signature. Checked kernels cannot be represented by
+/// an infallible fallback that would hide a rejected request from preview or export.
+#[derive(Clone, Copy)]
+pub enum EffectRender {
+    Legacy(RenderFn),
+    Checked(CheckedRenderFn),
+}
 
 pub struct EffectSpec {
     pub id: &'static str,
     pub name: &'static str,
     pub category: &'static str,
     pub params: Vec<ParamSpec>,
-    pub render: RenderFn,
+    pub render: EffectRender,
     /// Implemented on the GPU path too (shown with a badge).
     pub gpu: bool,
     /// Supports 32 bpc float (badge).
@@ -425,6 +435,7 @@ pub fn registry() -> &'static [EffectSpec] {
     static R: OnceLock<Vec<EffectSpec>> = OnceLock::new();
     R.get_or_init(|| {
         let mut v = Vec::new();
+        v.push(bloom::spec());
         v.extend(misc::specs());
         v.extend(color_fx::specs());
         v.extend(generate::specs());
@@ -807,6 +818,7 @@ pub const GPU_EFFECTS: &[&str] = &[
     "ec.blur.fastbox",
     "ec.blur.directional",
     "ec.stylize.glow",
+    "ec.stylize.bloom",
     "ec.color.levels",
     "ec.color.curves",
     "ec.color.huesaturation",
@@ -1160,8 +1172,11 @@ pub fn is_time_dependent(id: &str) -> bool {
 }
 
 /// Run an effect on a buffer.
-pub fn apply(spec: &EffectSpec, ctx: &EffectCtx, buf: Buf) -> Buf {
-    (spec.render)(ctx, buf)
+pub fn apply(spec: &EffectSpec, ctx: &EffectCtx, buf: Buf) -> Result<Buf, String> {
+    match spec.render {
+        EffectRender::Legacy(render) => Ok(render(ctx, buf)),
+        EffectRender::Checked(render) => render(ctx, buf),
+    }
 }
 
 /// Test helper: run effect `id` on `img` (scale 1, layer size = image size) with its defaults
@@ -1176,7 +1191,7 @@ pub(crate) fn run_fx(id: &str, vals: &[(&str, Value)], img: Image, time: f64, en
         params.values.insert(k.to_string(), v.clone());
     }
     let ctx = EffectCtx { params: &params, time, layer_size: [img.width as f64, img.height as f64], seed: 1, adjustment: false, env };
-    apply(s, &ctx, Buf { img, offset: [0.0, 0.0], scale: 1.0 })
+    apply(s, &ctx, Buf { img, offset: [0.0, 0.0], scale: 1.0 }).unwrap()
 }
 
 #[cfg(test)]
@@ -1294,7 +1309,7 @@ mod tests {
         for s in registry() {
             let params = Params { values: s.params.iter().map(|p| (p.id.to_string(), p.default.clone())).collect() };
             let ctx = EffectCtx { params: &params, time: 0.5, layer_size: [48.0, 32.0], seed: 1, adjustment: false, env: Default::default() };
-            let out = apply(s, &ctx, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 });
+            let out = apply(s, &ctx, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 }).unwrap();
             assert!(!out.img.is_empty(), "{}", s.id);
             assert!(out.img.data.iter().all(|p| p[3].is_finite() && p[3] >= -1e-4 && p[3] <= 1.0001), "{} alpha out of range", s.id);
         }
@@ -1322,7 +1337,7 @@ mod tests {
             }
             let run = |t: f64| {
                 let ctx = EffectCtx { params: &params, time: t, layer_size: [40.0, 30.0], seed: 7, adjustment: false, env: Default::default() };
-                apply(s, &ctx, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 }).img
+                apply(s, &ctx, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 }).unwrap().img
             };
             let (a, b) = (run(0.0), run(1.37));
             if a != b && !is_time_dependent(s.id) {

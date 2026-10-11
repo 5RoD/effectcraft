@@ -41,6 +41,8 @@ pub struct AutoSaveState {
     pub last_path: Option<String>,
     /// This session owns the crash-recovery sentinel ([`crate::Session::begin_recovery`]).
     pub sentinel: bool,
+    /// This native run's marker, OS lease and pending recovery choices.
+    pub run: crate::recovery_sessions::Run,
 }
 
 /// A background auto-save write ([`AutoSaveState::background`]).
@@ -199,6 +201,12 @@ pub struct Sentinel {
     pub project: Option<String>,
     /// Latest auto-save of this run.
     pub autosave: Option<String>,
+    /// Run-specific rotating slots, so simultaneous instances never replace one another's
+    /// checkpoints. Old markers without this field use the legacy folder.
+    pub autosave_folder: Option<String>,
+    /// Validated relative config-store name of the completed-edit recovery journal.
+    pub edit_journal: Option<String>,
+    pub edit_journal_revision: Option<u64>,
     /// Whether the project had unsaved changes.
     pub dirty: bool,
 }
@@ -211,6 +219,9 @@ pub struct Recovery {
     /// The auto-save to offer (exists on disk).
     pub autosave: Option<String>,
     pub dirty: bool,
+    /// This recovery file was rebuilt from completed edits rather than a timer checkpoint.
+    pub completed_edits: bool,
+    pub warning: Option<String>,
 }
 
 /// At launch: report an unclean previous exit (a leftover sentinel), then start this run's
@@ -218,14 +229,52 @@ pub struct Recovery {
 pub fn begin(store: &dyn ConfigStore, prefs: &Prefs) -> Option<Recovery> {
     let found = store.read(SENTINEL).map(|t| serde_json::from_str::<Sentinel>(&t).unwrap_or_default());
     let _ = store.write(SENTINEL, &serde_json::to_string(&Sentinel { pid: pid(), ..Default::default() }).unwrap_or_default());
-    let s = found?;
+    Some(recover_sentinel(store, prefs, found?))
+}
+
+pub(crate) fn recover_sentinel(store: &dyn ConfigStore, prefs: &Prefs, s: Sentinel) -> Recovery {
     let fallback = store.dir();
     // The worker can finish an atomic checkpoint immediately before the process dies, before
     // the UI has updated the sentinel. Prefer the latest complete slot on disk in that case.
-    let autosave = latest_in(store.files(), prefs, s.project.as_deref(), fallback.as_deref())
+    let mut scoped_prefs = prefs.clone();
+    if let Some(folder) = &s.autosave_folder {
+        scoped_prefs.auto_save.location = "custom".into();
+        scoped_prefs.auto_save.folder = folder.clone();
+    }
+    let autosave = latest_in(store.files(), &scoped_prefs, s.project.as_deref(), fallback.as_deref())
         .map(|p| p.to_string_lossy().to_string())
         .or_else(|| s.autosave.clone().filter(|p| store.files().is_file(Path::new(p))));
-    Some(Recovery { project: s.project, autosave, dirty: s.dirty })
+    let journal = s.edit_journal.as_deref().map(|name| crate::recovery_journal::recover(store, name));
+    let (autosave, completed_edits, warning) = match journal {
+        Some(Ok(mut recovered)) => {
+            if s.edit_journal_revision.is_some_and(|expected| expected > recovered.revision) {
+                recovered.warning = Some("The recovery journal is missing its latest acknowledged record; the surviving journal was preserved.".into());
+            }
+            // A journal can stop on an I/O failure while a later timer checkpoint succeeds.
+            // In that case offer the more recent complete state instead of stale journal data.
+            let newer_checkpoint = autosave
+                .as_deref()
+                .and_then(|path| {
+                    let bytes = store.files().read_bounded(Path::new(path), crate::recovery_journal::MAX_CHECKPOINT_BYTES).ok()?;
+                    #[derive(Deserialize)]
+                    struct Meta {
+                        #[serde(rename = "recoveryRevision")]
+                        revision: Option<u64>,
+                    }
+                    serde_json::from_slice::<Meta>(&bytes).ok()?.revision
+                })
+                .is_some_and(|revision| revision > recovered.revision);
+            if newer_checkpoint { (autosave, false, recovered.warning) } else { (Some(recovered.path), true, recovered.warning) }
+        }
+        Some(Err(e)) => (autosave, false, Some(e.to_string())),
+        None => (autosave, false, None),
+    };
+    let warning = if s.dirty && s.project.is_none() && autosave.is_none() && warning.is_none() {
+        Some("The previous untitled session has no readable recovery checkpoint. Its marker was preserved.".into())
+    } else {
+        warning
+    };
+    Recovery { project: s.project, autosave, dirty: s.dirty, completed_edits, warning }
 }
 
 /// This process id (0 where processes don't exist, e.g. the browser).

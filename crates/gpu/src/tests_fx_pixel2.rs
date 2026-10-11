@@ -95,7 +95,7 @@ pub(crate) fn direct_env(id: &str, vals: &[(&str, Value)], allow: f64) {
             }
             let env = EffectEnv { masks: &masks, host: Some(&host), comp_time: 0.25, frame_rate: 30.0, ..Default::default() };
             let ctx = || effectcraft_effects::EffectCtx { params: &params, time: 0.25, layer_size: SIZE, seed: 11, adjustment, env };
-            let cpu = (spec.render)(&ctx(), buf.clone());
+            let cpu = effectcraft_effects::apply(spec, &ctx(), buf.clone()).unwrap();
             let out =
                 effectcraft_render::Accelerator::effects(g, &[effectcraft_render::FxStep { spec, ctx: ctx() }], &buf, None).expect("the GPU runs the effect");
             assert_eq!((out.offset, out.scale), (cpu.offset, cpu.scale), "{id}: geometry");

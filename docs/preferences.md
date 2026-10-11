@@ -42,6 +42,7 @@ Commands (CLI, MCP, control channel):
 - `project.useTemplate`: New Project Loads Template
 - `project.templatePath`: Template Project
 - `autoSave.enabled`: Automatically Save Projects
+- `autoSave.protectEveryEdit`: Protect Every Completed Edit (native recovery journal)
 - `autoSave.intervalMinutes`: Save Every
 - `autoSave.maxVersions`: Maximum Project Versions
 - `autoSave.location`: Auto-Save Location

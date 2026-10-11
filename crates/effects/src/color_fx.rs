@@ -7,7 +7,7 @@ use effectcraft_project::ParamUi;
 use crate::{Buf, EffectCtx, EffectSpec, col, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
-    EffectSpec { id, name, category: "Color Correction", params, render, gpu: false, float: true }
+    EffectSpec { id, name, category: "Color Correction", params, render: crate::EffectRender::Legacy(render), gpu: false, float: true }
 }
 
 fn mix(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
@@ -995,7 +995,7 @@ pub fn specs() -> Vec<EffectSpec> {
                 p("verticalFeather", "Vertical Feather", num(0.0), slider(0.0, 5000.0, 0.0, 100.0, 1)),
                 p("opacity", "Opacity", num(100.0), slider(0.0, 100.0, 0.0, 100.0, 1)),
             ],
-            render: fill,
+            render: crate::EffectRender::Legacy(fill),
             gpu: false,
             float: true,
         },

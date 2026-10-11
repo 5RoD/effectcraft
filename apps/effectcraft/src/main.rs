@@ -132,7 +132,7 @@ fn main() -> eframe::Result {
             session.check_footage_on_open = true;
             session.autosave.background = true;
             // Settings, shortcut presets and the crash-recovery sentinel live in the platform
-            // config directory. Agent-driven runs (`--control`) skip crash recovery.
+            // config directory. Control-enabled desktop runs receive the same protection.
             if let Some(dir) = effectcraft_host::config_dir() {
                 // WebAssembly effect plug-ins in <config>/Plug-ins load before the menus are built.
                 let plugins = dir.join("Plug-ins");
@@ -142,7 +142,7 @@ fn main() -> eframe::Result {
                 session.config = Some(std::sync::Arc::new(effectcraft_engine::config::DirConfig::new(dir)));
             }
             session.load_settings();
-            let recovery = if control_port.is_none() { session.begin_recovery() } else { None };
+            let recovery = session.begin_recovery();
             let project = files.iter().find(|f| f.ends_with(".ecproj")).cloned();
             if let Some(p) = project {
                 if let Err(e) = session.execute("file.open", json!({"path": p})) {

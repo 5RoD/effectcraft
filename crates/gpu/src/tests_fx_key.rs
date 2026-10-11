@@ -244,7 +244,7 @@ fn arithmetic_preserves_positive_subepsilon_alpha() {
     let ctx = || effectcraft_effects::EffectCtx { params: &params, time: 0.0, layer_size: size, seed: 0, adjustment: false, env: Default::default() };
     let img = effectcraft_raster::Image::filled(1, 1, [1.0, 0.0, 0.0, 5e-7]);
     let buf = effectcraft_effects::Buf { img, offset: [0.0; 2], scale: 1.0 };
-    let cpu = (spec.render)(&ctx(), buf.clone());
+    let cpu = effectcraft_effects::apply(spec, &ctx(), buf.clone()).unwrap();
     let out = effectcraft_render::Accelerator::effects(g, &[effectcraft_render::FxStep { spec, ctx: ctx() }], &buf, None).unwrap();
     assert_eq!(cpu.img.get(0, 0), [1.0, 0.0, 0.0, 5e-7]);
     assert_eq!(out.img.get(0, 0), cpu.img.get(0, 0));

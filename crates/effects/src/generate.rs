@@ -12,7 +12,7 @@ use crate::{Buf, EffectCtx, EffectSpec, col, num, p, popup, slider};
 pub(crate) const SIZE_FROM: [&str; 3] = ["Corner Point", "Width Slider", "Width & Height Sliders"];
 
 fn spec(id: &'static str, name: &'static str, category: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
-    EffectSpec { id, name, category, params, render, gpu: false, float: true }
+    EffectSpec { id, name, category, params, render: crate::EffectRender::Legacy(render), gpu: false, float: true }
 }
 
 /// Blend a generated straight colour `g` (with alpha `ga`) over the original pixel.

@@ -10,7 +10,7 @@ use crate::util::pin_rect;
 use crate::{Buf, EffectCtx, EffectSpec, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
-    EffectSpec { id, name, category: "Distort", params, render, gpu: false, float: true }
+    EffectSpec { id, name, category: "Distort", params, render: crate::EffectRender::Legacy(render), gpu: false, float: true }
 }
 
 /// Resample through `f(x, y) -> source point` (pixel coordinates, centres at +0.5).
@@ -491,7 +491,7 @@ mod tests {
             params.values.insert(k.to_string(), v.clone());
         }
         let ctx = EffectCtx { params: &params, time: 0.0, layer_size: ls, seed: 3, adjustment: false, env: Default::default() };
-        crate::apply(s, &ctx, Buf { img: im, offset: [0.0, 0.0], scale: 1.0 })
+        crate::apply(s, &ctx, Buf { img: im, offset: [0.0, 0.0], scale: 1.0 }).unwrap()
     }
 
     fn differs(a: Px4, b: Px4) -> bool {

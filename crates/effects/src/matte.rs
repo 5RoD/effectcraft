@@ -10,7 +10,7 @@ use crate::util::{Plane, gauss_plane, guided_filter, morph_frac, morph_plane, pr
 use crate::{Buf, EffectCtx, EffectSpec, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
-    EffectSpec { id, name, category: "Matte", params, render, gpu: false, float: true }
+    EffectSpec { id, name, category: "Matte", params, render: crate::EffectRender::Legacy(render), gpu: false, float: true }
 }
 
 fn matte_view(b: &mut Buf) {
@@ -342,7 +342,7 @@ mod tests {
         }
         let ctx =
             EffectCtx { params: &params, time: 0.0, layer_size: [img.width as f64, img.height as f64], seed: 1, adjustment: true, env: Default::default() };
-        apply(s, &ctx, Buf { img, offset: [0.0, 0.0], scale: 1.0 }).img
+        apply(s, &ctx, Buf { img, offset: [0.0, 0.0], scale: 1.0 }).unwrap().img
     }
 
     fn alpha_sum(img: &Image) -> f32 {

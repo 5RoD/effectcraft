@@ -12,7 +12,7 @@ use crate::util::{Plane, gauss_plane, layer_or_self, premul, unpremul};
 use crate::{Buf, EffectCtx, EffectSpec, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
-    EffectSpec { id, name, category: "Noise & Grain", params, render, gpu: false, float: true }
+    EffectSpec { id, name, category: "Noise & Grain", params, render: crate::EffectRender::Legacy(render), gpu: false, float: true }
 }
 
 fn pct() -> ParamUi {

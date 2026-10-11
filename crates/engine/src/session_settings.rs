@@ -176,8 +176,13 @@ impl Session {
         self.prefs.push_recent(path);
         self.save_prefs();
         let _ = self.autosave_wait();
-        self.autosave =
-            autosave::AutoSaveState { last: self.autosave.last, sentinel: self.autosave.sentinel, background: self.autosave.background, ..Default::default() };
+        self.autosave = autosave::AutoSaveState {
+            last: self.autosave.last,
+            sentinel: self.autosave.sentinel,
+            background: self.autosave.background,
+            run: self.autosave.run.clone(),
+            ..Default::default()
+        };
         self.update_sentinel();
     }
 
@@ -186,14 +191,38 @@ impl Session {
         if let Some(c) = &self.config
             && self.autosave.sentinel
         {
-            let s = Sentinel { pid: autosave::pid(), project: self.path.clone(), autosave: self.autosave.last_path.clone(), dirty: self.needs_save() };
-            autosave::update(c.as_ref(), &s);
+            let s = Sentinel {
+                pid: autosave::pid(),
+                project: self.path.clone(),
+                autosave: self.autosave.last_path.clone(),
+                autosave_folder: self.autosave_folder().map(|p| p.to_string_lossy().into_owned()),
+                dirty: self.needs_save(),
+                edit_journal: self.recovery_journal.name.clone(),
+                edit_journal_revision: self.recovery_journal.saved_revision,
+            };
+            if let Err(e) = self.autosave.run.update(c.as_ref(), &s) {
+                log::warn!("cannot update the recovery marker: {e}");
+            }
         }
     }
 
     /// Fallback folder for auto-saves of untitled projects (next to the settings).
     pub fn default_autosave_root(&self) -> Option<std::path::PathBuf> {
         self.config.as_ref().and_then(|c| c.dir())
+    }
+
+    pub fn autosave_folder(&self) -> Option<std::path::PathBuf> {
+        let root = self.default_autosave_root();
+        autosave::folder(&self.prefs, self.path.as_deref(), root.as_deref()).map(|base| self.autosave.run.autosave_folder(base))
+    }
+
+    pub(crate) fn autosave_prefs(&self) -> crate::prefs::Prefs {
+        let mut prefs = self.prefs.clone();
+        if let Some(folder) = self.autosave_folder() {
+            prefs.auto_save.location = "custom".into();
+            prefs.auto_save.folder = folder.to_string_lossy().into_owned();
+        }
+        prefs
     }
 
     /// Where auto-saves live: the config store's [`crate::config::FileOps`], else the file system.
@@ -214,14 +243,16 @@ impl Session {
         self.autosave_wait()?;
         let root = self.default_autosave_root();
         let fail = |e: std::io::Error| EngineError::Other(format!("auto-save failed: {e}"));
-        let plan = autosave::plan_in(self.file_ops(), &self.prefs, self.path.as_deref(), root.as_deref(), self.autosave.last_slot).map_err(fail)?;
+        let prefs = self.autosave_prefs();
+        let plan = autosave::plan_in(self.file_ops(), &prefs, self.path.as_deref(), root.as_deref(), self.autosave.last_slot).map_err(fail)?;
         if self.autosave.background && !cfg!(target_arch = "wasm32") {
             let project = self.project.clone();
             let history = self.history.clone();
             let config = self.config.clone();
             let job = plan.clone();
+            let revision = self.revision;
             let pending = autosave::PendingWrite::spawn(plan.path.clone(), self.revision, plan.slot, move || {
-                let json = crate::history_file::encode(&project, &history, true).map_err(std::io::Error::other)?;
+                let json = recovery_text(&project, &history, revision).map_err(std::io::Error::other)?;
                 match &config {
                     Some(c) => job.write(c.files(), json.as_bytes()),
                     None => job.write(&crate::config::StdFiles, json.as_bytes()),
@@ -230,7 +261,7 @@ impl Session {
             .map_err(fail)?;
             self.autosave.pending = Some(pending);
         } else {
-            let json = crate::history_file::encode(&self.project, &self.history, true)?;
+            let json = recovery_text(&self.project, &self.history, self.revision)?;
             plan.write(self.file_ops(), json.as_bytes()).map_err(fail)?;
             self.autosave_completed(&plan.path, plan.slot, self.revision);
         }
@@ -293,14 +324,30 @@ impl Session {
     /// cleanly (and the setting asks for it).
     pub fn begin_recovery(&mut self) -> Option<autosave::Recovery> {
         let c = self.config.clone()?;
-        let r = autosave::begin(c.as_ref(), &self.prefs);
+        if self.autosave.sentinel {
+            return self.autosave.run.offered.clone().filter(|_| self.prefs.startup.offer_crash_recovery);
+        }
+        self.autosave.run = match crate::recovery_sessions::Run::begin(c.as_ref(), &self.prefs) {
+            Ok(run) => run,
+            Err(e) => {
+                self.recovery_journal.error = Some(format!("Edit recovery: cannot start recovery protection: {e}"));
+                return None;
+            }
+        };
+        let r = self.autosave.run.offered.clone();
         self.autosave.sentinel = true;
+        self.recovery_journal.active = c.native_recovery_dir().is_some() && !cfg!(target_arch = "wasm32");
+        self.commit_edit_recovery();
         self.update_sentinel();
         r.filter(|_| self.prefs.startup.offer_crash_recovery)
     }
 
     /// Clean exit: remove the crash-recovery sentinel.
     pub fn end_recovery(&mut self) {
+        self.commit_edit_recovery();
+        if self.recovery_journal.error.is_some() {
+            return;
+        }
         if let Err(e) = self.autosave_wait() {
             self.toast(e.to_string());
             return;
@@ -308,8 +355,109 @@ impl Session {
         if let Some(c) = &self.config
             && self.autosave.sentinel
         {
-            autosave::end(c.as_ref());
+            // A headless/control-channel open also resolves the chosen recovery once its
+            // protected replacement has landed. Other pending projects remain recoverable.
+            let opened = self.autosave.run.offered.as_ref().is_some_and(|r| self.path.is_some() && (self.path == r.autosave || self.path == r.project));
+            if opened && let Err(e) = self.autosave.run.resolve(c.as_ref()) {
+                self.toast(format!("Cannot resolve the previous recovery marker: {e}"));
+                return;
+            }
+            if let Err(e) = self.autosave.run.end(c.as_ref()) {
+                self.toast(format!("Cannot close the recovery marker: {e}"));
+                return;
+            }
+            if let Some(name) = &self.recovery_journal.name {
+                crate::recovery_journal::remove(c.as_ref(), name);
+            }
             self.autosave.sentinel = false;
+            self.recovery_journal.active = false;
         }
     }
+
+    /// Complete edits are acknowledged only after the journal's atomic write returns. Errors
+    /// remain visible independently of transient status/toast messages. Retrying creates a
+    /// checked checkpoint containing the whole currently retained branching history.
+    pub fn commit_edit_recovery(&mut self) {
+        if self.recovery_journal.depth > 0 {
+            return;
+        }
+        self.write_edit_recovery();
+    }
+
+    fn write_edit_recovery(&mut self) {
+        if !self.recovery_journal.active || !self.prefs.auto_save.protect_every_edit || self.recovery_journal.error.is_some() {
+            return;
+        }
+        if self.recovery_journal.saved_revision == Some(self.revision) && self.recovery_journal.error.is_none() {
+            return;
+        }
+        let Some(config) = self.config.clone() else { return };
+        if self.recovery_journal.commit(config.as_ref(), &self.project, &self.history, self.path.clone(), self.revision).is_ok() {
+            let sentinel = Sentinel {
+                pid: autosave::pid(),
+                project: self.path.clone(),
+                autosave: self.autosave.last_path.clone(),
+                autosave_folder: self.autosave_folder().map(|p| p.to_string_lossy().into_owned()),
+                dirty: self.needs_save(),
+                edit_journal: self.recovery_journal.name.clone(),
+                edit_journal_revision: self.recovery_journal.saved_revision,
+            };
+            let result = self.autosave.run.update(config.as_ref(), &sentinel);
+            if let Err(e) = result {
+                self.recovery_journal.error = Some(format!("Edit recovery: cannot publish the recovery journal: {e}"));
+                self.recovery_journal.saved_revision = None;
+            } else {
+                self.recovery_journal.cleanup_obsolete(config.as_ref());
+            }
+        }
+    }
+
+    pub fn retry_edit_recovery(&mut self) -> Result<()> {
+        // This read-only command must report its completed write, while a nested script or
+        // batch must never publish an intermediate project before its transaction settles.
+        if self.recovery_journal.depth > 1 {
+            return Err(EngineError::Other("Retry edit recovery after the current script or batch finishes.".into()));
+        }
+        let previous_revision = self.recovery_journal.saved_revision;
+        self.recovery_journal.reset();
+        if !self.autosave.sentinel {
+            let _ = self.begin_recovery();
+        }
+        self.write_edit_recovery();
+        if let Some(error) = &self.recovery_journal.error {
+            self.recovery_journal.saved_revision = previous_revision;
+            return Err(EngineError::Other(error.clone()));
+        }
+        Ok(())
+    }
+
+    /// Resolve one offered crashed session after its file has opened successfully, or after
+    /// the user explicitly dismisses it. Failed opens/writes leave the old marker untouched.
+    pub fn resolve_recovery(&mut self, dismiss: bool) -> Result<Option<autosave::Recovery>> {
+        if !dismiss {
+            if self.recovery_journal.error.is_some()
+                || (self.recovery_journal.active && self.prefs.auto_save.protect_every_edit && self.recovery_journal.saved_revision != Some(self.revision))
+            {
+                return Err(EngineError::Other(
+                    "The recovered project is open, but its new recovery checkpoint could not be stored; the original recovery was preserved.".into(),
+                ));
+            }
+            let opened = self.autosave.run.offered.as_ref().is_some_and(|r| self.path.is_some() && (self.path == r.autosave || self.path == r.project));
+            if !opened {
+                return Err(EngineError::Other("Open the offered recovery successfully before resolving its marker.".into()));
+            }
+        }
+        let c = self.config.clone().ok_or_else(|| EngineError::Other("Recovery storage is unavailable.".into()))?;
+        self.autosave.run.resolve(c.as_ref()).map_err(|e| EngineError::Other(format!("Cannot resolve the recovery marker: {e}")))?;
+        Ok(self.autosave.run.offered.clone())
+    }
+}
+
+fn recovery_text(project: &std::sync::Arc<effectcraft_project::Project>, history: &crate::history::History, revision: u64) -> Result<String> {
+    let mut json = crate::history_file::encode(project, history, true)?;
+    if json.pop() != Some('}') {
+        return Err(EngineError::Other("invalid recovery checkpoint object".into()));
+    }
+    json.push_str(&format!(",\"recoveryRevision\":{revision}}}"));
+    Ok(json)
 }

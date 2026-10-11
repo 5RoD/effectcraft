@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 
 use effectcraft_engine::project::{Comp, ItemId, ItemKind, LayerSource, Node, Project, PropGroup};
 use effectcraft_engine::render::disk_cache::{self, DiskCache};
-use effectcraft_engine::render::{ExprHost, FootageSource, LayerCache, RenderOpts, Renderer};
+use effectcraft_engine::render::{ExprHost, FootageSource, FrameDiagnostics, LayerCache, RenderOpts, Renderer};
 use effectcraft_engine::time::Tick;
 use effectcraft_gpu::{DisplayFrame, Gpu};
 use rayon::prelude::*;
@@ -367,6 +367,7 @@ pub struct Frames {
     pub last_ms: Arc<Mutex<f64>>,
     content_keys: ContentKeys,
     gpu_retired: Arc<AtomicBool>,
+    failures: Arc<Mutex<VecDeque<(FrameKey, String)>>>,
     /// [`comp_content`] identities by (revision, comp), with the project that keeps an identity
     /// found by [`Frames::identity`] in another project.
     identities: Mutex<HashMap<(u64, u64), Identity>>,
@@ -401,6 +402,7 @@ impl Default for Frames {
             last_ms: Arc::new(Mutex::new(0.0)),
             content_keys: Arc::default(),
             gpu_retired: Arc::default(),
+            failures: Arc::default(),
             identities: Mutex::default(),
             bases: Mutex::default(),
             keepers: Mutex::default(),
@@ -635,7 +637,26 @@ impl Frames {
         self.cache.lock().map(|c| c.budget).unwrap_or(0)
     }
 
+    /// A terminal render failure for this exact content/time/options. Edits naturally select
+    /// another key; until then automatic repaint/prefetch must not retry the rejected job.
+    pub fn failure(&self, key: &FrameKey) -> Option<String> {
+        self.failures.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().find(|(k, _)| k == key).map(|(_, message)| message.clone())
+    }
+
+    /// Register a synchronous auxiliary-view failure using the same bounded UI state.
+    pub fn record_failure(&self, key: FrameKey, error: String) {
+        self.worker().fail(key, false, error);
+    }
+
+    pub fn retry(&self, key: &FrameKey) {
+        self.failures.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|(k, _)| k != key);
+        if let Some(ctx) = &self.ctx {
+            ctx.request_repaint();
+        }
+    }
+
     pub fn clear(&self) {
+        self.failures.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
         if let Some(r) = &self.remote {
             r.purge();
         }
@@ -663,7 +684,7 @@ impl Frames {
     }
 
     fn request_with(&self, src: &RenderSource, key: FrameKey, comp: ItemId, t: Tick, opts: RenderOpts, urgent: bool) {
-        if self.is_cached(&key) {
+        if self.is_cached(&key) || self.failure(&key).is_some() {
             return;
         }
         let Ok(mut q) = self.queue.lock() else { return };
@@ -720,6 +741,7 @@ impl Frames {
             last: self.last_ms.clone(),
             content_keys: self.content_keys.clone(),
             gpu_retired: self.gpu_retired.clone(),
+            failures: self.failures.clone(),
         }
     }
 
@@ -804,8 +826,10 @@ impl Frames {
                             let img = egui::ColorImage::from_rgba_premultiplied([f.width as usize, f.height as usize], &f.rgba);
                             fw.finish_key(key, urgent, FrameImage::Cpu(Arc::new(img)), t0);
                         }
+                        Err(e) if e.starts_with("Render failed in comp ") => fw.fail(key, urgent, e),
                         Err(e) => {
-                            // Not rendered (a stale revision, a lost worker): the viewer asks again.
+                            // Transport/stale-revision misses remain retryable. A contextual
+                            // render failure is terminal for this content/time/options key.
                             log::debug!("remote frame: {e}");
                             fw.release(key, urgent);
                         }
@@ -849,6 +873,7 @@ struct Worker {
     last: Arc<Mutex<f64>>,
     content_keys: ContentKeys,
     gpu_retired: Arc<AtomicBool>,
+    failures: Arc<Mutex<VecDeque<(FrameKey, String)>>>,
 }
 
 impl Worker {
@@ -872,10 +897,9 @@ impl Worker {
         let ci = match from_disk {
             Some(f) => FrameImage::Cpu(Arc::new(egui::ColorImage::from_rgba_premultiplied([f.width as usize, f.height as usize], &f.rgba))),
             None => match self.render_guarded(&job) {
-                Some(ci) => ci,
-                None => {
-                    // Not "in progress" forever: the viewer asks for it again.
-                    self.release(job.key, job.urgent);
+                Ok(ci) => ci,
+                Err(error) => {
+                    self.fail(job.key, job.urgent, error);
                     return true;
                 }
             },
@@ -891,6 +915,17 @@ impl Worker {
             }
         }
         true
+    }
+
+    fn fail(&self, key: FrameKey, urgent: bool, error: String) {
+        let mut failures = self.failures.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        failures.retain(|(k, _)| *k != key);
+        if failures.len() >= MAX_KEEPERS {
+            failures.pop_front();
+        }
+        failures.push_back((key, error.chars().take(4096).collect()));
+        drop(failures);
+        self.release(key, urgent);
     }
 
     /// Store a finished frame and release its job.
@@ -926,14 +961,20 @@ impl Worker {
         }
     }
 
-    /// [`Worker::render_job`], again on the CPU if it panicked (the panic hook has logged it);
-    /// `None` if that panicked too.
-    fn render_guarded(&self, job: &Job) -> Option<FrameImage> {
-        let attempt = |gpu: bool| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.render_job(job, gpu))).ok();
-        attempt(true).or_else(|| {
-            log::error!("a frame render panicked (frame {})", job.key.frame);
-            job.src.gpu.as_ref().and_then(|_| attempt(false))
-        })
+    /// Last-resort unwind guard; checked effect errors remain visible without repeated jobs.
+    fn render_guarded(&self, job: &Job) -> Result<FrameImage, String> {
+        let attempt = |gpu| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.render_job(job, gpu)));
+        match attempt(true) {
+            Ok(result) => result,
+            Err(_) => {
+                log::error!("a frame render panicked (frame {})", job.key.frame);
+                if job.src.gpu.is_some() {
+                    attempt(false).map_err(|_| "Rendering failed unexpectedly; edit the project or retry this frame".to_string())?
+                } else {
+                    Err("Rendering failed unexpectedly; edit the project or retry this frame".into())
+                }
+            }
+        }
     }
 
     /// A failed scoped attempt retries on CPU. Retired contexts cannot recover by reducing
@@ -955,13 +996,15 @@ impl Worker {
             return None;
         }
         let g = job.src.gpu.as_ref()?;
+        let diagnostics = FrameDiagnostics::default();
         let mut r = Renderer::new(&job.src.project, job.src.footage.as_ref(), job.opts);
+        r.diagnostics = Some(&diagnostics);
         r.expr = job.src.expr.as_deref();
         r.cache = Some(&job.src.layer_cache);
         r.accel = Some(g as &dyn effectcraft_engine::render::Accelerator);
         r.active_accel()?;
         match g.within_memory(|| g.render_display(&r, job.comp, job.t)) {
-            Ok(f) => f.map(|f| FrameImage::Gpu(Arc::new(f))),
+            Ok(f) => diagnostics.result(f).ok().flatten().map(|f| FrameImage::Gpu(Arc::new(f))),
             Err(e) => {
                 self.gpu_attempt_failed(g, &e);
                 None
@@ -970,8 +1013,10 @@ impl Worker {
     }
 
     /// Render a frame; `gpu: false` keeps it off the GPU compositor.
-    fn render_job(&self, job: &Job, gpu: bool) -> FrameImage {
+    fn render_job(&self, job: &Job, gpu: bool) -> Result<FrameImage, String> {
+        let diagnostics = FrameDiagnostics::default();
         let mut r = Renderer::new(&job.src.project, job.src.footage.as_ref(), job.opts);
+        r.diagnostics = Some(&diagnostics);
         r.expr = job.src.expr.as_deref();
         let gpu_allowed = gpu && !self.gpu_retired.load(Ordering::Acquire);
         // A failed GPU attempt may have populated intermediate entries before its scope
@@ -993,6 +1038,9 @@ impl Worker {
                 let t0 = web_time::Instant::now();
                 match g.within_memory(|| g.render_display(&r, job.comp, job.t)) {
                     Ok(Some(f)) => {
+                        if diagnostics.failed() {
+                            return self.render_job(job, false);
+                        }
                         if let Some((p, key)) = auto {
                             // Time the GPU's work, not just its recording.
                             g.wait();
@@ -1001,9 +1049,12 @@ impl Worker {
                             }
                             p.record(key, true, t0.elapsed().as_secs_f64() * 1000.0);
                         }
-                        return FrameImage::Gpu(Arc::new(f));
+                        return Ok(FrameImage::Gpu(Arc::new(f)));
                     }
                     Ok(None) => {
+                        if diagnostics.failed() {
+                            return self.render_job(job, false);
+                        }
                         if let Some((p, key)) = auto {
                             p.declined(key);
                         }
@@ -1015,23 +1066,24 @@ impl Worker {
                 }
             }
             let t0 = web_time::Instant::now();
-            let img = to_color_image(&r.comp_frame_cpu(job.comp, job.t));
+            let image = r.comp_frame_cpu_checked(job.comp, job.t).map_err(|error| error.to_string())?;
+            let img = to_color_image(&image);
             if let Some((p, key)) = auto {
                 p.record(key, false, t0.elapsed().as_secs_f64() * 1000.0);
             }
-            return FrameImage::Cpu(Arc::new(img));
+            return Ok(FrameImage::Cpu(Arc::new(img)));
         }
         if let Some(g) = gpu {
             // The GPU composites and the frame is read back.
-            return match g.within_memory(|| r.comp_frame(job.comp, job.t)) {
-                Ok(img) => FrameImage::Cpu(Arc::new(to_color_image(&img))),
+            return match g.within_memory(|| r.comp_frame_checked(job.comp, job.t)) {
+                Ok(result) => result.map(|image| FrameImage::Cpu(Arc::new(to_color_image(&image)))).map_err(|error| error.to_string()),
                 Err(e) => {
                     self.gpu_attempt_failed(g, &e);
                     self.render_job(job, false)
                 }
             };
         }
-        FrameImage::Cpu(Arc::new(to_color_image(&r.comp_frame(job.comp, job.t))))
+        r.comp_frame_checked(job.comp, job.t).map(|image| FrameImage::Cpu(Arc::new(to_color_image(&image)))).map_err(|error| error.to_string())
     }
 }
 
@@ -1159,6 +1211,113 @@ mod tests {
         assert!(footage.0.load(Ordering::SeqCst) > 0, "the render reached the footage");
         assert_eq!(f.inflight(), 0, "released");
         assert!(!f.is_cached(&key));
+    }
+
+    #[test]
+    fn checked_bloom_preview_failure_is_terminal_uncached_and_repairable() {
+        use effectcraft_engine::render::disk_cache::Kind;
+        use effectcraft_engine::{Session, keyframe::Value, project::LayerId};
+        use serde_json::json;
+        let mut session = Session::default();
+        let cid = ItemId(session.execute("comp.new", json!({"width": 8, "height": 8, "duration": 1})).unwrap()["comp"].as_u64().unwrap());
+        let layer = session.execute("layer.newSolid", json!({"color": "#ffffff"})).unwrap()["layer"].as_u64().unwrap();
+        session.execute("effect.apply", json!({"layers": [layer], "effect": "Native Bloom"})).unwrap();
+        Arc::make_mut(&mut session.project).comp_mut(cid).unwrap().layer_mut(LayerId(layer)).unwrap().props.prop_mut("effects/#1/radius").unwrap().value =
+            Value::Scalar(f64::MAX);
+        let directory = std::env::temp_dir().join(format!("ec-checked-bloom-preview-{}", std::process::id()));
+        let disk = DiskCache::open(&directory, 1024 * 1024).unwrap();
+        let mut source = RenderSource {
+            project: session.project.clone(),
+            footage: session.footage.clone(),
+            expr: None,
+            layer_cache: Arc::default(),
+            gpu: None,
+            gpu_display: false,
+            disk: Some(disk.clone()),
+        };
+        // Drive the queue synchronously, avoiding timing-dependent worker assertions.
+        let frames = Frames { remote: Some(Arc::new(ParkedRemote)), ..Default::default() };
+        let key = FrameKey { comp: cid.0, ..key(1, 0, 0) };
+        frames.request_urgent(&source, key, cid, Tick::ZERO, RenderOpts::default());
+        assert!(frames.worker().run_next());
+        assert!(frames.failure(&key).unwrap().contains("ec.stylize.bloom"));
+        assert!(!frames.is_cached(&key));
+        assert_eq!(frames.inflight(), 0);
+        assert!(!frames.urgent_pending());
+        assert_eq!(source.layer_cache.stats().entries, 0);
+        assert!(!disk.contains(Kind::Frame, frame_disk_key(&frames.content_keys, &source.project, &key, opts_hash(&RenderOpts::default()))));
+        for _ in 0..100 {
+            frames.request_urgent(&source, key, cid, Tick::ZERO, RenderOpts::default());
+        }
+        assert!(frames.queue.lock().unwrap().jobs.is_empty(), "repaints cannot loop on a terminal failed frame");
+        frames.retry(&key);
+        assert!(frames.failure(&key).is_none());
+        Arc::make_mut(&mut source.project).comp_mut(cid).unwrap().layer_mut(LayerId(layer)).unwrap().props.prop_mut("effects/#1/radius").unwrap().value =
+            Value::Scalar(0.0);
+        let repaired = FrameKey { content: 2, revision: 2, ..key };
+        frames.request_urgent(&source, repaired, cid, Tick::ZERO, RenderOpts::default());
+        assert!(frames.worker().run_next());
+        assert!(frames.is_cached(&repaired));
+        disk.flush();
+        drop(source);
+        drop(disk);
+        drop(frames);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn checked_raster_preview_failure_preserves_the_previous_cached_frame_and_document() {
+        use effectcraft_engine::Session;
+        use serde_json::json;
+        let mut session = Session::default();
+        let cid = ItemId(session.execute("comp.new", json!({"width": 8, "height": 8, "duration": 1})).unwrap()["comp"].as_u64().unwrap());
+        session.execute("layer.newSolid", json!({"color": "#ffffff"})).unwrap();
+        let original = serde_json::to_vec(&session.project).unwrap();
+        let source = RenderSource {
+            project: session.project.clone(),
+            footage: session.footage.clone(),
+            expr: None,
+            layer_cache: Arc::default(),
+            gpu: None,
+            gpu_display: false,
+            disk: None,
+        };
+        let frames = Frames { remote: Some(Arc::new(ParkedRemote)), ..Default::default() };
+        let good = FrameKey { comp: cid.0, ..key(1, 0, 0) };
+        frames.request_urgent(&source, good, cid, Tick::ZERO, RenderOpts::default());
+        assert!(frames.worker().run_next());
+        let previous = frames.get(&good).unwrap();
+        let invalid = FrameKey { opts: 2, ..good };
+        frames.request_urgent(
+            &source,
+            invalid,
+            cid,
+            Tick::ZERO,
+            RenderOpts { roi: Some([0.0, 0.0, f64::from(u32::MAX), f64::from(u32::MAX)]), ..Default::default() },
+        );
+        assert!(frames.worker().run_next());
+        assert!(frames.failure(&invalid).unwrap().contains("raster geometry"));
+        assert!(!frames.is_cached(&invalid));
+        assert_eq!(frames.inflight(), 0);
+        let FrameImage::Cpu(previous) = previous else { panic!("CPU fixture") };
+        let FrameImage::Cpu(retained) = frames.get(&good).unwrap() else { panic!("CPU fixture") };
+        assert!(Arc::ptr_eq(&previous, &retained), "the last completed frame stays available");
+        assert_eq!(serde_json::to_vec(&session.project).unwrap(), original);
+        frames.retry(&invalid);
+        frames.request_urgent(&source, invalid, cid, Tick::ZERO, RenderOpts::default());
+        assert!(frames.worker().run_next());
+        assert!(frames.is_cached(&invalid));
+        assert!(frames.failure(&invalid).is_none());
+    }
+
+    struct ParkedRemote;
+    impl RemoteFrames for ParkedRemote {
+        fn slots(&self) -> usize {
+            0
+        }
+        fn start(&self, _job: RemoteJob, _done: RemoteDone) {
+            panic!("manual test queue must not dispatch remotely")
+        }
     }
 
     /// Each time the GPU runs out of memory, half as many GPU frames are kept, down to a floor.

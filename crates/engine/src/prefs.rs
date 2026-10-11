@@ -107,6 +107,8 @@ page!(ProjectPrefs {
 
 page!(AutoSave {
     enabled: bool = true,
+    /// Durable recovery of completed native edits, separate from rotating auto-save files.
+    protect_every_edit: bool = true,
     interval_minutes: u32 = 20,
     /// Fast recovery checkpoints; zero uses the minute-based interval instead.
     interval_seconds: u32 = 30,
@@ -964,6 +966,7 @@ pub fn pages() -> Vec<Page> {
                 s("project.templatePath", "Template Project", Kind::Path, true),
                 Section("Auto-Save"),
                 s("autoSave.enabled", "Automatically Save Projects", B, true),
+                s("autoSave.protectEveryEdit", "Protect Every Completed Edit", B, true),
                 s("autoSave.intervalMinutes", "Save Every", Kind::Int(1, 240, "Minutes"), true),
                 s("autoSave.intervalSeconds", "Recovery Checkpoints", Kind::Int(0, 3600, "Seconds (0 uses Save Every)"), true),
                 s("autoSave.maxVersions", "Maximum Project Versions", Kind::Int(1, 99, ""), true),

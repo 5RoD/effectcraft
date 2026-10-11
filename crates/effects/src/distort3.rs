@@ -17,7 +17,7 @@ use crate::util::{Plane, dist_to_poly, gauss_plane, layer_or_self, pick, point_i
 use crate::{Buf, EffectCtx, EffectSpec, col, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
-    EffectSpec { id, name, category: "Distort", params, render, gpu: false, float: true }
+    EffectSpec { id, name, category: "Distort", params, render: crate::EffectRender::Legacy(render), gpu: false, float: true }
 }
 
 fn pt(x: f64, y: f64) -> Value {
@@ -1029,7 +1029,7 @@ mod tests {
         }
         let env = EffectEnv { masks, ..Default::default() };
         let ctx = EffectCtx { params: &params, time: 0.5, layer_size: ls, seed: 1, adjustment: false, env };
-        crate::apply(s, &ctx, Buf { img: im, offset: [0.0, 0.0], scale: 1.0 })
+        crate::apply(s, &ctx, Buf { img: im, offset: [0.0, 0.0], scale: 1.0 }).unwrap()
     }
 
     fn maxd(a: &Image, b: &Image) -> f32 {
@@ -1201,8 +1201,8 @@ mod tests {
         params.values.insert("top".into(), pt(20.0, 0.0));
         params.values.insert("base".into(), pt(20.0, 40.0));
         let ctx = EffectCtx { params: &params, time: 0.0, layer_size: [40.0, 40.0], seed: 1, adjustment: false, env: Default::default() };
-        let full = crate::apply(s, &ctx, Buf { img: img(40, 40), offset: [0.0; 2], scale: 1.0 });
-        let half = crate::apply(s, &ctx, Buf { img: effectcraft_raster::resample(&img(40, 40), 20, 20), offset: [0.0; 2], scale: 0.5 });
+        let full = crate::apply(s, &ctx, Buf { img: img(40, 40), offset: [0.0; 2], scale: 1.0 }).unwrap();
+        let half = crate::apply(s, &ctx, Buf { img: effectcraft_raster::resample(&img(40, 40), 20, 20), offset: [0.0; 2], scale: 0.5 }).unwrap();
         let a = full.img.sample_bilinear(20.0, 4.0)[3];
         let b = half.img.sample_bilinear(10.0, 2.0)[3];
         assert!((a - b).abs() < 0.3);

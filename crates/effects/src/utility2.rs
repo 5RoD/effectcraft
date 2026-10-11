@@ -40,7 +40,7 @@ pub fn specs() -> Vec<EffectSpec> {
             p("gain", "Gain", num(1.0), slider(1.0, 100.0, 1.0, 100.0, 2)),
             p("gamma", "Gamma", num(1.0), slider(0.1, 10.0, 0.1, 3.0, 2)),
         ],
-        render: hdr_compander,
+        render: crate::EffectRender::Legacy(hdr_compander),
         gpu: false,
         float: true,
     }]

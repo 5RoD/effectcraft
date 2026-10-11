@@ -46,7 +46,7 @@ fn box_h_into(src: &[Px], out: &mut [Px], w: usize, r: usize, repeat: bool) {
 }
 
 /// One vertical box pass (same semantics as [`box_h_into`] along columns).
-fn box_v_into(src: &[Px], out: &mut [Px], w: usize, h: usize, r: usize, repeat: bool) {
+fn box_v_into(src: &[Px], out: &mut [Px], w: usize, h: usize, r: usize, repeat: bool, scratch: Option<&mut [Px]>) {
     if r == 0 {
         out.copy_from_slice(src);
         return;
@@ -62,9 +62,9 @@ fn box_v_into(src: &[Px], out: &mut [Px], w: usize, h: usize, r: usize, repeat: 
             Some(&src[i as usize * w..(i as usize + 1) * w])
         }
     };
-    out.par_chunks_mut(w * block).enumerate().for_each(|(bi, chunk)| {
+    let run = |bi: usize, chunk: &mut [Px], acc: &mut [Px]| {
         let ya = (bi * block) as isize;
-        let mut acc = vec![[0.0f32; 4]; w];
+        acc.fill([0.0; 4]);
         for i in ya - r as isize..=ya + r as isize {
             if let Some(rw) = row(i) {
                 for (a, p) in acc.iter_mut().zip(rw) {
@@ -76,7 +76,7 @@ fn box_v_into(src: &[Px], out: &mut [Px], w: usize, h: usize, r: usize, repeat: 
         }
         for (yy, o) in chunk.chunks_mut(w).enumerate() {
             let y = ya + yy as isize;
-            for (o, a) in o.iter_mut().zip(&acc) {
+            for (o, a) in o.iter_mut().zip(acc.iter()) {
                 *o = a.map(|v| v * norm);
             }
             match (row(y + r as isize + 1), row(y - r as isize)) {
@@ -104,7 +104,12 @@ fn box_v_into(src: &[Px], out: &mut [Px], w: usize, h: usize, r: usize, repeat: 
                 (None, None) => {}
             }
         }
-    });
+    };
+    if let Some(scratch) = scratch {
+        out.par_chunks_mut(w * block).zip(scratch.par_chunks_mut(w)).enumerate().for_each(|(bi, (chunk, acc))| run(bi, chunk, acc));
+    } else {
+        out.par_chunks_mut(w * block).enumerate().for_each(|(bi, chunk)| run(bi, chunk, &mut vec![[0.0; 4]; w]));
+    }
 }
 
 /// Run horizontal passes with radii `rx` then vertical passes with radii `ry`.
@@ -119,13 +124,57 @@ fn box_passes(img: &Image, rx: &[usize], ry: &[usize], repeat: bool) -> Image {
     for (i, &(vertical, r)) in passes.iter().enumerate() {
         let src: &[Px] = if i == 0 { &img.data } else { &a.data };
         if vertical {
-            box_v_into(src, &mut b.data, w, h, r, repeat);
+            box_v_into(src, &mut b.data, w, h, r, repeat, None);
         } else {
             box_h_into(src, &mut b.data, w, r, repeat);
         }
         std::mem::swap(&mut a, &mut b);
     }
     a
+}
+
+/// Fallible transparent-border box passes for a validated bounded renderer. The fixed arrays
+/// bound pass counts; allocation failure is returned instead of aborting a large image request.
+/// Existing Gaussian/box APIs retain their behavior.
+pub fn box_passes_checked(img: &Image, rx: [usize; 3], ry: [usize; 3]) -> Result<Image, String> {
+    let (w, h) = (img.width as usize, img.height as usize);
+    let len = w.checked_mul(h).ok_or("blur image dimensions overflow")?;
+    if w == 0 || h == 0 || w > 16384 || h > 16384 || len > 32 * 1024 * 1024 || img.data.len() != len {
+        return Err("blur requires a valid image of at most 32 million pixels and 16384 pixels per dimension".into());
+    }
+    if rx.iter().chain(&ry).any(|&r| r > 4096) {
+        return Err("blur box radius exceeds 4096 rendered pixels".into());
+    }
+    let allocate = || -> Result<Image, String> {
+        let mut data = vec![];
+        data.try_reserve_exact(len).map_err(|error| format!("cannot allocate blur scratch: {error}"))?;
+        data.resize(len, [0.0; 4]);
+        Ok(Image { width: img.width, height: img.height, data })
+    };
+    let mut a = allocate()?;
+    let mut b = allocate()?;
+    // A block has at least 32 rows. Reserve every possible block's column accumulator
+    // fallibly, once, so the parallel vertical loop cannot make infallible allocations.
+    let scratch_len = w.checked_mul(h.div_ceil(32)).ok_or("blur accumulator length overflow")?;
+    let mut scratch = vec![];
+    scratch.try_reserve_exact(scratch_len).map_err(|error| format!("cannot allocate blur accumulators: {error}"))?;
+    scratch.resize(scratch_len, [0.0; 4]);
+    let mut first = true;
+    for (vertical, radius) in rx.into_iter().map(|radius| (false, radius)).chain(ry.into_iter().map(|radius| (true, radius))).filter(|(_, radius)| *radius > 0)
+    {
+        let src = if first { &img.data } else { &a.data };
+        if vertical {
+            box_v_into(src, &mut b.data, w, h, radius, false, Some(&mut scratch));
+        } else {
+            box_h_into(src, &mut b.data, w, radius, false);
+        }
+        std::mem::swap(&mut a, &mut b);
+        first = false;
+    }
+    if first {
+        a.data.copy_from_slice(&img.data);
+    }
+    Ok(a)
 }
 
 /// Box radii for `n` passes approximating a Gaussian of `sigma` (Kovesi / "boxes for Gauss").
@@ -288,5 +337,29 @@ mod tests {
         let r = box_radii(10.0, 3);
         assert_eq!(r.len(), 3);
         assert!(r.iter().all(|&v| (7..=10).contains(&v)), "{r:?}");
+    }
+
+    #[test]
+    fn checked_box_passes_match_existing_transparent_filter() {
+        let mut image = Image::new(53, 301);
+        for y in 0..301 {
+            for x in 0..53 {
+                let value = crate::hash_noise(x, y, 3);
+                image.set(x, y, [value * 2.0, value, value * 0.5, value]);
+            }
+        }
+        for radii in [[0, 0, 0], [1, 2, 2], [5, 8, 9], [16, 15, 16]] {
+            let checked = box_passes_checked(&image, radii, radii).unwrap();
+            let existing = box_passes(&image, &radii, &radii, false);
+            assert_eq!(checked, existing);
+        }
+    }
+
+    #[test]
+    fn checked_box_passes_reject_hostile_storage_and_radius() {
+        for image in [Image::new(0, 0), Image { width: u32::MAX, height: 1, data: vec![] }, Image { width: 2, height: 2, data: vec![[0.0; 4]] }] {
+            assert!(box_passes_checked(&image, [1; 3], [1; 3]).is_err());
+        }
+        assert!(box_passes_checked(&Image::new(1, 1), [usize::MAX; 3], [1; 3]).is_err());
     }
 }

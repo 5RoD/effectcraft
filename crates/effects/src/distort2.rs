@@ -24,7 +24,7 @@ use crate::util::{SRC_NAMES, Src, fit_layer, layer_rect, lerp4, map_xy, pick, pi
 use crate::{Buf, EffectCtx, EffectSpec, col, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
-    EffectSpec { id, name, category: "Distort", params, render, gpu: false, float: true }
+    EffectSpec { id, name, category: "Distort", params, render: crate::EffectRender::Legacy(render), gpu: false, float: true }
 }
 
 fn pt(x: f64, y: f64) -> Value {
@@ -908,7 +908,7 @@ mod tests {
             params.values.insert(k.to_string(), v.clone());
         }
         let ctx = EffectCtx { params: &params, time: 0.5, layer_size: ls, seed: 3, adjustment: false, env: Default::default() };
-        crate::apply(s, &ctx, Buf { img, offset: [0.0, 0.0], scale: 1.0 })
+        crate::apply(s, &ctx, Buf { img, offset: [0.0, 0.0], scale: 1.0 }).unwrap()
     }
 
     fn max_diff(a: &Image, b: &Image) -> f32 {
@@ -1055,7 +1055,7 @@ mod tests {
             params.values.insert("displacementMapBehavior".into(), Value::Enum(behavior));
             let env = crate::EffectEnv { host: Some(&host), ..Default::default() };
             let ctx = EffectCtx { params: &params, time: 0.0, layer_size: [32.0, 24.0], seed: 1, adjustment: false, env };
-            let o = crate::apply(s, &ctx, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 });
+            let o = crate::apply(s, &ctx, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 }).unwrap();
             if behavior == 0 {
                 // Center Map: the 8×8 map covers only the middle; outside it nothing moves.
                 assert_eq!(o.img.get(2, 2), img.get(2, 2));

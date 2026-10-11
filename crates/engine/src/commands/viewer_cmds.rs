@@ -157,7 +157,7 @@ fn take_snapshot(s: &mut Session, p: &Value) -> Result<Value> {
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     let t = s.time_of(cid);
     let scale = f_p(p, "scale").unwrap_or(1.0).clamp(0.05, 1.0);
-    let img = s.render(cid, t, RenderOpts { scale, guides: true, view: s.view_camera(cid).filter(|_| comp.has_3d()), ..Default::default() });
+    let img = s.render_checked(cid, t, RenderOpts { scale, guides: true, view: s.view_camera(cid).filter(|_| comp.has_3d()), ..Default::default() })?;
     let (w, h) = (img.width, img.height);
     s.snapshot = Some(Snapshot { comp: cid, time: t, scale, image: std::sync::Arc::new(img) });
     s.events.push(crate::Event::ProjectChanged { revision: s.revision });

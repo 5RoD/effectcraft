@@ -131,7 +131,7 @@ fn render(set: &Set, time: f64) -> Image {
     let host = Host;
     let env = EffectEnv { host: Some(&host), frame_rate: FPS, comp_time: time, ..Default::default() };
     let ctx = EffectCtx { params: &params, time, layer_size: size, seed: 1, adjustment: false, env };
-    apply(spec, &ctx, Buf { img: texture(0.0), offset: [0.0; 2], scale: 1.0 }).img
+    apply(spec, &ctx, Buf { img: texture(0.0), offset: [0.0; 2], scale: 1.0 }).unwrap().img
 }
 
 fn hashes() -> Vec<(String, u64)> {

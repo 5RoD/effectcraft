@@ -54,6 +54,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod adv3d;
+pub mod bloom;
 mod bokeh;
 mod classic3d;
 mod context;
@@ -184,9 +185,17 @@ impl Gpu {
     /// Render a top-level comp frame and leave it on the GPU as a display texture (no
     /// readback unless a CPU fallback step needs one). `None` = render on the CPU.
     pub fn render_display(&self, r: &Renderer, comp: ItemId, t: Tick) -> Option<DisplayFrame> {
+        if r.diagnostics.is_none() {
+            let diagnostics = effectcraft_render::FrameDiagnostics::default();
+            let renderer = r.with_diagnostics(&diagnostics);
+            return diagnostics.result(self.render_display(&renderer, comp, t)).map_err(|error| log::error!("{error}")).ok().flatten();
+        }
         self.ctx.check_health().map_err(|e| log::error!("gpu display: {e}")).ok()?;
         let mut e = Enc::new(&self.ctx);
         let img = walk::render(&mut e, r, comp, t)?;
+        if !r.cache_allowed() {
+            return None;
+        }
         let texture = e.display(&img);
         e.submit();
         // Reject failures observed during rendering/submission before publishing the frame.
@@ -213,6 +222,13 @@ impl Gpu {
 
     /// Render a frame on the GPU and read it back (`None` = not handled).
     pub fn render(&self, r: &Renderer, comp: ItemId, t: Tick) -> Option<Image> {
+        if r.diagnostics.is_none() {
+            let diagnostics = effectcraft_render::FrameDiagnostics::default();
+            let renderer = r.with_diagnostics(&diagnostics);
+            return diagnostics.result(self.render(&renderer, comp, t)).map_err(|error| log::error!("{error}")).ok().flatten();
+        }
+        // Deferred ready pixels bypass the walk; validate the current document/options first.
+        r.frame_raster(comp, t)?;
         self.ctx.check_health().ok()?;
         if !self.ctx.can_readback() {
             return None;
@@ -222,6 +238,9 @@ impl Gpu {
         }
         let mut e = Enc::new(&self.ctx);
         let img = walk::render(&mut e, r, comp, t)?;
+        if !r.cache_allowed() {
+            return None;
+        }
         e.download(&img)
     }
 
@@ -251,6 +270,9 @@ impl Gpu {
         let misses = d.misses();
         let mut e = Enc::new(&self.ctx);
         let img = walk::render(&mut e, r, comp, t)?;
+        if !r.cache_allowed() {
+            return None;
+        }
         if d.misses() != misses {
             // Layer steps are still in flight: this pass's canvas is not the frame.
             return Some(Image::new(1, 1));
@@ -308,6 +330,10 @@ impl Accelerator for Gpu {
     fn effects(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<Buf> {
         self.ctx.check_health().ok()?;
         effects::run_chain(&mut Enc::new(&self.ctx), chain, buf, levels)
+    }
+    fn effect_checked(&self, step: &FxStep, buf: &Buf, levels: Option<f32>) -> Result<Option<Buf>, String> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| effects::run_checked(&mut Enc::new(&self.ctx), step, buf, levels)))
+            .map_err(|_| "checked GPU effect was rejected by the driver".to_owned())?
     }
 
     fn raster_3d(&self, scene: &effectcraft_render::three_d::adv::Scene) -> Option<effectcraft_render::three_d::adv::Target> {
@@ -423,3 +449,6 @@ mod tests_fx_warp;
 mod tests_init;
 #[cfg(test)]
 mod tests_particles;
+
+#[cfg(test)]
+mod tests_checked;

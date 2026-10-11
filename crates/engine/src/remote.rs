@@ -57,8 +57,14 @@ pub enum Step {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Op {
     pub path: Vec<Step>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present_op_value")]
     pub value: Option<Value>,
+}
+
+// `Some(Value::Null)` sets an explicit null; an absent field removes an object member.
+// Serde's normal Option reader conflates the two after a wire/file round trip.
+fn present_op_value<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
 }
 
 /// The changes that turn `old` into `new` (empty when equal).
@@ -431,13 +437,17 @@ impl FrameServer {
         if let Some(a) = r.accel {
             a.pass_begin();
         }
-        let img = r.comp_frame(pr.comp, pr.time);
-        if r.accel.is_some_and(|a| a.pass_missed()) {
+        let frame = match r.comp_frame_attempt(pr.comp, pr.time) {
+            Ok(frame) => frame,
+            Err(error) => return vec![(FrameReply::Failed { id: pr.id, error: error.to_string(), stale: false }, None)],
+        };
+        if !frame.cpu_retry && r.accel.is_some_and(|a| a.pass_missed()) {
             self.pending = Some(pr);
             return vec![];
         }
+        let img = frame.image;
         let ms = pr.t0.elapsed().as_secs_f64() * 1000.0;
-        let gpu = r.accel.is_some() && r.active_accel().is_some();
+        let gpu = !frame.cpu_retry && r.accel.is_some() && r.active_accel().is_some();
         let hex = |v: Vec<u128>| v.into_iter().map(|k| format!("{k:032x}")).collect::<Vec<_>>();
         let (layer_misses, layer_hits) = match &self.layer_store {
             Some(st) => (hex(st.take_misses()), hex(st.take_hits())),
@@ -492,6 +502,22 @@ mod tests {
         assert_eq!(z, json!([1]));
         // A patch for another document fails cleanly.
         assert!(patch(&mut json!(3), &diff(&a, &b)).is_err());
+    }
+
+    #[test]
+    fn serialized_patches_preserve_explicit_nulls_and_distinguish_member_removal() {
+        let before = json!({"object":1, "array":[2,3], "remove":4});
+        let after = json!({"object":null, "array":[null,3], "added":null});
+        let ops: Vec<Op> = round(&diff(&before, &after));
+        assert!(ops.iter().any(|op| op.value == Some(Value::Null)));
+        assert!(ops.iter().any(|op| op.value.is_none()));
+        let mut actual = before.clone();
+        patch(&mut actual, &ops).unwrap();
+        assert_eq!(actual, after);
+        let mut document = before;
+        let replace: Vec<Op> = round(&diff(&document, &Value::Null));
+        patch(&mut document, &replace).unwrap();
+        assert_eq!(document, Value::Null);
     }
 
     fn server(s: &Session) -> FrameServer {
@@ -700,7 +726,7 @@ mod tests {
             self.chains.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut b = buf.clone();
             for s in chain {
-                b = effectcraft_effects::apply(s.spec, &s.ctx, b);
+                b = effectcraft_effects::apply(s.spec, &s.ctx, b).unwrap();
                 if let Some(l) = levels {
                     effectcraft_render::color::quantize(&mut b.img, l);
                 }

@@ -13,7 +13,7 @@ use effectcraft_render::{RenderOpts, Renderer};
 use effectcraft_time::Tick;
 use web_time::Instant;
 
-use crate::{Job, RenderQuality, out};
+use crate::{ExportError, Job, RenderQuality, Result, out};
 
 /// A job being exported: the job, the project with the Render Settings overrides applied, and
 /// per-frame timing for the render log.
@@ -75,7 +75,7 @@ impl<'a> Cx<'a> {
         self.project.comp(self.job.comp)
     }
 
-    async fn render_at(&self, t: Tick) -> Image {
+    async fn render_at(&self, t: Tick) -> Result<Image> {
         let s = self.job.settings;
         let opts = RenderOpts {
             scale: s.resolution.clamp(0.01, 4.0),
@@ -94,7 +94,7 @@ impl<'a> Cx<'a> {
         r.expr = self.job.expr;
         r.accel = self.job.accel;
         // With deferred GPU readbacks (a browser worker) the frame renders in passes.
-        effectcraft_render::passes::comp_frame(&r, self.job.comp, t).await
+        effectcraft_render::passes::comp_frame_checked(&r, self.job.comp, t).await.map_err(|error| ExportError::Render(error.to_string()))
     }
 
     /// Whether frames render in passes (an accelerator with deferred readbacks).
@@ -104,32 +104,32 @@ impl<'a> Cx<'a> {
 
     /// Output frames `ks`, each mapped by `f` (encoding): rendered in parallel batches, or one
     /// by one in passes when readbacks are deferred ([`Cx::deferred`]).
-    pub async fn frames<T: Send>(&self, comp: &Comp, ks: Vec<u64>, f: impl Fn(u64, Image) -> T + Sync + Send) -> Vec<T> {
+    pub async fn frames<T: Send>(&self, comp: &Comp, ks: Vec<u64>, f: impl Fn(u64, Image) -> T + Sync + Send) -> Result<Vec<T>> {
         if self.deferred() {
             let mut out = Vec::with_capacity(ks.len());
             for k in ks {
-                let img = self.frame_async(comp, k).await;
+                let img = self.frame_async(comp, k).await?;
                 out.push(f(k, img));
             }
-            return out;
+            return Ok(out);
         }
         use rayon::prelude::*;
-        ks.into_par_iter().map(|k| f(k, self.frame(comp, k))).collect()
+        ks.into_par_iter().map(|k| self.frame(comp, k).map(|image| f(k, image))).collect()
     }
 
     /// Output frame `i`: sampled (fields, pulldown), at the colour depth, cropped and resized.
-    pub fn frame(&self, comp: &Comp, i: u64) -> Image {
+    pub fn frame(&self, comp: &Comp, i: u64) -> Result<Image> {
         effectcraft_render::passes::block_on(self.frame_async(comp, i))
     }
 
     /// [`Cx::frame`] as a future (deferred readbacks: the frame renders in passes).
-    pub async fn frame_async(&self, comp: &Comp, i: u64) -> Image {
+    pub async fn frame_async(&self, comp: &Comp, i: u64) -> Result<Image> {
         let t0 = Instant::now();
         let img = match self.job.settings.sample(comp, i) {
-            FrameSample::Progressive(t) => self.render_at(t).await,
+            FrameSample::Progressive(t) => self.render_at(t).await?,
             FrameSample::Fields { first, second, upper_first } => {
-                let a = self.render_at(first).await;
-                if second == first { a } else { interleave(&a, &self.render_at(second).await, upper_first) }
+                let a = self.render_at(first).await?;
+                if second == first { a } else { interleave(&a, &self.render_at(second).await?, upper_first) }
             }
         };
         let mut img = img;
@@ -144,7 +144,7 @@ impl<'a> Cx<'a> {
         if let Some(ft) = &self.frame_times {
             ft.lock().unwrap_or_else(|e| e.into_inner()).push((i, t0.elapsed().as_secs_f64()));
         }
-        img
+        Ok(img)
     }
 
     /// Output Module ▸ Crop, then Resize.
@@ -206,7 +206,7 @@ impl<'a> Cx<'a> {
     }
 
     /// Write the render log next to the output, as the Log setting asks. Returns its path.
-    pub fn write_log(&self, result: &Result<crate::Report, crate::ExportError>, seconds: f64) -> Option<String> {
+    pub fn write_log(&self, result: &Result<crate::Report>, seconds: f64) -> Option<String> {
         let level = self.job.options.log;
         // Errors Only: a log for failures (a user stop is not an error).
         if level == RenderLog::ErrorsOnly && matches!(result, Ok(_) | Err(crate::ExportError::Cancelled)) {

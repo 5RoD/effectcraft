@@ -34,6 +34,8 @@ pub mod perf;
 pub mod prefs;
 pub mod preview;
 pub mod psd_import;
+pub mod recovery_journal;
+pub mod recovery_sessions;
 pub mod remote;
 pub mod render_queue;
 pub mod roto;
@@ -336,6 +338,7 @@ pub struct Session {
     /// that must be persisted before the project closes.
     pub saved_history: History,
     pub history_dirty: bool,
+    pub recovery_journal: recovery_journal::RecoveryJournal,
     pub path: Option<String>,
     pub state: EditorState,
     pub services: Arc<dyn Services>,
@@ -473,6 +476,7 @@ impl Default for Session {
             saved_project: project.clone(),
             saved_history: History::default(),
             history_dirty: false,
+            recovery_journal: recovery_journal::RecoveryJournal::default(),
             project,
             history: History::default(),
             revision: 0,
@@ -552,7 +556,11 @@ impl Session {
             }
         }
         // Last-resort guard: a panicking command reports an error instead of crashing the app.
-        let r = guard::guarded(&format!("command `{id}`"), || (spec.run)(self, &params))?;
+        self.recovery_journal.depth += 1;
+        let result = guard::guarded(&format!("command `{id}`"), || (spec.run)(self, &params));
+        self.recovery_journal.depth -= 1;
+        self.commit_edit_recovery();
+        let r = result?;
         self.learn_observe(id, &params);
         if spec.journal {
             self.journal.push((id.to_string(), params));
@@ -580,11 +588,15 @@ impl Session {
         let before = self.project.clone();
         let mut p = (*self.project).clone();
         let mut st = self.state.clone();
+        if p.next_id >= effectcraft_project::MAX_DOCUMENT_ID {
+            return Err(effectcraft_project::ProjectError::Invalid("project ID space is exhausted; the document was not changed".into()).into());
+        }
         let r = f(&mut p, &mut st)?;
         // Layer styles: one Global Light per comp, whichever layer edited it.
         effectcraft_project::styles::sync_global_light(&before, &mut p);
         // Essential Properties of precomp layers follow their comps' Essential Graphics.
         effectcraft_project::essential::sync_project(&before, &mut p);
+        p.validate_id_space_since(&before)?;
         // Warp Stabilizer analyses made from other frames are cleared (and queued again).
         for w in warp::invalidate(&before, &mut p) {
             if !self.warp_pending.contains(&w) {
@@ -634,6 +646,7 @@ impl Session {
             self.layer_cache.set_disk_salt(effectcraft_render::disk_cache::footage_salt(&self.project));
         }
         self.events.push(Event::ProjectChanged { revision: self.revision });
+        self.commit_edit_recovery();
     }
 
     pub fn undo(&mut self) -> bool {
@@ -828,6 +841,15 @@ impl Session {
         r.comp_frame(comp, t)
     }
 
+    pub fn render_checked(&self, comp: ItemId, time: Tick, opts: RenderOpts) -> Result<Image> {
+        let opts = RenderOpts { nested_switches: self.prefs.general.switches_affect_nested_comps, draft_shadows: self.prefs.three_d.realtime_shadows, ..opts };
+        let mut renderer = Renderer::new(&self.project, self.footage.as_ref(), opts);
+        renderer.expr = self.expr.as_deref();
+        renderer.cache = Some(&self.layer_cache);
+        renderer.accel = self.accel.as_deref();
+        renderer.comp_frame_checked(comp, time).map_err(|error| EngineError::Other(error.to_string()))
+    }
+
     /// Resolve a comp reference (item id number or name; `None`/null = the active comp).
     pub fn resolve_comp(&self, comp: Option<&Value>) -> Result<ItemId> {
         let p = match comp {
@@ -843,7 +865,7 @@ impl Session {
         let c = self.project.comp(comp).ok_or(EngineError::NoComp)?;
         let long = c.width.max(c.height).max(1) as f64;
         let scale = if max_side == 0 { 1.0 } else { (max_side as f64 / long).min(1.0) };
-        let img = self.render(comp, t, RenderOpts { scale, backend: effectcraft_render::Backend::Auto, ..Default::default() });
+        let img = self.render_checked(comp, t, RenderOpts { scale, backend: effectcraft_render::Backend::Auto, ..Default::default() })?;
         Ok((img.width, img.height, img.to_rgba8_over(c.background)))
     }
 
@@ -869,7 +891,7 @@ impl Session {
                     let mut r = Renderer::new(&project, footage.as_ref(), opts);
                     r.expr = expr.as_deref();
                     r.cache = Some(&cache);
-                    let img = r.comp_frame(item, t);
+                    let img = r.comp_frame_checked(item, t).ok()?;
                     Some((img.width, img.height, img.to_rgba8_over(bg)))
                 }))
             }
@@ -904,7 +926,7 @@ impl Session {
         let c = self.project.comp(comp).ok_or(EngineError::NoComp)?;
         let long = c.width.max(c.height).max(1) as f64;
         let scale = if max_side == 0 { 1.0 } else { (max_side as f64 / long).min(1.0) };
-        let img = self.render(comp, t, RenderOpts { scale, backend: effectcraft_render::Backend::Auto, ..Default::default() });
+        let img = self.render_checked(comp, t, RenderOpts { scale, backend: effectcraft_render::Backend::Auto, ..Default::default() })?;
         Ok((img.width, img.height, img.to_rgba8()))
     }
 
@@ -935,6 +957,7 @@ impl Session {
         upgrade_effects(&mut p);
         self.project = Arc::new(p);
         self.history = History::default();
+        self.recovery_journal.reset();
         self.state = EditorState { snapping: true, view_layout: 1, ..Default::default() };
         self.path = path;
         self.bump();

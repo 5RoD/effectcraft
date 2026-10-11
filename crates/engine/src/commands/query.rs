@@ -54,6 +54,11 @@ fn summary(s: &mut Session, _: &Value) -> Result<Value> {
         "dirty": s.is_dirty(),
         "needsSave": s.needs_save(),
         "historyDirty": s.history_dirty,
+        "editRecovery": {
+            "active": s.recovery_journal.active && s.prefs.auto_save.protect_every_edit,
+            "savedRevision": s.recovery_journal.saved_revision,
+            "error": s.recovery_journal.error,
+        },
         "bitDepth": s.project.settings.bit_depth.label(),
         "renderer": super::file::backend_status(s),
         "items": items,
@@ -193,7 +198,7 @@ fn capabilities(s: &mut Session, _: &Value) -> Result<Value> {
 }
 
 /// The headline of `docs/parity.md` (kept in sync by hand at each audit).
-const PARITY: &str = "≈94% weighted feature parity (80 done / 12 partial / 0 missing of 92 features); 298 of 298 After Effects 2026 effects present";
+const PARITY: &str = "Development fork: feature and fidelity gaps remain. Complete After Effects and commercial plugin parity are not verified.";
 
 fn state(s: &mut Session, _: &Value) -> Result<Value> {
     Ok(serde_json::to_value(&s.state).unwrap_or_default())

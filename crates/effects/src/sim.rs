@@ -19,7 +19,7 @@ use crate::util::{SimCache, hash1, params_key, unpremul};
 use crate::{Buf, EffectCtx, EffectSpec, col, num, p, popup, slider};
 
 pub(crate) fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
-    EffectSpec { id, name, category: "Simulation", params, render, gpu: false, float: true }
+    EffectSpec { id, name, category: "Simulation", params, render: crate::EffectRender::Legacy(render), gpu: false, float: true }
 }
 
 pub(crate) fn pt(x: f64, y: f64) -> Value {
@@ -1739,8 +1739,8 @@ mod tests {
         params.values.insert("flakes".into(), num(50.0));
         params.values.insert("offset".into(), pt(20.0, 20.0));
         let ctx = EffectCtx { params: &params, time: 0.5, layer_size: [40.0, 40.0], seed: 1, adjustment: false, env: EffectEnv::default() };
-        let full = crate::apply(s, &ctx, Buf { img: grey(40, 40), offset: [0.0; 2], scale: 1.0 });
-        let half = crate::apply(s, &ctx, Buf { img: grey(20, 20), offset: [0.0; 2], scale: 0.5 });
+        let full = crate::apply(s, &ctx, Buf { img: grey(40, 40), offset: [0.0; 2], scale: 1.0 }).unwrap();
+        let half = crate::apply(s, &ctx, Buf { img: grey(20, 20), offset: [0.0; 2], scale: 0.5 }).unwrap();
         let sum = |i: &Image| i.data.iter().map(|p| p[0]).sum::<f32>() / i.data.len() as f32;
         assert!((sum(&full.img) - sum(&half.img)).abs() < 0.05, "{} {}", sum(&full.img), sum(&half.img));
     }

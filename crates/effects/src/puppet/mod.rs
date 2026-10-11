@@ -91,7 +91,7 @@ pub fn specs() -> Vec<EffectSpec> {
         name: "Puppet",
         category: "Distort",
         params: vec![p("refinement", "Mesh Rotation Refinement", Value::Scalar(20.0), slider(0.0, 100.0, 0.0, 100.0, 0))],
-        render,
+        render: crate::EffectRender::Legacy(render),
         gpu: false,
         float: true,
     }]

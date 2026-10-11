@@ -32,7 +32,7 @@ use crate::util::{SimCache, hash1, params_key, point_in_poly, unpremul};
 use crate::{Buf, EffectCtx, EffectSpec, col, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
-    EffectSpec { id, name, category: "Simulation", params, render, gpu: false, float: true }
+    EffectSpec { id, name, category: "Simulation", params, render: crate::EffectRender::Legacy(render), gpu: false, float: true }
 }
 
 // ---------------------------------------------------------------- Particle Playground

@@ -20,6 +20,32 @@ fn project_with_layer() -> (Project, crate::ItemId) {
 }
 
 #[test]
+fn hostile_project_and_property_ids_fail_before_counter_repair_can_overflow() {
+    let (project, comp) = project_with_layer();
+    let mut cases = vec![];
+    let mut counter = project.clone();
+    counter.next_id = u64::MAX;
+    cases.push(counter);
+    let mut item = project.clone();
+    let mut moved = item.items.remove(&comp).unwrap();
+    moved.id = crate::ItemId(u64::MAX);
+    item.items.insert(moved.id, moved);
+    cases.push(item);
+    let mut layer = project.clone();
+    layer.comp_mut(comp).unwrap().layers[0].id = crate::LayerId(u64::MAX);
+    cases.push(layer);
+    let mut property = project.clone();
+    property.comp_mut(comp).unwrap().layers[0].props.prop_mut("transform/opacity").unwrap().uid = u64::MAX;
+    cases.push(property);
+    for project in cases {
+        let file = serde_json::to_string(&project).unwrap();
+        let result = std::panic::catch_unwind(|| Project::from_json(&file));
+        assert!(result.is_ok(), "hostile IDs must return an error, not panic");
+        assert!(result.unwrap().unwrap_err().to_string().contains("ID space"));
+    }
+}
+
+#[test]
 fn editing_one_layer_detaches_only_its_property_tree_and_preserves_snapshots() {
     let (mut project, cid) = project_with_layer();
     let mut sibling = project.comp(cid).unwrap().layers[0].clone();

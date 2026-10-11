@@ -27,7 +27,7 @@ use effectcraft_project::ParamUi;
 use crate::{Buf, EffectCtx, EffectSpec, Params, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>) -> EffectSpec {
-    EffectSpec { id, name, category: "Audio", params, render: passthrough, gpu: false, float: true }
+    EffectSpec { id, name, category: "Audio", params, render: crate::EffectRender::Legacy(passthrough), gpu: false, float: true }
 }
 
 fn passthrough(_: &EffectCtx, b: Buf) -> Buf {

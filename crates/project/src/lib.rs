@@ -27,6 +27,9 @@ pub use effectcraft_keyframe as keyframe;
 pub use effectcraft_keyframe::{Keyframe, Value};
 
 pub const SCHEMA_VERSION: u32 = 1;
+/// IDs cross JavaScript scripting and JSON control interfaces. Reserve the upper boundary
+/// rather than accepting IDs those interfaces cannot represent exactly or increment safely.
+pub const MAX_DOCUMENT_ID: u64 = (1_u64 << 53) - 1;
 
 /// The EffectCraft version, written into project files as `savedBy`.
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1228,14 +1231,56 @@ impl Project {
     pub fn fix_next_id(&mut self) {
         let mut m = self.next_id;
         for (id, it) in &self.items {
-            m = m.max(id.0 + 1);
+            m = m.max(id.0.saturating_add(1));
             if let ItemKind::Comp(c) = &it.kind {
                 for l in &c.layers {
-                    m = m.max(l.id.0 + 1).max(l.props.max_uid() + 1);
+                    m = m.max(l.id.0.saturating_add(1)).max(l.props.max_uid().saturating_add(1));
                 }
             }
         }
         self.next_id = m;
+    }
+    /// Reject unsupported/exhausted ID space before loading, upgrading or committing a
+    /// document. A saturated repaired counter is an error, never a reusable/duplicate ID.
+    pub fn validate_id_space(&self) -> Result<(), ProjectError> {
+        self.validate_id_changes(None)
+    }
+    /// Shared compositions/property trees already validated in `before` need no repeated
+    /// walk on every mouse gesture. Only changed/new layers can introduce new property IDs.
+    pub fn validate_id_space_since(&self, before: &Project) -> Result<(), ProjectError> {
+        self.validate_id_changes(Some(before))
+    }
+    fn validate_id_changes(&self, before: Option<&Project>) -> Result<(), ProjectError> {
+        let invalid = || ProjectError::Invalid("project ID space exceeds the supported exact-integer range; the document was not changed".into());
+        if self.next_id >= MAX_DOCUMENT_ID {
+            return Err(invalid());
+        }
+        for (id, item) in &self.items {
+            if id.0 >= MAX_DOCUMENT_ID || item.id.0 >= MAX_DOCUMENT_ID {
+                return Err(invalid());
+            }
+            let ItemKind::Comp(comp) = &item.kind else { continue };
+            let previous = before.and_then(|p| p.items.get(id)).and_then(|i| match &i.kind {
+                ItemKind::Comp(c) => Some(c),
+                _ => None,
+            });
+            if previous.is_some_and(|p| Arc::ptr_eq(p, comp)) {
+                continue;
+            }
+            for (index, layer) in comp.layers.iter().enumerate() {
+                if layer.id.0 >= MAX_DOCUMENT_ID {
+                    return Err(invalid());
+                }
+                let old = previous.and_then(|p| p.layers.get(index).filter(|l| l.id == layer.id).or_else(|| p.layer(layer.id)));
+                if old.is_some_and(|l| std::ptr::eq(&*l.props, &*layer.props)) {
+                    continue;
+                }
+                if layer.props.max_uid() >= MAX_DOCUMENT_ID {
+                    return Err(invalid());
+                }
+            }
+        }
+        Ok(())
     }
     /// Whether `other` holds the same content. An allocated id counts (an edit may hand it out
     /// beyond the project, so it must stay taken). Shared compositions compare by pointer first,
@@ -1287,6 +1332,7 @@ impl Project {
             return Err(ProjectError::Invalid(format!("project schema {} is newer than this version supports ({SCHEMA_VERSION})", p.schema)));
         }
         p.fix_next_id();
+        p.validate_id_space()?;
         Ok(p)
     }
 }

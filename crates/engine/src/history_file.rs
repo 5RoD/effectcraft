@@ -271,6 +271,7 @@ fn decode_archive(text: &str, history: Option<Value>, current: &Arc<Project>) ->
         }
         // Keep the shared composition Arcs: reparsing each snapshot duplicates unchanged comps.
         stored.project.fix_next_id();
+        stored.project.validate_id_space().map_err(invalid)?;
         states.push(Arc::new(stored.project));
     }
     if states.first().is_none_or(|p| **p != **current) {

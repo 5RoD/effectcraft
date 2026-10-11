@@ -14,7 +14,7 @@ use crate::util::{Plane, gauss_plane, layer_rect, premul, smoothstep, unpremul};
 use crate::{Buf, EffectCtx, EffectSpec, ParamSpec, col, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<ParamSpec>, render: crate::RenderFn) -> EffectSpec {
-    EffectSpec { id, name, category: "Perspective", params, render, gpu: false, float: true }
+    EffectSpec { id, name, category: "Perspective", params, render: crate::EffectRender::Legacy(render), gpu: false, float: true }
 }
 
 fn norm3(v: [f64; 3]) -> [f64; 3] {
@@ -454,7 +454,7 @@ mod tests {
         }
         let ctx =
             EffectCtx { params: &params, time: 0.0, layer_size: [img.width as f64, img.height as f64], seed: 1, adjustment: false, env: Default::default() };
-        (s.render)(&ctx, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 })
+        crate::apply(s, &ctx, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 }).unwrap()
     }
 
     fn square(w: u32, h: u32, m: u32, c: [f32; 3]) -> Image {

@@ -456,3 +456,72 @@ fn edge_pinning_displaces_all_of_a_centred_shape_layer() {
         assert!(q.iter().all(|&d| d > 20.0), "{id}: per-quadrant change {q:?}");
     }
 }
+
+#[test]
+fn checked_bloom_failures_propagate_context_without_caching_failed_pixels() {
+    use crate::{Backend, LayerCache, NoFootage, RenderOpts, Renderer};
+    let (mut project, cid, comp) = setup();
+    let mut layer = solid(&mut project, &comp, [2.0, 1.0, 0.5], 20, 20);
+    add_effect(&mut project, &mut layer, effectcraft_effects::bloom::ID, [20.0; 2], &[("radius", Value::Scalar(f64::MAX))]);
+    let lid = layer.id;
+    let uid = layer.effects().unwrap().groups().next().unwrap().uid;
+    project.comp_mut(cid).unwrap().layers.push(layer);
+    let cache = LayerCache::default();
+    let options = RenderOpts { backend: Backend::Cpu, ..Default::default() };
+    let mut legacy = Renderer::new(&project, &NoFootage, options);
+    legacy.cache = Some(&cache);
+    let _ = legacy.comp_frame(cid, Tick(37));
+    assert_eq!(cache.stats().entries, 0, "an infallible internal caller cannot poison later checked renders");
+    for _ in 0..2 {
+        let mut renderer = Renderer::new(&project, &NoFootage, options);
+        renderer.cache = Some(&cache);
+        let error = renderer.comp_frame_checked(cid, Tick(37)).unwrap_err();
+        assert_eq!((error.comp, error.layer, error.effect_uid, error.time), (cid, lid, uid, Tick(37)));
+        assert_eq!(error.effect_id, effectcraft_effects::bloom::ID);
+        assert!(error.message.contains("radius"));
+        assert_eq!(cache.stats().entries, 0, "failed layer or converted buffer must not enter the cache");
+    }
+    project.comp_mut(cid).unwrap().layer_mut(lid).unwrap().props.prop_mut("effects/#1/radius").unwrap().value = Value::Scalar(0.0);
+    let mut renderer = Renderer::new(&project, &NoFootage, options);
+    renderer.cache = Some(&cache);
+    let expected = renderer.comp_frame_checked(cid, Tick(37)).unwrap();
+    assert!(cache.stats().entries > 0);
+    let actual = renderer.comp_frame_checked(cid, Tick(37)).unwrap();
+    assert_eq!(actual.data, expected.data, "a repaired frame uses valid cached pixels");
+}
+
+#[test]
+fn checked_bloom_nested_collapsed_and_motion_blurred_failures_reach_outer_frame() {
+    use crate::{Backend, NoFootage, RenderOpts, Renderer};
+    let (mut project, inner, comp) = setup();
+    let mut layer = solid(&mut project, &comp, [2.0, 1.0, 0.5], 20, 20);
+    layer.switches.motion_blur = true;
+    add_effect(&mut project, &mut layer, effectcraft_effects::bloom::ID, [20.0; 2], &[("radius", Value::Scalar(f64::MAX))]);
+    let lid = layer.id;
+    project.comp_mut(inner).unwrap().layers.push(layer);
+    let outer_comp = Comp::new(200, 100, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+    let outer = project.add_item("Outer", Label::Sandstone, None, ItemKind::Comp(outer_comp.clone().into()));
+    let mut nested = build::layer(&mut project, &outer_comp, "Inner", LayerSource::Comp { item: inner }, (200, 100), None);
+    nested.switches.motion_blur = true;
+    let nested_id = nested.id;
+    project.comp_mut(outer).unwrap().layers.push(nested);
+    project.comp_mut(inner).unwrap().enable_motion_blur = true;
+    project.comp_mut(outer).unwrap().enable_motion_blur = true;
+    for collapse in [false, true] {
+        project.comp_mut(outer).unwrap().layer_mut(nested_id).unwrap().switches.collapse = collapse;
+        for motion_blur in [false, true] {
+            let renderer = Renderer::new(&project, &NoFootage, RenderOpts { backend: Backend::Cpu, motion_blur, ..Default::default() });
+            let error = renderer.comp_frame_checked(outer, Tick::from_seconds_f64(0.5)).unwrap_err();
+            assert_eq!((error.comp, error.layer), (inner, lid));
+        }
+    }
+}
+
+#[test]
+fn checked_frame_boundary_preserves_legacy_output() {
+    use crate::{Backend, NoFootage, RenderOpts, Renderer};
+    let (project, comp) = cache_scene();
+    let renderer = Renderer::new(&project, &NoFootage, RenderOpts { backend: Backend::Cpu, ..Default::default() });
+    let time = Tick::from_seconds_f64(0.5);
+    assert_eq!(renderer.comp_frame(comp, time).data, renderer.comp_frame_checked(comp, time).unwrap().data);
+}

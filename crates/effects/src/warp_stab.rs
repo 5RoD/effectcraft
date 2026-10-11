@@ -87,7 +87,7 @@ pub fn specs() -> Vec<EffectSpec> {
             p(ANALYSIS, "Analysis", Value::Str(String::new()), ParamUi::Hidden),
             p(ANALYSIS_KEY, "Analysis Key", Value::Str(String::new()), ParamUi::Hidden),
         ],
-        render,
+        render: crate::EffectRender::Legacy(render),
         gpu: false,
         float: true,
     }]

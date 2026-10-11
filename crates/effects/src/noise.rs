@@ -11,7 +11,7 @@ use crate::util::{Plane, gauss_plane, guided_filter, hash1, join, lerp, premul, 
 use crate::{Buf, EffectCtx, EffectSpec, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
-    EffectSpec { id, name, category: "Noise & Grain", params, render, gpu: false, float: true }
+    EffectSpec { id, name, category: "Noise & Grain", params, render: crate::EffectRender::Legacy(render), gpu: false, float: true }
 }
 
 fn pct() -> ParamUi {
@@ -841,7 +841,7 @@ mod tests {
             params.values.insert(k.to_string(), v.clone());
         }
         let ctx = EffectCtx { params: &params, time, layer_size: [img.width as f64, img.height as f64], seed: 3, adjustment: false, env: Default::default() };
-        crate::apply(s, &ctx, Buf { img, offset: [0.0, 0.0], scale: 1.0 })
+        crate::apply(s, &ctx, Buf { img, offset: [0.0, 0.0], scale: 1.0 }).unwrap()
     }
 
     fn gray(w: u32, h: u32, v: f32) -> Image {

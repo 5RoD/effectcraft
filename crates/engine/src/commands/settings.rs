@@ -239,13 +239,31 @@ fn auto_save(s: &mut Session, _: &Value) -> Result<Value> {
 
 fn recovery_info(s: &mut Session, _: &Value) -> Result<Value> {
     let root = s.default_autosave_root();
-    let latest = crate::autosave::latest_in(s.file_ops(), &s.prefs, s.path.as_deref(), root.as_deref()).map(|p| p.to_string_lossy().to_string());
+    let latest = crate::autosave::latest_in(s.file_ops(), &s.autosave_prefs(), s.path.as_deref(), root.as_deref()).map(|p| p.to_string_lossy().to_string());
     Ok(json!({
         "lastAutoSave": s.autosave.last_path,
         "latestOnDisk": latest,
-        "folder": crate::autosave::folder(&s.prefs, s.path.as_deref(), root.as_deref()).map(|p| p.to_string_lossy().to_string()),
+        "folder": s.autosave_folder().map(|p| p.to_string_lossy().to_string()),
+        "offeredRecovery": s.autosave.run.offered,
+        "pendingRecoveries": s.autosave.run.pending,
         "recentProjects": s.prefs.recent_projects,
+        "completedEdits": {
+            "active": s.recovery_journal.active && s.prefs.auto_save.protect_every_edit,
+            "savedRevision": s.recovery_journal.saved_revision,
+            "currentRevision": s.revision,
+            "error": s.recovery_journal.error,
+        },
     }))
+}
+
+fn retry_recovery(s: &mut Session, _: &Value) -> Result<Value> {
+    s.retry_edit_recovery()?;
+    recovery_info(s, &Value::Null)
+}
+
+fn resolve_recovery(s: &mut Session, params: &Value) -> Result<Value> {
+    let dismiss = super::b_p(params, "dismiss").unwrap_or(false);
+    Ok(json!({"next": s.resolve_recovery(dismiss)?}))
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -273,6 +291,16 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("file.openRecent", "Open Recent", [], None, "{index? | path?}", has_recent, open_recent),
         cmd!("file.clearRecent", "Clear Recent Projects", ["File", "Open Recent"], None, "{}", has_recent, clear_recent),
         cmd!("file.autoSave", "Auto-Save Now", [], None, "{}", always, auto_save),
+        cmd!("file.retryEditRecovery", "Retry Edit Recovery", [], None, "{}", always, retry_recovery),
+        cmd!(
+            "file.resolveRecovery",
+            "Resolve Offered Recovery",
+            [],
+            None,
+            "{dismiss?: false (requires a successful recovery open) or true (explicitly skip this recovery)}",
+            always,
+            resolve_recovery
+        ),
         query!("file.recoveryInfo", "Auto-Save Status", "{}", recovery_info),
     ]
 }

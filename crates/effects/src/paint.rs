@@ -151,7 +151,7 @@ pub fn specs() -> Vec<EffectSpec> {
         name: "Paint",
         category: "Paint",
         params: vec![p("on_transparent", "Paint on Transparent", Value::Bool(false), ParamUi::Checkbox)],
-        render,
+        render: crate::EffectRender::Legacy(render),
         gpu: false,
         float: true,
     }]

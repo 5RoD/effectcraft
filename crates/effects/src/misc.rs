@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use crate::{Buf, EffectCtx, EffectSpec, col, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, category: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
-    EffectSpec { id, name, category, params, render, gpu: false, float: true }
+    EffectSpec { id, name, category, params, render: crate::EffectRender::Legacy(render), gpu: false, float: true }
 }
 
 /// AE's Blurriness is roughly a radius; our Gaussian uses sigma = blurriness / 2.

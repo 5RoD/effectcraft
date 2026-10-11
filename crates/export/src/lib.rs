@@ -60,6 +60,8 @@ pub enum ExportError {
     #[error("encode: {0}")]
     Encode(String),
     #[error("{0}")]
+    Render(String),
+    #[error("{0}")]
     Unsupported(String),
 }
 
@@ -181,6 +183,14 @@ pub async fn export_async(job: &Job<'_>, progress: &mut dyn FnMut(&Progress) -> 
 
 async fn export_with(cx: &Cx<'_>, progress: &mut dyn FnMut(&Progress) -> bool, t0: Instant) -> Result<Report> {
     let comp = cx.comp().ok_or(ExportError::NoComp)?;
+    if !cx.output.format.is_audio_only() {
+        // Codec setup precedes rendering; reject hostile composition sizes before it can
+        // allocate a frame. Finite positive settings retain the existing resolution clamp.
+        let scale = cx.settings.resolution;
+        let scale = if scale.is_finite() && scale > 0.0 { scale.clamp(0.01, 4.0) } else { scale };
+        effectcraft_render::raster_bounds::frame(comp.width, comp.height, scale, None)
+            .map_err(|message| ExportError::Render(format!("Render failed in comp {} / raster geometry before export: {message}", cx.comp.0)))?;
+    }
     let total = cx.settings.frame_count(comp);
     let mut st = State { t0, total, done: 0, progress };
     st.advance(0)?;
@@ -267,7 +277,7 @@ async fn sequence(cx: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut State<'_>) 
                 std::io::Write::write_all(&mut f, &data).map_err(io)?;
                 f.finish()
             })
-            .await;
+            .await?;
         for r in written {
             bytes += r?;
         }
@@ -367,7 +377,7 @@ async fn gif_export(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut State<'_
                 let mut px = job.pixels(&img, comp, job.output.channels, w, h);
                 gif::Frame::from_rgba_speed(w as u16, h as u16, &mut px, 10)
             })
-            .await;
+            .await?;
         for mut f in frames {
             clock += cs_per_frame;
             let d = (clock.round() as u64).saturating_sub(emitted).max(1);

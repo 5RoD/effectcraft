@@ -336,7 +336,7 @@ impl EffectcraftApp {
 
     /// Show the crash-recovery dialog for a previous run that didn't exit cleanly.
     pub fn offer_recovery(&mut self, r: effectcraft_engine::autosave::Recovery) {
-        if r.autosave.is_some() {
+        if r.autosave.is_some() || r.project.is_some() || r.warning.is_some() {
             self.recovery = Some(r);
             self.dialog = Some(Dialog::Recovery);
         }
@@ -1494,6 +1494,26 @@ impl EffectcraftApp {
 impl EffectcraftApp {
     /// Auto-save a dirty project when the interval has passed (Settings ▸ Project ▸ Auto-Save).
     fn tick_autosave(&mut self, ctx: &egui::Context) {
+        if let Some(error) = self.session.recovery_journal.error.clone() {
+            egui::Window::new("Edit recovery needs attention")
+                .id(egui::Id::new("editRecovery.failure"))
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 60.0))
+                .resizable(false)
+                .collapsible(false)
+                .default_width(360.0)
+                .max_width(360.0)
+                .show(ctx, |ui| {
+                    ui.label("Recent edits have not been stored in the recovery journal.");
+                    ui.label(error);
+                    let retry = ui.button("Retry Recovery Write");
+                    self.auto.add("recovery.retryWrite", retry.rect, "Retry Recovery Write");
+                    if retry.clicked()
+                        && let Err(e) = self.session.retry_edit_recovery()
+                    {
+                        self.ui.status = e.to_string();
+                    }
+                });
+        }
         let now = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
         if let Some(Err(e)) = self.session.autosave_tick(now) {
             self.ui.status = e.to_string();

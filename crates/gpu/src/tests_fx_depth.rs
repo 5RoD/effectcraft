@@ -133,7 +133,7 @@ pub(crate) fn direct(id: &str, vals: &[(&str, Value)], allow: f64) {
                 adjustment: false,
                 env: EffectEnv { host: Some(&host), ..Default::default() },
             };
-            let cpu = (spec.render)(&ctx(), buf.clone());
+            let cpu = effectcraft_effects::apply(spec, &ctx(), buf.clone()).unwrap();
             let out =
                 effectcraft_render::Accelerator::effects(g, &[effectcraft_render::FxStep { spec, ctx: ctx() }], &buf, None).expect("the GPU runs the effect");
             assert_eq!((out.offset, out.scale), (cpu.offset, cpu.scale), "{id}: geometry");

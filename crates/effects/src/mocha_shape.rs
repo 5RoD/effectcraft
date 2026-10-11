@@ -196,7 +196,7 @@ pub fn specs() -> Vec<EffectSpec> {
             // JSON shape data (see the module docs) or a path to a .json file.
             p("shapeData", "Shape data", Value::Str(String::new()), ParamUi::Hidden),
         ],
-        render: mocha_shape,
+        render: crate::EffectRender::Legacy(mocha_shape),
         gpu: false,
         float: true,
     }]

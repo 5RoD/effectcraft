@@ -422,13 +422,14 @@ fn recovery_finds_a_checkpoint_that_landed_before_sentinel_update() {
     let d = tmp("recovery-late-worker");
     let store: Arc<dyn ConfigStore> = Arc::new(DirConfig::new(d.join("config")));
     let mut s = session_with_comp();
+    s.prefs.auto_save.protect_every_edit = false; // Exercise timer checkpoints independently.
     s.config = Some(store.clone());
     s.begin_recovery();
     s.execute("file.saveAs", json!({"path": d.join("Worker.ecproj").to_string_lossy()})).unwrap();
     s.execute("layer.newNull", json!({"name": "First"})).unwrap();
     let first = s.autosave_now().unwrap();
     s.execute("layer.newNull", json!({"name": "Newer"})).unwrap();
-    let plan = autosave::plan_in(s.file_ops(), &s.prefs, s.path.as_deref(), None, s.autosave.last_slot).unwrap();
+    let plan = autosave::plan_in(s.file_ops(), &s.autosave_prefs(), s.path.as_deref(), None, s.autosave.last_slot).unwrap();
     plan.write(s.file_ops(), crate::history_file::encode(&s.project, &s.history, true).unwrap().as_bytes()).unwrap();
     std::fs::OpenOptions::new().write(true).open(&first).unwrap().set_modified(std::time::SystemTime::UNIX_EPOCH).unwrap();
     drop(s); // No UI collection of the completed write, and no clean exit.
@@ -437,6 +438,18 @@ fn recovery_finds_a_checkpoint_that_landed_before_sentinel_update() {
     assert_eq!(recovery.autosave.as_deref(), Some(plan.path.to_string_lossy().as_ref()));
     reopened.execute("file.open", json!({"path": recovery.autosave.unwrap()})).unwrap();
     assert_eq!(reopened.active_comp().unwrap().layers[0].name, "Newer");
+    let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
+fn failed_atomic_rename_preserves_the_destination_and_cleans_the_temporary_file() {
+    let d = tmp("atomic-rename-failure");
+    let f = d.join("blocked.json");
+    std::fs::create_dir(&f).unwrap();
+    std::fs::write(f.join("retained"), b"existing content").unwrap();
+    assert!(atomic_write(&f, b"replacement").is_err());
+    assert_eq!(std::fs::read(f.join("retained")).unwrap(), b"existing content");
+    assert!(!temp_path(&f).exists(), "a failed rename must not leak the completed temporary file");
     let _ = std::fs::remove_dir_all(d);
 }
 
@@ -526,6 +539,7 @@ fn crash_recovery_detects_an_unclean_exit() {
     let store: Arc<dyn ConfigStore> = Arc::new(DirConfig::new(d.join("config")));
     // First run: open a project, auto-save, then "crash" (no end_recovery).
     let mut s = session_with_comp();
+    s.prefs.auto_save.protect_every_edit = false; // Exercise the legacy auto-save recovery path.
     s.config = Some(store.clone());
     assert!(s.begin_recovery().is_none(), "first launch is clean");
     let proj = d.join("Crash.ecproj");

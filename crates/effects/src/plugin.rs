@@ -287,7 +287,7 @@ pub fn register_plugin(plugin: Arc<dyn EffectPlugin>) -> Result<&'static EffectS
         name: leak(&m.name),
         category: leak(&m.category),
         params: m.params.iter().map(param_spec).collect(),
-        render: TRAMPOLINES[slot],
+        render: crate::EffectRender::Legacy(TRAMPOLINES[slot]),
         gpu: false,
         float: true,
     }));

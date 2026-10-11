@@ -20,7 +20,7 @@ fn passthrough(_: &EffectCtx, b: Buf) -> Buf {
 }
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>) -> EffectSpec {
-    EffectSpec { id, name, category: "Expression Controls", params, render: passthrough, gpu: true, float: true }
+    EffectSpec { id, name, category: "Expression Controls", params, render: crate::EffectRender::Legacy(passthrough), gpu: true, float: true }
 }
 
 pub fn specs() -> Vec<EffectSpec> {

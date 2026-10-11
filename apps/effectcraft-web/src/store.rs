@@ -527,6 +527,10 @@ mod tests {
         let mut a = Session { config: Some(Arc::new(WebConfig::new(s.clone()))), ..Default::default() };
         a.load_settings();
         assert!(a.begin_recovery().is_none());
+        assert!(!a.recovery_journal.active, "a browser path is a virtual namespace even in native tests");
+        let config = a.config.as_ref().unwrap();
+        assert!(config.native_recovery_dir().is_none());
+        assert_eq!(config.try_lease("RecoverySessions/test.lease").unwrap_err().kind(), std::io::ErrorKind::Unsupported);
         a.execute("file.newProject", json!({})).unwrap();
         a.execute("comp.new", json!({"name": "C"})).unwrap();
         // Untitled: the auto-save lands in the store's file table.
@@ -538,6 +542,7 @@ mod tests {
         b.load_settings();
         let r = b.begin_recovery().expect("recovery");
         assert!(r.autosave.is_some());
+        assert!(b.autosave.run.name.is_none());
         // Increment and Save sees the store's files.
         let fs = WebConfig::new(s.clone());
         fs.files().write(Path::new("/A.ecproj"), b"{}").unwrap();

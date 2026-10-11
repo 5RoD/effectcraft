@@ -257,3 +257,117 @@ fn opening_an_old_project_upgrades_effect_instances() {
     // The upgraded project renders.
     let _ = s2.render(cid, s2.time(), Default::default());
 }
+
+#[test]
+fn checked_bloom_session_frame_apis_and_remote_worker_reject_failed_pixels() {
+    use crate::remote::{FrameMsg, FrameReply, FrameServer, Mirror};
+    use crate::render::RenderOpts;
+    use crate::time::Tick;
+    use std::sync::Arc;
+    let (mut session, layer_id, _) = comp_with_two_solids();
+    let comp = session.active_comp_id().unwrap();
+    apply(&mut session, layer_id, "Native Bloom");
+    Arc::make_mut(&mut session.project).comp_mut(comp).unwrap().layer_mut(LayerId(layer_id)).unwrap().props.prop_mut("effects/#1/radius").unwrap().value =
+        KV::Scalar(f64::MAX);
+    for transparent in [false, true] {
+        let error = session.render_rgba8_alpha(comp, Tick::ZERO, 32, transparent).unwrap_err();
+        assert!(error.to_string().contains("ec.stylize.bloom"));
+    }
+    assert!(crate::commands::frame_export::layered_psd(&session, comp, Tick::ZERO, 0.05).is_err());
+    assert!(crate::commands::frame_export::layered_exr(&session, comp, Tick::ZERO, 0.05).is_err());
+    assert!(session.execute("view.takeSnapshot", json!({"scale": 0.05})).is_err());
+    assert!(session.snapshot.is_none());
+    let mut worker = FrameServer::new(session.footage.clone(), session.expr.clone());
+    let mut mirror = Mirror::default();
+    assert!(worker.handle(mirror.sync(session.revision, &session.project).unwrap()).is_empty());
+    let replies = worker.handle(FrameMsg::Render {
+        id: 17,
+        revision: session.revision,
+        comp,
+        time: Tick::ZERO,
+        opts: Box::new(RenderOpts::default()),
+        disk: None,
+        layers: false,
+        prefetch: vec![],
+    });
+    assert_eq!(replies.len(), 1);
+    let (FrameReply::Failed { id, error, stale }, pixels) = &replies[0] else { panic!("expected checked render failure") };
+    assert_eq!(*id, 17);
+    assert!(!stale);
+    assert!(error.contains("ec.stylize.bloom"));
+    assert!(pixels.is_none());
+    assert_eq!(worker.cache.stats().entries, 0);
+}
+
+#[test]
+fn checked_bloom_remote_cpu_retry_finishes_without_obsolete_deferred_passes() {
+    use crate::remote::{FrameMsg, FrameReply, FrameServer, Mirror};
+    use crate::render::{Accelerator, Backend, FrameFailure, FxStep, Image, RenderOpts, Renderer};
+    use crate::time::Tick;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    struct Declines {
+        missed: Arc<AtomicBool>,
+        calls: AtomicUsize,
+    }
+    impl Accelerator for Declines {
+        fn name(&self) -> String {
+            "synthetic checked retry".into()
+        }
+        fn comp_frame(&self, renderer: &Renderer, comp: crate::project::ItemId, time: Tick) -> Option<Image> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.missed.store(true, Ordering::Release);
+            renderer.diagnostics.unwrap().record(FrameFailure {
+                comp,
+                layer: LayerId(1),
+                effect_uid: 1,
+                effect_id: "ec.stylize.bloom".into(),
+                time,
+                message: "synthetic GPU transfer refusal".into(),
+            });
+            Some(Image::new(1, 1))
+        }
+        fn supports_effect(&self, _: &str) -> bool {
+            false
+        }
+        fn effects(&self, _: &[FxStep], _: &crate::effects::Buf, _: Option<f32>) -> Option<crate::effects::Buf> {
+            None
+        }
+        fn pass_begin(&self) {
+            self.missed.store(false, Ordering::Release);
+        }
+        fn pass_missed(&self) -> bool {
+            self.missed.load(Ordering::Acquire)
+        }
+        fn miss_gate(&self) -> Option<Arc<AtomicBool>> {
+            Some(self.missed.clone())
+        }
+    }
+    let mut session = Session::default();
+    let comp = crate::project::ItemId(session.execute("comp.new", json!({"width": 8, "height": 8, "duration": 1})).unwrap()["comp"].as_u64().unwrap());
+    let layer = session.execute("layer.newSolid", json!({"color": "#ffffff"})).unwrap()["layer"].as_u64().unwrap();
+    apply(&mut session, layer, "Native Bloom");
+    let expected = crate::remote::rgba8_premultiplied(&session.render_checked(comp, Tick::ZERO, RenderOpts::default()).unwrap());
+    let declines = Arc::new(Declines { missed: Arc::default(), calls: AtomicUsize::new(0) });
+    let mut worker = FrameServer::new(session.footage.clone(), session.expr.clone());
+    worker.set_accel(Some(declines.clone()));
+    let mut mirror = Mirror::default();
+    worker.handle(mirror.sync(session.revision, &session.project).unwrap());
+    let replies = worker.handle(FrameMsg::Render {
+        id: 18,
+        revision: session.revision,
+        comp,
+        time: Tick::ZERO,
+        opts: Box::new(RenderOpts { backend: Backend::Gpu, ..Default::default() }),
+        disk: None,
+        layers: false,
+        prefetch: vec![],
+    });
+    let (FrameReply::Frame { passes, gpu, .. }, pixels) = &replies[0] else { panic!("CPU retry must complete immediately") };
+    assert_eq!(*passes, 1);
+    assert!(!gpu);
+    assert_eq!(pixels.as_ref().unwrap(), &expected);
+    assert_eq!(declines.calls.load(Ordering::Relaxed), 1);
+}

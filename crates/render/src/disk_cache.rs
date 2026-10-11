@@ -732,7 +732,9 @@ fn decode_layer(p: &[u8]) -> Option<Buf> {
 // ---------------------------------------------------------------- content keys
 
 /// Bump when rendering changes in a way that makes old disk entries wrong.
-const RENDER_VERSION: &str = "effectcraft-render-1";
+// Fork evaluation includes Native Text Counter and checked Native Bloom semantics. Keep the
+// disk container format at v1; existing upstream pixels are misses under this renderer salt.
+const RENDER_VERSION: &str = "effectcraft-5rod-render-3";
 
 fn hash_debug(h: &mut Hash128, v: &impl std::fmt::Debug) {
     h.write(format!("{v:?}").as_bytes());
@@ -764,8 +766,12 @@ fn footage_stamp(h: &mut Hash128, f: &effectcraft_project::Footage) {
 /// Salt for layer cache keys on disk: the renderer version and every footage file's identity
 /// (layer keys name footage items, not file contents).
 pub fn footage_salt(project: &effectcraft_project::Project) -> u64 {
+    footage_salt_with_version(project, RENDER_VERSION)
+}
+
+fn footage_salt_with_version(project: &effectcraft_project::Project, version: &str) -> u64 {
     let mut h = Hash128::default();
-    h.write(RENDER_VERSION.as_bytes());
+    h.write(version.as_bytes());
     for (id, it) in &project.items {
         if let effectcraft_project::ItemKind::Footage(f) = &it.kind {
             h.write_u64(id.0);
@@ -782,9 +788,13 @@ pub fn footage_salt(project: &effectcraft_project::Project) -> u64 {
 /// files' size and time). With expressions in play (which can read any comp) the whole project
 /// counts. Switches that don't change pixels (Audio, Lock, Shy, Hide Shy Layers) don't count.
 pub fn comp_content_key(project: &effectcraft_project::Project, comp: effectcraft_project::ItemId) -> u128 {
+    comp_content_key_with_version(project, comp, RENDER_VERSION)
+}
+
+fn comp_content_key_with_version(project: &effectcraft_project::Project, comp: effectcraft_project::ItemId, version: &str) -> u128 {
     use effectcraft_project::{ItemKind, LayerSource};
     let mut h = Hash128::default();
-    h.write(RENDER_VERSION.as_bytes());
+    h.write(version.as_bytes());
     hash_debug(&mut h, &project.settings);
     let mut seen = std::collections::BTreeSet::new();
     let mut stack = vec![comp];
@@ -1009,5 +1019,27 @@ mod tests {
         for k in 0..5u128 {
             assert_eq!(b.get_layer(k).unwrap().img, buf(k as u32, 16, 16).img);
         }
+    }
+}
+
+#[cfg(test)]
+mod render_version_tests {
+    use super::*;
+    use effectcraft_project::{Comp, ItemKind, Project};
+    use effectcraft_time::{FrameRate, Tick};
+
+    #[test]
+    fn checked_fork_render_salt_rejects_upstream_frame_and_layer_cache_keys() {
+        let mut project = Project::default();
+        let comp =
+            project.add_item("Cache salt", Default::default(), None, ItemKind::Comp(Comp::new(8, 8, FrameRate::FPS_30, Tick::from_seconds_f64(1.0)).into()));
+        let current = comp_content_key(&project, comp);
+        for previous in ["effectcraft-render-1", "effectcraft-5rod-render-2"] {
+            let old_content = comp_content_key_with_version(&project, comp, previous);
+            assert_ne!(old_content, current);
+            assert_ne!(frame_key(old_content, 0, 1000, 0), frame_key(current, 0, 1000, 0));
+            assert_ne!(footage_salt_with_version(&project, previous), footage_salt(&project));
+        }
+        assert_eq!(VERSION, "v1", "only renderer semantics change, not the cache file format");
     }
 }

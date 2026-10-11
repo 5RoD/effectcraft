@@ -298,7 +298,7 @@ fn render(id: &str, set: &Set, time: f64, bpc8: bool, half: bool) -> Image {
     let masks = masks();
     let env = EffectEnv { host: Some(&host), masks: &masks, frame_rate: 30.0, comp_time: time, ..Default::default() };
     let ctx = EffectCtx { params: &params, time, layer_size: size, seed: 1, adjustment: false, env };
-    let mut out = apply(spec, &ctx, buf).img;
+    let mut out = apply(spec, &ctx, buf).unwrap().img;
     if bpc8 {
         out.clamp01();
         out.quantize(255.0);

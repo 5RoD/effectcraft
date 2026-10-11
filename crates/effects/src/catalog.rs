@@ -129,8 +129,8 @@ pub fn effects_markdown() -> String {
     s.push_str(&format!(
         "EffectCraft ships {} effects with {} parameters in total, grouped into the same categories as the Effects & Presets \
          panel. Every effect is our own implementation, written from public behaviour descriptions and standard \
-         image-processing literature. Parameter names, order, popup options, units, defaults and ranges follow the \
-         reference application so that projects, expressions and muscle memory carry over.\n\n",
+         image-processing literature. Reference-workflow effects use corresponding parameter names, order, popup \
+         options, units, defaults and ranges; original native tools use their own documented controls.\n\n",
         r.len(),
         params
     ));

@@ -22,7 +22,7 @@ use crate::util::{fit_layer, unpremul};
 use crate::{Buf, EffectCtx, EffectSpec, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
-    EffectSpec { id, name, category: "Time", params, render, gpu: false, float: true }
+    EffectSpec { id, name, category: "Time", params, render: crate::EffectRender::Legacy(render), gpu: false, float: true }
 }
 
 pub fn specs() -> Vec<EffectSpec> {

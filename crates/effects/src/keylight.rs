@@ -529,7 +529,7 @@ pub fn specs() -> Vec<EffectSpec> {
             pp("sourceCrops/cropTop", "Top", pct(0.0)),
             pp("sourceCrops/cropBottom", "Bottom", pct(0.0)),
         ],
-        render: key_light,
+        render: crate::EffectRender::Legacy(key_light),
         gpu: false,
         float: true,
     }]

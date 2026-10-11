@@ -74,7 +74,7 @@ pub fn specs() -> Vec<EffectSpec> {
             p(DELETED, "Deleted Points", Value::Str(String::new()), ParamUi::Hidden),
             p(CAMERA, "Camera Layer", num(0.0), ParamUi::Hidden),
         ],
-        render,
+        render: crate::EffectRender::Legacy(render),
         gpu: false,
         float: true,
     }]

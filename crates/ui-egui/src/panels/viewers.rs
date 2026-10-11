@@ -114,6 +114,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: u32, rect: Rect) {
                 }
             }
             p.rect_stroke(r, 0.0, egui::Stroke::new(1.0, t.separator), egui::StrokeKind::Outside);
+            super::viewer::render_error_banner(app, ui, rect, key);
         }
         None => {
             p.text(rect.center(), Align2::CENTER_CENTER, "Click to show the active composition here", Tokens::ui(12.0), t.text_faint);

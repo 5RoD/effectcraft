@@ -61,7 +61,7 @@ pub const BLEND_NORMAL: u32 = 1;
 pub const NOISE_SOFT_LINEAR: u32 = 2;
 
 fn spec(id: &'static str, name: &'static str, params: Vec<ParamSpec>, render: crate::RenderFn) -> EffectSpec {
-    EffectSpec { id, name, category: "Noise & Grain", params, render, gpu: false, float: true }
+    EffectSpec { id, name, category: "Noise & Grain", params, render: crate::EffectRender::Legacy(render), gpu: false, float: true }
 }
 
 fn params(turbulent: bool) -> Vec<ParamSpec> {

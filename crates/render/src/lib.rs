@@ -12,11 +12,14 @@ pub mod audio;
 pub mod auto;
 pub mod cache;
 pub mod color;
+pub mod diagnostics;
 pub mod disk_cache;
 use color::Region;
+pub use diagnostics::{FrameDiagnostics, FrameFailure};
 pub mod eval;
 pub mod masks;
 pub mod passes;
+pub mod raster_bounds;
 pub mod shapes;
 pub mod styles;
 pub mod text;
@@ -260,7 +263,7 @@ impl Backend {
     }
 }
 
-/// One effect of a GPU effect chain (see [`Accelerator::effects`]).
+/// One GPU effect step (see [`Accelerator::effects`] and [`Accelerator::effect_checked`]).
 pub struct FxStep<'x> {
     pub spec: &'static effectcraft_effects::EffectSpec,
     pub ctx: EffectCtx<'x>,
@@ -277,9 +280,15 @@ pub trait Accelerator: Send + Sync {
     fn comp_frame(&self, r: &Renderer, comp: ItemId, t: Tick) -> Option<Image>;
     /// The accelerator implements effect `id` with the CPU effect's semantics.
     fn supports_effect(&self, id: &str) -> bool;
-    /// Run a chain of supported effects on `buf`, clamping and quantising to `levels` after
-    /// every effect when set (8/16 bpc). `None` = not handled.
+    /// Run a chain of supported legacy effects on `buf`, clamping and quantising to `levels`
+    /// after every effect when set (8/16 bpc). `None` = not handled. Checked kernels use
+    /// [`Accelerator::effect_checked`] so a failure cannot collapse into this Option.
     fn effects(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<Buf>;
+    /// One checked accelerator effect. Unsupported backends return Ok(None); actual
+    /// failures stay explicit. Deferred placeholders must raise the usual miss gate.
+    fn effect_checked(&self, _step: &FxStep, _buf: &Buf, _levels: Option<f32>) -> Result<Option<Buf>, String> {
+        Ok(None)
+    }
     /// Rasterise and shade an Advanced 3D scene at its raster size (depth buffer, PBR, image
     /// based light, shadow maps), with the CPU rasteriser's semantics
     /// ([`three_d::adv::raster::render`]). `None` = not handled (the CPU renders it).
@@ -334,8 +343,16 @@ pub trait FxTarget {
     /// Run a chain of accelerator-supported effects (quantising after each to the bit depth).
     /// `false` = not handled: the effects then run one by one through [`FxTarget::cpu`].
     fn gpu(&mut self, steps: &[FxStep]) -> bool;
+    /// One checked GPU effect. Ok(false) means unsupported, so the checked CPU kernel
+    /// runs instead. Deferred work raises the miss gate and returns Ok(true).
+    fn gpu_checked(&mut self, _step: &FxStep) -> Result<bool, String> {
+        Ok(false)
+    }
     /// Run one CPU effect: `f` maps the buffer.
     fn cpu(&mut self, f: &mut dyn FnMut(Buf) -> Buf);
+    /// A checked CPU kernel. `Ok(false)` means a deferred readback is still pending; no
+    /// kernel ran and the existing frame-pass loop must retry. Actual failures return Err.
+    fn cpu_checked(&mut self, f: &mut dyn FnMut(Buf) -> Result<Buf, String>) -> Result<bool, String>;
 }
 
 /// The CPU effect target (GPU chains go through [`Accelerator::effects`]: upload, readback).
@@ -360,6 +377,21 @@ impl FxTarget for CpuFx<'_> {
         if let Some(b) = self.buf.take() {
             self.buf = Some(f(b));
         }
+    }
+    fn gpu_checked(&mut self, step: &FxStep) -> Result<bool, String> {
+        let (Some(accel), Some(input)) = (self.accel, &self.buf) else { return Ok(false) };
+        match accel.effect_checked(step, input, self.levels)? {
+            Some(output) => {
+                self.buf = Some(output);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+    fn cpu_checked(&mut self, f: &mut dyn FnMut(Buf) -> Result<Buf, String>) -> Result<bool, String> {
+        let input = self.buf.take().ok_or("checked effect has no input buffer")?;
+        self.buf = Some(f(input)?);
+        Ok(true)
     }
 }
 
@@ -423,6 +455,7 @@ pub struct Renderer<'a> {
     pub cache: Option<&'a LayerCache>,
     /// Optional per-layer timing sink (`frame --bench` / perf readouts).
     pub profile: Option<&'a std::sync::Mutex<Vec<LayerTiming>>>,
+    pub diagnostics: Option<&'a FrameDiagnostics>,
     /// GPU backend used when [`RenderOpts::backend`] asks for it.
     pub accel: Option<&'a dyn Accelerator>,
     /// Current nesting depth (precomp recursion guard).
@@ -515,6 +548,13 @@ pub struct LayerTiming {
     pub cached: bool,
 }
 
+/// A checked frame and whether a failed accelerated attempt completed via a fresh CPU retry.
+/// Deferred callers must not wait for obsolete readbacks after that completed software frame.
+pub struct CheckedFrame {
+    pub image: Image,
+    pub cpu_retry: bool,
+}
+
 impl<'a> Renderer<'a> {
     pub fn new(project: &'a Project, footage: &'a dyn FootageSource, opts: RenderOpts) -> Renderer<'a> {
         Renderer {
@@ -524,6 +564,7 @@ impl<'a> Renderer<'a> {
             opts,
             cache: None,
             profile: None,
+            diagnostics: None,
             accel: None,
             depth: 0,
             pipe: color::Pipe::of(&project.settings),
@@ -616,6 +657,13 @@ impl<'a> Renderer<'a> {
     pub fn collapse_into(&self, ctx: &EvalCtx<'a>, layer: &'a Layer, item: ItemId, opacity: f32) -> Option<(Renderer<'a>, EvalCtx<'a>)> {
         let nc = self.project.comp(item)?;
         let t = ctx.nested_time(layer);
+        self.checked_raster(
+            raster_bounds::frame(nc.width, nc.height, self.opts.scale, None),
+            item,
+            effectcraft_project::LayerId(0),
+            t,
+            "collapsed composition",
+        )?;
         if !nc.covers(t) {
             return None;
         }
@@ -717,6 +765,10 @@ impl<'a> Renderer<'a> {
         Renderer { accel, ..*self }
     }
 
+    pub fn with_diagnostics<'b>(&'b self, diagnostics: &'b FrameDiagnostics) -> Renderer<'b> {
+        Renderer { diagnostics: Some(diagnostics), ..*self }
+    }
+
     /// The accelerator to use for this render, if any (see [`Backend`]).
     pub fn active_accel(&self) -> Option<&'a dyn Accelerator> {
         let a = self.accel?;
@@ -730,6 +782,15 @@ impl<'a> Renderer<'a> {
     /// Render a composition at comp time `t` (transparent background, comp size × scale).
     /// Top-level frames go to the GPU when [`Self::active_accel`] is set and handles them.
     pub fn comp_frame(&self, comp_id: ItemId, t: Tick) -> Image {
+        if self.diagnostics.is_none() {
+            return self.local_result(|renderer| renderer.comp_frame(comp_id, t)).unwrap_or_else(|error| {
+                log::error!("{error}");
+                Image::new(1, 1)
+            });
+        }
+        if self.frame_raster(comp_id, t).is_none() {
+            return Image::new(1, 1);
+        }
         // Classic 3D runs composite on the GPU too (M12.7), so Auto sends 3D comps there as well;
         // Auto renders each comp on whichever compositor measured faster ([`AutoPick`]).
         if self.depth == 0
@@ -758,6 +819,104 @@ impl<'a> Renderer<'a> {
         self.comp_frame_cpu(comp_id, t)
     }
 
+    /// User-facing frame boundary. Nested work shares this attempt's diagnostics without
+    /// changing legacy layer/effect functions. Failed provisional pixels never escape here.
+    pub fn comp_frame_checked(&self, comp: ItemId, time: Tick) -> Result<Image, FrameFailure> {
+        self.comp_frame_attempt(comp, time).map(|frame| frame.image)
+    }
+
+    pub fn comp_frame_attempt(&self, comp: ItemId, time: Tick) -> Result<CheckedFrame, FrameFailure> {
+        self.checked_frame(comp, time, false)
+    }
+
+    /// CPU compositor with the existing effect-acceleration policy and checked failures.
+    pub fn comp_frame_cpu_checked(&self, comp: ItemId, time: Tick) -> Result<Image, FrameFailure> {
+        self.checked_frame(comp, time, true).map(|frame| frame.image)
+    }
+
+    fn checked_frame(&self, comp: ItemId, time: Tick, cpu: bool) -> Result<CheckedFrame, FrameFailure> {
+        let diagnostics = FrameDiagnostics::default();
+        let renderer = Renderer { diagnostics: Some(&diagnostics), ..*self };
+        let image = if cpu { renderer.comp_frame_cpu(comp, time) } else { renderer.comp_frame(comp, time) };
+        match diagnostics.result(image) {
+            Err(_) if self.active_accel().is_some() => {
+                // A checked CPU step may fail during GPU transfer while its CPU render is
+                // valid. The retry has fresh diagnostics and cannot read provisional cache.
+                let retry = FrameDiagnostics::default();
+                let renderer =
+                    Renderer { diagnostics: Some(&retry), accel: None, cache: None, opts: RenderOpts { backend: Backend::Cpu, ..self.opts }, ..*self };
+                retry.result(renderer.comp_frame_cpu(comp, time)).map(|image| CheckedFrame { image, cpu_retry: true })
+            }
+            result => result.map(|image| CheckedFrame { image, cpu_retry: false }),
+        }
+    }
+
+    /// Even legacy infallible entry points get a local sink, so they cannot poison caches
+    /// later read by a checked frame. User-facing callers use the explicit Result methods.
+    fn local_result<T>(&self, render: impl FnOnce(&Renderer<'_>) -> T) -> Result<T, FrameFailure> {
+        let diagnostics = FrameDiagnostics::default();
+        let renderer = Renderer { diagnostics: Some(&diagnostics), ..*self };
+        diagnostics.result(render(&renderer))
+    }
+
+    pub fn cache_allowed(&self) -> bool {
+        self.diagnostics.is_none_or(|diagnostics| !diagnostics.failed())
+    }
+
+    fn checked_raster<T>(&self, result: Result<T, String>, comp: ItemId, layer: effectcraft_project::LayerId, time: Tick, source: &str) -> Option<T> {
+        match result {
+            Ok(value) => Some(value),
+            Err(message) => {
+                let failure = FrameFailure { comp, layer, time, effect_uid: 0, effect_id: "render.raster".into(), message: format!("{source}: {message}") };
+                if let Some(diagnostics) = self.diagnostics {
+                    diagnostics.record(failure);
+                } else {
+                    log::error!("{failure}");
+                }
+                None
+            }
+        }
+    }
+
+    /// Shared CPU/GPU pre-allocation plan. A failed plan records a terminal frame error.
+    pub fn frame_raster(&self, comp_id: ItemId, time: Tick) -> Option<raster_bounds::FrameRaster> {
+        let comp = self.project.comp(comp_id)?;
+        self.checked_raster(
+            raster_bounds::frame(comp.width, comp.height, self.opts.scale, self.opts.roi.filter(|_| self.top)),
+            comp_id,
+            effectcraft_project::LayerId(0),
+            time,
+            "composition/ROI",
+        )
+    }
+
+    /// Validate document geometry even before a cached layer can bypass source evaluation.
+    fn layer_raster_valid(&self, ctx: &EvalCtx, layer: &Layer) -> Option<()> {
+        self.frame_raster(ctx.comp_id, ctx.time)?;
+        match layer.source {
+            LayerSource::Solid { item } => {
+                if let Some(ItemKind::Solid(solid)) = self.project.item(item).map(|item| &item.kind) {
+                    self.checked_raster(raster_bounds::solid(solid.width, solid.height, self.opts.scale), ctx.comp_id, layer.id, ctx.time, "solid source")?;
+                }
+            }
+            LayerSource::Comp { item } => {
+                if let Some(comp) = self.project.comp(item) {
+                    let full = self.opts.scale < 1.0 && comp.preserve_resolution && self.proxy_for(item).is_none();
+                    let scale = if full { 1.0 } else { self.opts.scale };
+                    self.checked_raster(
+                        raster_bounds::frame(comp.width, comp.height, scale, None),
+                        item,
+                        effectcraft_project::LayerId(0),
+                        ctx.nested_time(layer),
+                        "nested composition",
+                    )?;
+                }
+            }
+            _ => {}
+        }
+        Some(())
+    }
+
     /// The Auto timing history and key for a top-level frame of `comp` (`None` unless the
     /// backend is [`Backend::Auto`] and the accelerator keeps history).
     pub fn frame_auto(&self, a: &'a dyn Accelerator, comp: ItemId, display: bool) -> Option<(&'a AutoPick, AutoKey)> {
@@ -769,10 +928,14 @@ impl<'a> Renderer<'a> {
 
     /// [`Self::comp_frame`] on the CPU compositor only.
     pub fn comp_frame_cpu(&self, comp_id: ItemId, t: Tick) -> Image {
+        if self.diagnostics.is_none() {
+            return self.local_result(|renderer| renderer.comp_frame_cpu(comp_id, t)).unwrap_or_else(|error| {
+                log::error!("{error}");
+                Image::new(1, 1)
+            });
+        }
         let Some(comp) = self.project.comp(comp_id) else { return Image::new(1, 1) };
-        let s = self.opts.scale;
-        let w = ((comp.width as f64 * s).round() as u32).max(1);
-        let h = ((comp.height as f64 * s).round() as u32).max(1);
+        let Some(plan) = self.frame_raster(comp_id, t) else { return Image::new(1, 1) };
         // Region of interest on a comp with 3D layers: render the frame and crop it. A region
         // reaching past the comp frame (the Extended Viewer) renders Classic 3D natively — the
         // planes project through the offset camera — and Advanced 3D as the frame, padded.
@@ -782,8 +945,9 @@ impl<'a> Renderer<'a> {
             && (roi_inside(r, comp.width, comp.height) || comp.renderer == effectcraft_project::Renderer::Advanced3D)
         {
             let full = Renderer { opts: RenderOpts { roi: None, ..self.opts }, ..*self }.comp_frame(comp_id, t);
-            let (x0, y0) = ((r[0] * s).round() as i64, (r[1] * s).round() as i64);
-            let (rw, rh) = (((r[2] * s).round() as u32).max(1), ((r[3] * s).round() as u32).max(1));
+            let Some(region) = plan.roi else { return Image::new(1, 1) };
+            let [rw, rh] = region.size;
+            let [x0, y0] = region.offset.map(|coordinate| coordinate as i64);
             let mut out = Image::new(rw, rh);
             for y in 0..rh as i64 {
                 let sy = y + y0;
@@ -799,10 +963,7 @@ impl<'a> Renderer<'a> {
             }
             return out;
         }
-        let (w, h) = match self.roi_offset() {
-            Some((_, _, rw, rh)) => (rw, rh),
-            None => (w, h),
-        };
+        let [w, h] = plan.output_size();
         let mut canvas = Image::new(w, h);
         if self.depth > 16 {
             return canvas;
@@ -936,8 +1097,12 @@ impl<'a> Renderer<'a> {
             if let Some(a) = accel
                 && spec.gpu
                 && a.supports_effect(spec.id)
+                && matches!(spec.render, effectcraft_effects::EffectRender::Legacy(_))
             {
-                let run: Vec<_> = stack[k..].iter().take_while(|(_, _, s)| s.gpu && a.supports_effect(s.id)).collect();
+                let run: Vec<_> = stack[k..]
+                    .iter()
+                    .take_while(|(_, _, s)| s.gpu && a.supports_effect(s.id) && matches!(s.render, effectcraft_effects::EffectRender::Legacy(_)))
+                    .collect();
                 let params: Vec<Params> = run.iter().map(|(_, g, _)| self.effect_params(ctx, layer, g)).collect();
                 let steps: Vec<FxStep> = run
                     .iter()
@@ -963,12 +1128,45 @@ impl<'a> Renderer<'a> {
             let env = EffectEnv { effect_index: i, ..env };
             let ectx = EffectCtx { params: &params, time: lt.seconds(), layer_size, seed: g.uid as u32, adjustment, env };
             let t0 = web_time::Instant::now();
-            target.cpu(&mut |buf| {
-                let mut buf = effectcraft_effects::apply(spec, &ectx, buf);
-                // 8/16 bpc effects write integer pixels.
-                self.pipe.quantize(&mut buf.img);
-                buf
-            });
+            match spec.render {
+                effectcraft_effects::EffectRender::Legacy(render) => target.cpu(&mut |buf| {
+                    let mut buf = render(&ectx, buf);
+                    self.pipe.quantize(&mut buf.img);
+                    buf
+                }),
+                effectcraft_effects::EffectRender::Checked(render) => {
+                    let step = FxStep { spec, ctx: ectx };
+                    let gpu_result = if spec.gpu && accel.is_some_and(|accel| accel.supports_effect(spec.id)) { target.gpu_checked(&step) } else { Ok(false) };
+                    let result = match gpu_result {
+                        Ok(true) => Ok(true),
+                        Err(error) => Err(error),
+                        Ok(false) => target.cpu_checked(&mut |buf| {
+                            let mut buf = render(&step.ctx, buf)?;
+                            self.pipe.quantize(&mut buf.img);
+                            Ok(buf)
+                        }),
+                    };
+                    match result {
+                        Ok(true) => {}
+                        Ok(false) => return,
+                        Err(message) => {
+                            if let Some(diagnostics) = self.diagnostics {
+                                diagnostics.record(FrameFailure {
+                                    comp: ctx.comp_id,
+                                    layer: layer.id,
+                                    effect_uid: g.uid,
+                                    effect_id: spec.id.to_owned(),
+                                    time: ctx.time,
+                                    message,
+                                });
+                            } else {
+                                log::error!("checked effect {} failed: {message}", spec.id);
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
             if let Some(v) = timing.as_deref_mut() {
                 v.push((spec.id.to_string(), t0.elapsed().as_secs_f64() * 1e3));
             }
@@ -977,12 +1175,12 @@ impl<'a> Renderer<'a> {
 
     /// Source pixels of a layer in layer space (before masks/effects).
     fn source(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Buf> {
+        self.layer_raster_valid(ctx, layer)?;
         let s = self.opts.scale;
         match &layer.source {
             LayerSource::Solid { item } => {
                 let ItemKind::Solid(sol) = &self.project.item(*item)?.kind else { return None };
-                let w = ((sol.width as f64 * s).ceil() as u32).max(1);
-                let h = ((sol.height as f64 * s).ceil() as u32).max(1);
+                let [w, h] = self.checked_raster(raster_bounds::solid(sol.width, sol.height, s), ctx.comp_id, layer.id, ctx.time, "solid source")?;
                 if layer.switches.adjustment {
                     return Some(Buf { img: Image::filled(w, h, [1.0; 4]), offset: [0.0; 2], scale: s });
                 }
@@ -1139,7 +1337,9 @@ impl<'a> Renderer<'a> {
                 let b = self.footage.frame(item, f, f.frame_rate.tick_of(i + 1));
                 if let (Some(a), Some(b)) = (a, b) {
                     let img = blend_frames(mode, &a, &b, w as f32);
-                    if let (Some(c), Some(k)) = (self.cache, key) {
+                    if let (Some(c), Some(k)) = (self.cache, key)
+                        && self.cache_allowed()
+                    {
                         c.insert(k, Arc::new(Buf { img: img.clone(), offset: [0.0; 2], scale: 1.0 }));
                     }
                     return Some(Arc::new(img));
@@ -1166,11 +1366,17 @@ impl<'a> Renderer<'a> {
     /// Fully processed layer buffer (source → masks → effects → layer styles, flattened).
     /// Served from the layer cache when the layer's content key matches.
     pub fn layer_buf(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Arc<Buf>> {
+        if self.diagnostics.is_none() {
+            return self.local_result(|renderer| renderer.layer_buf(ctx, layer)).ok().flatten();
+        }
         self.layer_buf_keyed(ctx, layer).map(|(b, _)| b)
     }
 
     /// [`Self::layer_buf`] in the blending space (linear with Blend Colors Using 1.0 Gamma).
     pub fn blend_layer_buf(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Arc<Buf>> {
+        if self.diagnostics.is_none() {
+            return self.local_result(|renderer| renderer.blend_layer_buf(ctx, layer)).ok().flatten();
+        }
         let (b, k) = self.layer_buf_keyed(ctx, layer)?;
         Some(self.to_blend(b, k))
     }
@@ -1187,7 +1393,9 @@ impl<'a> Renderer<'a> {
         let mut nb = (*b).clone();
         color::convert(&mut nb.img, &c);
         let nb = Arc::new(nb);
-        if let (Some(cache), Some(k)) = (self.cache, key) {
+        if let (Some(cache), Some(k)) = (self.cache, key)
+            && self.cache_allowed()
+        {
             cache.insert(k, nb.clone());
         }
         nb
@@ -1205,7 +1413,9 @@ impl<'a> Renderer<'a> {
             return Some((b, key));
         }
         let flat = Arc::new(styles::Styled { passes: st.passes.iter().map(|(b, m)| ((**b).clone(), *m)).collect(), body: (*st.body).clone() }.flatten());
-        if let (Some(c), Some(k)) = (self.cache, key) {
+        if let (Some(c), Some(k)) = (self.cache, key)
+            && self.cache_allowed()
+        {
             c.insert(k, flat.clone());
         }
         Some((flat, key))
@@ -1215,15 +1425,22 @@ impl<'a> Renderer<'a> {
     /// (what the motion tracker analyses, like After Effects' Layer panel). `None` for layers
     /// without pixels.
     pub fn layer_source(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Buf> {
+        if self.diagnostics.is_none() {
+            return self.local_result(|renderer| renderer.layer_source(ctx, layer)).ok().flatten();
+        }
         self.source(ctx, layer)
     }
 
     /// Layer pixels after source → masks → effects (no layer styles).
     pub fn content_buf(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Arc<Buf>> {
+        if self.diagnostics.is_none() {
+            return self.local_result(|renderer| renderer.content_buf(ctx, layer)).ok().flatten();
+        }
         self.content_buf_timed(ctx, layer, None).map(|(b, _)| b)
     }
 
     fn content_buf_timed(&self, ctx: &EvalCtx, layer: &Layer, mut timing: Option<&mut LayerTiming>) -> Option<(Arc<Buf>, Option<u64>)> {
+        self.layer_raster_valid(ctx, layer)?;
         let key = self.cache.and_then(|_| cache::layer_key(ctx, layer, self.raster_scale(ctx, layer), self.opts.draft, self.mb_on(ctx, layer)));
         let key = self.content_key(ctx, layer, key);
         if let (Some(c), Some(k)) = (self.cache, key)
@@ -1236,7 +1453,9 @@ impl<'a> Renderer<'a> {
         }
         let buf = self.masked_source(ctx, layer)?;
         let buf = Arc::new(self.apply_effects_timed(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects)));
-        if let (Some(c), Some(k)) = (self.cache, key) {
+        if let (Some(c), Some(k)) = (self.cache, key)
+            && self.cache_allowed()
+        {
             c.insert(k, buf.clone());
         }
         Some((buf, key))
@@ -1246,6 +1465,10 @@ impl<'a> Renderer<'a> {
     /// (what Time effects read at neighbouring times). Served from / stored in the layer cache
     /// under its own key, so scrubbing reuses frames rendered for earlier output frames.
     pub fn layer_input(&self, ctx: &EvalCtx, layer: &Layer, effects: usize) -> Option<Arc<Buf>> {
+        if self.diagnostics.is_none() {
+            return self.local_result(|renderer| renderer.layer_input(ctx, layer, effects)).ok().flatten();
+        }
+        self.layer_raster_valid(ctx, layer)?;
         let key = self.cache.and_then(|_| cache::input_key(ctx, layer, self.raster_scale(ctx, layer), self.opts.draft, self.mb_on(ctx, layer), effects));
         let key = self.content_key(ctx, layer, key);
         if let (Some(c), Some(k)) = (self.cache, key)
@@ -1258,7 +1481,9 @@ impl<'a> Renderer<'a> {
             buf = self.apply_effects_timed(ctx, layer, buf, false, effects, None);
         }
         let buf = Arc::new(buf);
-        if let (Some(c), Some(k)) = (self.cache, key) {
+        if let (Some(c), Some(k)) = (self.cache, key)
+            && self.cache_allowed()
+        {
             c.insert(k, buf.clone());
         }
         Some(buf)
@@ -1291,9 +1516,13 @@ impl<'a> Renderer<'a> {
         let body = Arc::new(st.body);
         let passes: Vec<_> = st.passes.into_iter().map(|(b, m)| (Arc::new(b), m)).collect();
         if let (Some(c), Some(k)) = (self.cache, key) {
-            c.insert(k, body.clone());
+            if self.cache_allowed() {
+                c.insert(k, body.clone());
+            }
             for (i, (b, _)) in passes.iter().enumerate() {
-                c.insert(cache::derive(k, i as u64 + 1), b.clone());
+                if self.cache_allowed() {
+                    c.insert(cache::derive(k, i as u64 + 1), b.clone());
+                }
             }
         }
         Some(StyledLayer { passes, body, content, key, ckey, plain: false })
@@ -1327,11 +1556,9 @@ impl<'a> Renderer<'a> {
     /// pixels and its size. `None` renders the whole comp (no ROI, or a nested comp).
     pub(crate) fn roi_offset(&self) -> Option<(f64, f64, u32, u32)> {
         let r = self.opts.roi.filter(|_| self.top)?;
-        let s = self.opts.scale;
-        if r[2] <= 0.0 || r[3] <= 0.0 {
-            return None;
-        }
-        Some(((r[0] * s).round(), (r[1] * s).round(), ((r[2] * s).round() as u32).max(1), ((r[3] * s).round() as u32).max(1)))
+        // Frame/source entry points record rejected ROI plans; transform helpers only read it.
+        let region = raster_bounds::roi(r, self.opts.scale).ok()?;
+        Some((region.offset[0], region.offset[1], region.size[0], region.size[1]))
     }
 
     /// The region of interest's offset in output pixels for 3D projection (0 without one).
@@ -1813,6 +2040,7 @@ impl<'a> Renderer<'a> {
 
     /// Evaluation context of comp `comp_id` at comp time `t`.
     pub fn eval_ctx(&self, comp_id: ItemId, t: Tick) -> Option<EvalCtx<'a>> {
+        self.frame_raster(comp_id, t)?;
         Some(self.ctx(comp_id, self.project.comp(comp_id)?, t))
     }
 
@@ -1903,6 +2131,10 @@ impl<'a> Renderer<'a> {
     /// An adjustment layer's footprint (its source with masks applied, layer space): where
     /// its effects show. `None` = the layer changes nothing.
     pub fn adjustment_footprint(&self, ctx: &EvalCtx, layer: &Layer) -> Option<Arc<Buf>> {
+        if self.diagnostics.is_none() {
+            return self.local_result(|renderer| renderer.adjustment_footprint(ctx, layer)).ok().flatten();
+        }
+        self.layer_raster_valid(ctx, layer)?;
         // Cached, so an accelerator sees the same buffer (and uploads it once) every frame.
         let key = self.cache.and_then(|_| cache::footprint_key(ctx, layer, self.raster_scale(ctx, layer), self.opts.draft, self.mb_on(ctx, layer)));
         if let (Some(c), Some(k)) = (self.cache, key)
@@ -1913,7 +2145,9 @@ impl<'a> Renderer<'a> {
         let mut foot = self.source(ctx, layer)?;
         let _ = masks::apply(ctx, layer, &mut foot, self.mask_blur(ctx, layer));
         let foot = Arc::new(foot);
-        if let (Some(c), Some(k)) = (self.cache, key) {
+        if let (Some(c), Some(k)) = (self.cache, key)
+            && self.cache_allowed()
+        {
             c.insert(k, foot.clone());
         }
         Some(foot)
@@ -1931,6 +2165,9 @@ impl<'a> Renderer<'a> {
 
     /// The layer's finished buffers (styles included) in the blending space.
     pub fn styled_layer(&self, ctx: &EvalCtx, layer: &Layer) -> Option<StyledLayer> {
+        if self.diagnostics.is_none() {
+            return self.local_result(|renderer| renderer.styled_layer(ctx, layer)).ok().flatten();
+        }
         let mut timing = self.profile.map(|_| LayerTiming { depth: self.depth, layer: layer.name.clone(), ..Default::default() });
         let t0 = web_time::Instant::now();
         let st = self.styled(ctx, layer, timing.as_mut()).map(|st| self.styled_to_blend(st));
@@ -2069,6 +2306,8 @@ pub fn render_frame(project: &Project, comp: ItemId, t: Tick, scale: f64) -> Ima
 mod tests;
 #[cfg(test)]
 mod tests_auto;
+#[cfg(test)]
+mod tests_raster_bounds;
 #[cfg(test)]
 mod tests_remap;
 #[cfg(test)]

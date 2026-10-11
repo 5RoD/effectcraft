@@ -19,7 +19,7 @@ use crate::util::Plane;
 use crate::{Buf, EffectCtx, EffectSpec, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
-    EffectSpec { id, name, category: "Blur & Sharpen", params, render, gpu: false, float: true }
+    EffectSpec { id, name, category: "Blur & Sharpen", params, render: crate::EffectRender::Legacy(render), gpu: false, float: true }
 }
 
 // ---------------------------------------------------------------- CC Radial Blur

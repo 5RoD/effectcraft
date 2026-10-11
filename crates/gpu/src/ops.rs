@@ -181,7 +181,7 @@ pub fn quantize(e: &mut Enc, img: &GpuImage, levels: f32) -> GpuImage {
     out
 }
 
-fn curve_id(s: Option<effectcraft_color::ColorSpace>) -> u32 {
+pub(crate) fn curve_id(s: Option<effectcraft_color::ColorSpace>) -> u32 {
     use effectcraft_color::space::Curve;
     match s.map(|s| s.curve()) {
         None | Some(Curve::Linear) => 0,

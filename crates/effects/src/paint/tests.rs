@@ -16,7 +16,7 @@ fn fx_with(strokes: &[StrokeSpec], tweak: impl Fn(&mut PropGroup)) -> PropGroup 
 fn run(g: &PropGroup, img: Image, time: f64) -> Buf {
     let params = flatten_params(g, &mut |p| p.value.clone());
     let ctx = EffectCtx { params: &params, time, layer_size: [img.width as f64, img.height as f64], seed: 1, adjustment: false, env: EffectEnv::default() };
-    crate::apply(crate::find(ID).unwrap(), &ctx, Buf { img, offset: [0.0; 2], scale: 1.0 })
+    crate::apply(crate::find(ID).unwrap(), &ctx, Buf { img, offset: [0.0; 2], scale: 1.0 }).unwrap()
 }
 
 fn brush(points: &[[f64; 2]]) -> StrokeSpec {

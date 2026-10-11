@@ -22,7 +22,7 @@ use crate::util::{Plane, gauss_plane, hash1, premul, unpremul};
 use crate::{Buf, EffectCtx, EffectSpec, col, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
-    EffectSpec { id, name, category: "3D Channel", params, render, gpu: false, float: true }
+    EffectSpec { id, name, category: "3D Channel", params, render: crate::EffectRender::Legacy(render), gpu: false, float: true }
 }
 
 fn aux(ctx: &EffectCtx) -> Option<Arc<AuxChannels>> {

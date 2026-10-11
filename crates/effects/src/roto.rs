@@ -95,7 +95,7 @@ pub fn specs() -> Vec<EffectSpec> {
             p(INPUT_KEY, "Input Key", Value::Str(String::new()), ParamUi::Hidden),
             p(FROZEN, "Frozen", Value::Str(String::new()), ParamUi::Hidden),
         ],
-        render,
+        render: crate::EffectRender::Legacy(render),
         gpu: false,
         float: true,
     }]
@@ -698,7 +698,7 @@ mod tests {
                 adjustment: false,
                 env: EffectEnv { host: Some(&host), frame_rate: 25.0, ..Default::default() },
             };
-            crate::apply(&specs()[0], &ctx, Buf { img: frame(t), offset: [0.0; 2], scale: 1.0 }).img
+            crate::apply(&specs()[0], &ctx, Buf { img: frame(t), offset: [0.0; 2], scale: 1.0 }).unwrap().img
         };
         // Frame 5 (propagated through frames 1–4).
         let out = run(5.0 / 25.0 + 0.001);
@@ -726,7 +726,7 @@ mod tests {
             adjustment: false,
             env: EffectEnv { host: Some(&host), frame_rate: 25.0, ..Default::default() },
         };
-        let o = crate::apply(&specs()[0], &ctx, Buf { img: frame(0.3), offset: [0.0; 2], scale: 1.0 }).img;
+        let o = crate::apply(&specs()[0], &ctx, Buf { img: frame(0.3), offset: [0.0; 2], scale: 1.0 }).unwrap().img;
         assert!(o.data.iter().all(|p| p[3] == 0.0));
     }
 

@@ -29,7 +29,7 @@ use crate::util::{hash1, point_in_poly};
 use crate::{Buf, EffectCtx, EffectSpec, col, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
-    EffectSpec { id, name, category: "Distort", params, render, gpu: false, float: true }
+    EffectSpec { id, name, category: "Distort", params, render: crate::EffectRender::Legacy(render), gpu: false, float: true }
 }
 
 // ---------------------------------------------------------------- CC Flo Motion

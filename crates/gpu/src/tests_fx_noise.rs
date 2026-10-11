@@ -217,7 +217,7 @@ fn dust_threshold_on_quantized_input() {
         let mut img = crate::tests::pattern(seed, 70, 44);
         effectcraft_render::color::quantize(&mut img, 255.0);
         let buf = effectcraft_effects::Buf { img, offset: [0.0; 2], scale: 1.0 };
-        let cpu = (spec.render)(&ctx(), buf.clone());
+        let cpu = effectcraft_effects::apply(spec, &ctx(), buf.clone()).unwrap();
         let gpu = effectcraft_render::Accelerator::effects(g, &[effectcraft_render::FxStep { spec, ctx: ctx() }], &buf, None).unwrap();
         for (i, (a, b)) in cpu.img.data.iter().zip(&gpu.img.data).enumerate() {
             let d = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0_f32, f32::max);

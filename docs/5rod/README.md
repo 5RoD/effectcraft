@@ -10,7 +10,11 @@ application and Desktop shortcut have not been removed or replaced.
   panel can revisit them after reopening. History is retained without the old 32/99 edit cap by
   default; continuous gestures still form one undo step. Unchanged items and layers are shared in
   the archive, and changed values use lossless structural patches.
-- Recovery checkpoints default to 30 seconds and run in the background on desktop. A failed write
+- Every completed desktop edit is protected by a checked atomic journal, independently of the
+  30-second background checkpoints. Recovery restores the current project and its complete
+  branching history. Separate operating-system leases isolate simultaneous windows; write failures
+  retain the previous acknowledged state and expose a persistent warning with a checked Retry.
+  See [edit recovery](edit-recovery.md) for acceptance and remaining limits. A failed timer write
   does not advance the recovery pointer or rotation slot. The timer does not wait for an unfinished
   writer. A checkpoint that finished immediately before a crash is found even if its sentinel was
   not yet updated. Returning to saved pixels still prompts to preserve newly created redo history.
@@ -46,6 +50,12 @@ application and Desktop shortcut have not been removed or replaced.
   clears. CPU and GPU share a validated radius/padding plan that bounds hostile evaluated
   values before integer conversion. See [Glow bounds](../glow-safety.md) for the 4096-rendered-pixel
   cap at unusually large output/vector scales.
+- Native Bloom is available as an animatable effect with HDR extraction, soft thresholding,
+  multiscale falloff, quality and output controls, and checked CPU/GPU rendering. Adjustment layers
+  retain GPU textures between effect stages. Failed frames cannot enter the cache or replace the
+  last valid preview; exports report the failure and preserve the existing destination. Checked
+  raster bounds reject oversized or nonfinite render requests before allocation. Production
+  performance and moving-footage quality acceptance remain open.
 
 ## Compatibility and persistence limits
 
@@ -56,10 +66,10 @@ Malformed history produces a warning while the valid current project still opens
 copies made by this fork carry the extension too. New counter rigs require this fork's expression
 helper and controls; older builds do not render their generated digits correctly.
 
-Recovery checkpoints are not a per-edit durable journal. A crash can lose changes made since the
-latest successful checkpoint, and no software can promise protection against all disk or hardware
-failures. An append-only edit journal, persistent revision IDs, crash-boundary fault injection and
-recovery diagnostics remain required for the stronger requested saving behavior.
+The native journal protects completed edits once storage acknowledges them. Unfinished operations,
+hardware loss, damaged storage and deleted recovery files remain outside that guarantee. The
+development ZIP at commit `d10346b` predates the journal and Native Bloom integration; it is not an
+accepted replacement for the installed app.
 
 Unlimited retained snapshots can use substantial memory in long projects. Shared layer-property
 trees and archive storage reduce duplication but do not provide lazy loading of old in-memory
@@ -73,8 +83,8 @@ The requested Digit Fiddler, Flow, KeyFast, Deep Glow, Shake Sauce and Twixtor a
 for After Effects. This fork does not load their binaries, scripts or proprietary presets. Original
 native workflow tools now cover the counter, easing-library, quick-transform and seeded-shake
 workflows described above; effect names alone are not quality parity. The integrated tools,
-including font-based text counters, pass the repository gate. Native Bloom is being developed
-separately; its checked renderer is not exposed as a usable effect in this milestone.
+including font-based text counters and Native Bloom, pass the repository gate. These checks do
+not establish commercial plug-in look, performance or workflow parity.
 
 Full UI/shortcut parity, live camera preview, difficult-footage camera tracking, compositing/color
 fidelity, optical-flow retiming, glow quality/performance and codec/export acceptance remain open.
@@ -85,8 +95,8 @@ and the inherited [gap assessment](../gaps.md).
 ## Validation
 
 The complete repository gate is `cargo xtask ci`: formatting, clippy, workspace tests, dependency
-layering, licensed assets and WebAssembly checks. The integrated run passed on 2026-10-09 (local date):
-2,342 tests passed, 26 explicitly optional tests were ignored, all 30 assets were attributed,
+layering, licensed assets and WebAssembly checks. The integrated run passed on 2026-10-11 (local date):
+2,411 tests passed, 26 explicitly optional tests were ignored, all 30 assets were attributed,
 dependency layering passed, and 32 crates passed the WebAssembly check. Formatting and native
 clippy with warnings denied also passed. The WebAssembly check reports one inherited dead-code
 warning in `effectcraft-media::pool::sample_time`.
@@ -104,6 +114,27 @@ was also inspected at 1680×1020 and 640×480; its action buttons remain visible
 The normal production desktop executable launched on the RTX 3050 Vulkan device, reopened the
 counter project, rendered its animated digits through the control API, and exited cleanly using
 an isolated configuration folder. [Performance results](performance.md) report the measured scope.
+
+The new journal also passed a separate Windows desktop test: simultaneous instances, forced
+termination, a real filesystem write failure and retry, Unicode content, exact project/history
+reconstruction, and navigation to an abandoned branch after reopening. Twelve additional process
+termination probes covered temporary writes and publication of records, markers and replacement
+epochs. Those new behavioral runs used release optimization with LTO disabled; they do not
+establish production speed. Their scope is recorded in [edit recovery](edit-recovery.md).
+
+## Playback and export acceptance targets
+
+The requested working footage is **2560×1440 at 60–144 fps**. Playback acceptance must measure
+decoded video in the actual timeline: cold and cached startup, sustained presentation, dropped
+frames, scrubbing latency, p95/p99 frame time and memory growth. Frame deadlines are approximately
+16.67 ms at 60 fps and 6.94 ms at 144 fps. Existing synthetic render and edit benchmarks do not
+prove this target. Effects, codecs and project complexity must be reported with each result.
+
+Maximum-quality export should use the available i9-10900F, RTX 3050 and 32 GB RAM efficiently,
+including parallel work where it improves measured throughput. The user accepts reduced desktop
+responsiveness during export. Measure rendering, transfers, encoding and output separately;
+retain requested resolution, frame rate, color and effect quality, keep memory bounded, and report
+whole-export duration and output validation. Faster export must not silently lower quality.
 
 Before replacing the installed app: all required workflows must be accepted, production binaries
 must pass launch/reopen/render checks, existing projects and preferences must be backed up, and the

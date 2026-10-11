@@ -630,7 +630,7 @@ pub fn display_xform(input: &Space, display: usize, view: usize, inverse: bool) 
 // ---------------------------------------------------------------- effects
 
 fn spec(id: &'static str, name: &'static str, cat: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
-    EffectSpec { id, name, category: cat, params, render, gpu: false, float: true }
+    EffectSpec { id, name, category: cat, params, render: crate::EffectRender::Legacy(render), gpu: false, float: true }
 }
 
 fn space_param(id: &'static str, name: &'static str, default: u32) -> crate::ParamSpec {

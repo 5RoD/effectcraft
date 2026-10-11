@@ -165,7 +165,7 @@ pub fn scope_frame(s: &Session, comp: ItemId, t: Tick, max_side: u32) -> Option<
     let c = s.project.comp(comp)?;
     let long = c.width.max(c.height).max(1) as f64;
     let scale = (max_side as f64 / long).min(1.0);
-    let mut img = s.render(comp, t, RenderOpts { scale, ..Default::default() });
+    let mut img = s.render_checked(comp, t, RenderOpts { scale, ..Default::default() }).ok()?;
     let bg = c.background;
     for p in &mut img.data {
         let k = 1.0 - p[3].clamp(0.0, 1.0);

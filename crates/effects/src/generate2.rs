@@ -16,7 +16,7 @@ use crate::util::{Plane, Rng, gauss_plane, hash1, layer_rect, lerp3, map_xy, smo
 use crate::{Buf, EffectCtx, EffectSpec, col, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
-    EffectSpec { id, name, category: "Generate", params, render, gpu: false, float: true }
+    EffectSpec { id, name, category: "Generate", params, render: crate::EffectRender::Legacy(render), gpu: false, float: true }
 }
 
 fn pt(x: f64, y: f64) -> Value {
@@ -1241,7 +1241,7 @@ mod tests {
             params.values.insert(k.to_string(), v.clone());
         }
         let ctx = EffectCtx { params: &params, time: 0.5, layer_size: ls, seed: 3, adjustment: false, env: Default::default() };
-        crate::apply(s, &ctx, Buf { img, offset: [0.0, 0.0], scale: 1.0 })
+        crate::apply(s, &ctx, Buf { img, offset: [0.0, 0.0], scale: 1.0 }).unwrap()
     }
 
     #[test]
@@ -1307,7 +1307,7 @@ mod tests {
                 params.values.insert(k.to_string(), v.clone());
             }
             let ctx = EffectCtx { params: &params, time: t, layer_size: [64.0, 64.0], seed: 3, adjustment: false, env: Default::default() };
-            crate::apply(s, &ctx, Buf { img: Image::new(64, 64), offset: [0.0, 0.0], scale: 1.0 })
+            crate::apply(s, &ctx, Buf { img: Image::new(64, 64), offset: [0.0, 0.0], scale: 1.0 }).unwrap()
         };
         // One wave born at t = 0, 0.2 s old: radius = Expansion × age = 20 px.
         let base = [("waveMotion/expansion", num(100.0)), ("waveMotion/frequency", num(0.5))];
@@ -1521,7 +1521,7 @@ mod tests {
             params.values.insert("cellPattern".into(), Value::Enum(pat));
             params.values.insert("size".into(), num(12.0));
             let ctx = EffectCtx { params: &params, time: 0.0, layer_size: [48.0, 48.0], seed: 1, adjustment: false, env: Default::default() };
-            crate::apply(s, &ctx, Buf { img: Image::new(48, 48), offset: [0.0; 2], scale: 1.0 }).img
+            crate::apply(s, &ctx, Buf { img: Image::new(48, 48), offset: [0.0; 2], scale: 1.0 }).unwrap().img
         };
         let distinct = |img: &Image| {
             let mut v: Vec<u32> = img.data.iter().map(|p| (p[0] * 10000.0) as u32).collect();

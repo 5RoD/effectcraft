@@ -148,7 +148,7 @@ pub(crate) async fn webm_av1(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut
         let end = (i + batch).min(total);
         // RGB, or the alpha matte alone (Channels: Alpha); AV1 in WebM carries no alpha track.
         let channels = if job.output.channels == Channels::Alpha { Channels::Alpha } else { Channels::Rgb };
-        let frames: Vec<Vec<u8>> = job.frames(comp, (i..end).collect(), |_, img| job.pixels(&img, comp, channels, w, h)).await;
+        let frames: Vec<Vec<u8>> = job.frames(comp, (i..end).collect(), |_, img| job.pixels(&img, comp, channels, w, h)).await?;
         for (j, px) in frames.iter().enumerate() {
             let k = i + j as u64;
             for p in venc.encode(px, k)? {

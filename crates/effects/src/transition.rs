@@ -14,7 +14,7 @@ use crate::util::{Plane, gauss_plane, hash1, layer_rect, remap, unpremul};
 use crate::{Buf, EffectCtx, EffectSpec, ParamSpec, col, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<ParamSpec>, render: crate::RenderFn) -> EffectSpec {
-    EffectSpec { id, name, category: "Transition", params, render, gpu: false, float: true }
+    EffectSpec { id, name, category: "Transition", params, render: crate::EffectRender::Legacy(render), gpu: false, float: true }
 }
 
 fn completion(ctx: &EffectCtx) -> f64 {
@@ -627,7 +627,7 @@ mod tests {
         }
         let ctx =
             EffectCtx { params: &params, time: 0.0, layer_size: [img.width as f64, img.height as f64], seed: 7, adjustment: false, env: Default::default() };
-        (s.render)(&ctx, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 }).img
+        crate::apply(s, &ctx, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 }).unwrap().img
     }
 
     fn ramp(w: u32, h: u32) -> Image {
@@ -811,7 +811,7 @@ mod tests {
             params.values.insert("gradientPlacement".into(), Value::Enum(placement));
             let env = crate::EffectEnv { host: Some(&host), ..Default::default() };
             let ctx = EffectCtx { params: &params, time: 0.0, layer_size: [40.0, 4.0], seed: 7, adjustment: false, env };
-            (s.render)(&ctx, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 }).img
+            crate::apply(s, &ctx, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 }).unwrap().img
         };
         // Stretched: one ramp across the layer.
         let st = wipe(2);
@@ -841,7 +841,7 @@ mod tests {
         }
         let env = crate::EffectEnv { host, ..Default::default() };
         let ctx = EffectCtx { params: &params, time, layer_size: size, seed: 7, adjustment: false, env };
-        (s.render)(&ctx, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 }).img
+        crate::apply(s, &ctx, Buf { img: img.clone(), offset: [0.0, 0.0], scale: 1.0 }).unwrap().img
     }
 
     #[test]

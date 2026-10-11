@@ -553,57 +553,78 @@ pub fn show(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
 
 /// Crash recovery: the previous session didn't exit cleanly; offer its latest auto-save.
 pub fn recovery(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
+    if app.session.autosave.sentinel && app.recovery != app.session.autosave.run.offered {
+        app.recovery = app.session.autosave.run.offered.clone();
+    }
     let Some(r) = app.recovery.clone() else {
         app.dialog = None;
         return;
     };
     let mut choice: Option<&str> = None;
-    super::dialogs::modal(ctx, "Recover Project", vec2(560.0, 230.0), t, |ui| {
-        ui.label("EffectCraft didn't quit normally last time.");
-        ui.add_space(6.0);
-        if let Some(p) = &r.project {
-            ui.label(format!("Project: {p}"));
-        }
-        if let Some(a) = &r.autosave {
-            let when = std::fs::metadata(a).and_then(|m| m.modified()).ok().and_then(|m| m.elapsed().ok()).map(|d| {
-                let m = d.as_secs() / 60;
-                if m < 1 {
-                    "less than a minute ago".to_string()
-                } else if m < 120 {
-                    format!("{m} minutes ago")
-                } else {
-                    format!("{} hours ago", m / 60)
-                }
-            });
-            ui.label(format!("Latest auto-save: {a}"));
-            if let Some(w) = when {
-                ui.label(RichText::new(format!("Saved {w}")).color(t.text_dim));
+    let size = vec2(560.0, 430.0).min((ctx.content_rect().size() - vec2(48.0, 48.0)).max(vec2(120.0, 80.0)));
+    let details_height = (size.y - 36.0 - 34.0 - 112.0).max(24.0);
+    super::dialogs::modal_no_scroll(ctx, "Recover Project", size, t, |ui| {
+        let details = egui::ScrollArea::vertical().id_salt("recovery-details").max_height(details_height).auto_shrink([false, true]).show(ui, |ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            ui.label("EffectCraft didn't quit normally last time.");
+            if !app.session.autosave.run.pending.is_empty() {
+                ui.label(format!("{} other project(s) are waiting for recovery.", app.session.autosave.run.pending.len()));
             }
-        }
-        ui.add_space(14.0);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let b = ui.add(egui::Button::new(RichText::new(" Open Auto-Save ").color(Color32::WHITE)).fill(t.accent));
-            app.auto.add("recovery.openAutoSave", b.rect, "Open Auto-Save");
-            if b.clicked() {
-                choice = Some("autosave");
+            ui.add_space(6.0);
+            if let Some(p) = &r.project {
+                ui.label(format!("Project: {p}"));
             }
-            if r.project.is_some() {
-                let b = ui.button("Open Last Saved Project");
-                app.auto.add("recovery.openProject", b.rect, "Open Last Saved Project");
-                if b.clicked() {
-                    choice = Some("project");
+            if let Some(a) = &r.autosave {
+                let when = std::fs::metadata(a).and_then(|m| m.modified()).ok().and_then(|m| m.elapsed().ok()).map(|d| {
+                    let m = d.as_secs() / 60;
+                    if m < 1 {
+                        "less than a minute ago".to_string()
+                    } else if m < 120 {
+                        format!("{m} minutes ago")
+                    } else {
+                        format!("{} hours ago", m / 60)
+                    }
+                });
+                ui.label(format!("{}: {a}", if r.completed_edits { "Completed-edit recovery" } else { "Latest auto-save" }));
+                if let Some(w) = when {
+                    ui.label(RichText::new(format!("Saved {w}")).color(t.text_dim));
                 }
             }
-            let b = ui.button("Don't Recover");
-            app.auto.add("recovery.dismiss", b.rect, "Don't Recover");
-            if b.clicked() {
-                choice = Some("none");
+            if let Some(warning) = &r.warning {
+                ui.label(RichText::new(warning).color(t.accent));
             }
         });
+        if details.content_size.y > details.inner_rect.height() {
+            let track = egui::Rect::from_min_max(
+                egui::pos2(details.inner_rect.max.x, details.inner_rect.min.y),
+                egui::pos2(ui.max_rect().max.x, details.inner_rect.max.y),
+            );
+            app.auto.add("recovery.details.scroll", track, &format!("{}/{}", details.state.offset.y, details.content_size.y - details.inner_rect.height()));
+        }
+        ui.add_space(14.0);
+        let label = if r.completed_edits { " Recover Completed Edits " } else { " Open Auto-Save " };
+        let b = ui.add_enabled(
+            r.autosave.is_some(),
+            egui::Button::new(RichText::new(label).color(Color32::WHITE)).fill(t.accent).min_size(vec2(ui.available_width(), 28.0)),
+        );
+        app.auto.add("recovery.openAutoSave", b.rect, "Open Auto-Save");
+        if b.clicked() {
+            choice = Some("autosave");
+        }
+        if r.project.is_some() {
+            let b = ui.add(egui::Button::new("Open Last Saved Project").min_size(vec2(ui.available_width(), 28.0)));
+            app.auto.add("recovery.openProject", b.rect, "Open Last Saved Project");
+            if b.clicked() {
+                choice = Some("project");
+            }
+        }
+        let b = ui.add(egui::Button::new("Don't Recover").min_size(vec2(ui.available_width(), 28.0)));
+        app.auto.add("recovery.dismiss", b.rect, "Don't Recover");
+        if b.clicked() {
+            choice = Some("none");
+        }
     });
     let Some(c) = choice else { return };
-    app.dialog = None;
-    app.recovery = None;
     let path = match c {
         "autosave" => r.autosave,
         "project" => r.project,
@@ -613,5 +634,16 @@ pub fn recovery(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
         && let Err(e) = crate::menus::invoke(app, ctx, "file.open", json!({"path": p}))
     {
         app.ui.status = e;
+        return;
+    }
+    match app.session.resolve_recovery(c == "none") {
+        Ok(next) => {
+            app.dialog = None;
+            app.recovery = None;
+            if let Some(next) = next {
+                app.offer_recovery(next);
+            }
+        }
+        Err(e) => app.ui.status = e.to_string(),
     }
 }
