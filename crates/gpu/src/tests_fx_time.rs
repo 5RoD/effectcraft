@@ -19,6 +19,106 @@ fn on() -> Value {
     Value::Bool(true)
 }
 
+struct Clock;
+impl effectcraft_effects::EffectHost for Clock {
+    fn layer(&self, _: u64, _: bool) -> Option<effectcraft_effects::LayerPixels> {
+        None
+    }
+    fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+        None
+    }
+    fn self_at(&self, time: f64, _: usize) -> Option<effectcraft_effects::Buf> {
+        let mut image = effectcraft_raster::Image::new(31, 19);
+        for (index, pixel) in image.data.iter_mut().enumerate() {
+            let value = (0.5 + 0.4 * (index as f64 * 0.1 + time * 3.0).sin()) as f32;
+            *pixel = [value * 0.4, value * 0.5, value * 0.2, 0.5];
+        }
+        Some(effectcraft_effects::Buf { img: image, offset: [1.0, 2.0], scale: 1.0 })
+    }
+}
+
+fn timewarp_parameters(method: u32, samples: usize) -> effectcraft_effects::Params {
+    let spec = effectcraft_effects::find(effectcraft_effects::timewarp::ID).unwrap();
+    let mut parameters = effectcraft_effects::Params {
+        values: spec.params.iter().map(|parameter| (parameter.id.into(), effectcraft_effects::default_value(parameter, [31.0, 19.0]))).collect(),
+    };
+    for (key, value) in [
+        ("method", e(method)),
+        ("adjustTimeBy", e(1)),
+        ("sourceFrame", n(4.4)),
+        ("motionBlur/enableMotionBlur", on()),
+        ("motionBlur/shutterControl", e(1)),
+        ("motionBlur/shutterAngle", n(0.0)),
+        ("motionBlur/shutterSamples", n(samples as f64)),
+    ] {
+        parameters.values.insert(key.into(), value);
+    }
+    parameters
+}
+
+fn timewarp_context(parameters: &effectcraft_effects::Params) -> effectcraft_effects::EffectCtx<'_> {
+    effectcraft_effects::EffectCtx {
+        params: parameters,
+        time: 0.7,
+        layer_size: [31.0, 19.0],
+        seed: 1,
+        adjustment: false,
+        env: effectcraft_effects::EffectEnv { host: Some(&Clock), frame_rate: 10.0, comp_time: 0.7, ..Default::default() },
+    }
+}
+
+#[test]
+fn checked_timewarp_streaming_keeps_gpu_uploads_and_scratch_bounded() {
+    let gpu = crate::tests::gpu();
+    let required = std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|value| value == "1");
+    assert!(!required || gpu.is_some(), "Timewarp acceptance requires a working GPU");
+    let Some(gpu) = gpu else { return };
+    let spec = effectcraft_effects::find(effectcraft_effects::timewarp::ID).unwrap();
+    let input = effectcraft_effects::Buf { img: effectcraft_raster::Image::new(31, 19), offset: [1.0, 2.0], scale: 1.0 };
+    for method in 0..=2 {
+        for samples in [1, 8, 64] {
+            let parameters = timewarp_parameters(method, samples);
+            let cpu = effectcraft_effects::apply(spec, &timewarp_context(&parameters), input.clone()).unwrap();
+            let before = gpu.context().transfer_stats();
+            let step = effectcraft_render::FxStep { spec, ctx: timewarp_context(&parameters) };
+            let output = effectcraft_render::Accelerator::effect_checked(gpu, &step, &input, None).unwrap().expect("checked GPU Timewarp must run");
+            let after = gpu.context().transfer_stats();
+            assert!(after.uploads - before.uploads <= 3, "only input and two unique sources upload, independent of samples");
+            assert_eq!(after.readbacks - before.readbacks, 1);
+            assert_eq!((output.offset, output.scale), (cpu.offset, cpu.scale));
+            assert_eq!(crate::tests::diff(&output.img, &cpu.img, 1e-3).over, 0, "method {method}, samples {samples}");
+        }
+    }
+    let mut parameters = timewarp_parameters(2, 64);
+    parameters.values.insert("speed".into(), n(f64::INFINITY));
+    let before = gpu.context().transfer_stats();
+    let step = effectcraft_render::FxStep { spec, ctx: timewarp_context(&parameters) };
+    assert!(effectcraft_render::Accelerator::effect_checked(gpu, &step, &input, None).unwrap_err().contains("Speed"));
+    let after = gpu.context().transfer_stats();
+    assert_eq!((after.uploads, after.readbacks), (before.uploads, before.readbacks), "hostile controls fail before GPU transfers");
+}
+
+#[test]
+fn checked_timewarp_missing_kernel_is_an_error_then_a_valid_whole_frame_works() {
+    crate::tests::hold_gpu_lock();
+    let gpu = crate::Gpu::headless();
+    let required = std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|value| value == "1");
+    assert!(!required || gpu.is_some(), "missing-kernel acceptance requires a working GPU");
+    let Some(mut gpu) = gpu else { return };
+    std::sync::Arc::get_mut(&mut gpu.ctx).unwrap().drop_kernel("ftm_mix");
+    let spec = effectcraft_effects::find(effectcraft_effects::timewarp::ID).unwrap();
+    let input = effectcraft_effects::Buf { img: effectcraft_raster::Image::new(31, 19), offset: [1.0, 2.0], scale: 1.0 };
+    let mut parameters = timewarp_parameters(1, 8);
+    let step = effectcraft_render::FxStep { spec, ctx: timewarp_context(&parameters) };
+    let error = effectcraft_render::Accelerator::effect_checked(&gpu, &step, &input, None).unwrap_err();
+    assert!(error.contains("ftm_mix"));
+    parameters.values.insert("method".into(), e(0));
+    let step = effectcraft_render::FxStep { spec, ctx: timewarp_context(&parameters) };
+    let actual = effectcraft_render::Accelerator::effect_checked(&gpu, &step, &input, None).unwrap().unwrap();
+    let expected = effectcraft_effects::apply(spec, &timewarp_context(&parameters), input).unwrap();
+    assert_eq!(crate::tests::diff(&actual.img, &expected.img, 1e-3).over, 0);
+}
+
 /// `id` with `vals` on a moving precomp; `map` adds a hidden footage layer and sets parameter
 /// `map` to it.
 fn moving(id: &str, vals: &[(&str, Value)], map: Option<&str>) {

@@ -52,7 +52,6 @@ pub(crate) fn apply(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<G
             let times: Vec<f64> = (0..n).map(|i| ctx.time - span * 0.5 + if n > 1 { span * i as f64 / (n - 1) as f64 } else { span * 0.5 }).collect();
             mean_of(e, ctx, b, &times)
         }
-        "ec.time.timewarp" => timewarp(e, ctx, b),
         _ => None,
     }
 }
@@ -174,56 +173,128 @@ fn time_displacement(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
 
 // ---------------------------------------------------------------- Timewarp
 
-fn timewarp(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
-    if ctx.env.host.is_none() {
-        return Some(b);
+struct WarpGpu {
+    raw: Vec<Option<GpuImage>>,
+    cropped: Vec<Option<GpuImage>>,
+    flows: Vec<Option<wgpu::Buffer>>,
+    samples: [Option<GpuImage>; 3],
+    accumulators: [Option<GpuImage>; 2],
+}
+
+impl WarpGpu {
+    fn target(e: &mut Enc, plan: &effectcraft_effects::TimewarpPlan, slot: &mut Option<GpuImage>) -> GpuImage {
+        slot.get_or_insert_with(|| e.scratch(plan.grid.width, plan.grid.height)).clone()
     }
-    let Some(plan) = effectcraft_effects::timewarp_plan(ctx) else { return Some(b) };
-    // Pixel Motion's in-between frame of frames a, b along motion field `flow`.
-    let motion = |e: &mut Enc, a: usize, bi: usize, w: f32, flow: usize| -> Option<GpuImage> {
-        let pa = e.g.upload_image(&effectcraft_effects::timewarp_crop(&plan.frames[a], &plan.pm))?;
-        let pb = e.g.upload_image(&effectcraft_effects::timewarp_crop(&plan.frames[bi], &plan.pm))?;
-        let f = &plan.flows[flow];
-        let v: Vec<f32> = f.v.iter().flat_map(|q| [q[0], q[1]]).collect();
-        let data = e.data(&v);
-        let mut p = Params::default();
-        p.u[0] = [if f.v.is_empty() { 0 } else { f.cols as u32 }, f.rows as u32, plan.pm.extreme as u32, plan.pm.build_from_one as u32];
-        p.f[0] = [f.block as f32, w, plan.pm.error_threshold, 0.0];
-        Some(kernel(e, "ftm_motion", &p, &pa, Some(&pb), Some(&data)))
-    };
-    let mut up: Vec<Option<GpuImage>> = vec![None; plan.frames.len()];
-    let mut frame = |e: &mut Enc, i: usize| -> Option<GpuImage> {
-        if up[i].is_none() {
-            up[i] = Some(e.g.upload_image(&plan.frames[i])?);
+
+    fn frame(&mut self, e: &mut Enc, plan: &effectcraft_effects::TimewarpPlan, index: usize, crop: bool) -> Result<GpuImage, String> {
+        let crop = crop && plan.pm.crops != [0; 4];
+        let cache = if crop { &mut self.cropped } else { &mut self.raw };
+        let slot = cache.get_mut(index).ok_or("Timewarp GPU: missing prepared frame index")?;
+        if slot.is_none() {
+            let source = plan.frames.get(index).ok_or("Timewarp GPU: missing prepared source")?;
+            let image = if crop { e.g.upload_image(&effectcraft_effects::timewarp_crop(source, &plan.pm)) } else { e.g.upload_image(source) };
+            *slot = Some(image.ok_or("Timewarp GPU: cannot upload a validated source frame")?);
         }
-        up[i].clone()
-    };
-    let mut imgs = vec![];
-    for (step, _) in &plan.steps {
-        let img = match *step {
-            TwStep::Whole(i) => frame(e, i)?,
-            TwStep::Mix(i, j, w) => {
-                let (a, bb) = (frame(e, i)?, frame(e, j)?);
-                let mut p = Params::default();
-                p.f[0][0] = w;
-                kernel(e, "ftm_mix", &p, &a, Some(&bb), None)
+        slot.clone().ok_or_else(|| "Timewarp GPU: uploaded frame is missing".into())
+    }
+
+    fn motion(&mut self, e: &mut Enc, plan: &effectcraft_effects::TimewarpPlan, indices: [usize; 3], fraction: f32, slot: usize) -> Result<GpuImage, String> {
+        let [a, b, flow] = indices;
+        let first = self.frame(e, plan, a, true)?;
+        let second = self.frame(e, plan, b, true)?;
+        let field = plan.flows.get(flow).ok_or("Timewarp GPU: missing prepared motion field")?;
+        let buffer = self.flows.get_mut(flow).ok_or("Timewarp GPU: missing motion buffer slot")?;
+        if buffer.is_none() {
+            let bytes: &[u8] = bytemuck::cast_slice(&field.v);
+            if bytes.len().max(16) as u64 > e.g.device.limits().max_storage_buffer_binding_size {
+                return Err("Timewarp GPU: motion field exceeds the device storage-buffer limit".into());
             }
-            TwStep::Motion { a, b: bi, w, flow } => motion(e, a, bi, w, flow)?,
+            let mut data = Vec::new();
+            data.try_reserve_exact(bytes.len().max(16)).map_err(|error| format!("Timewarp GPU: cannot stage motion field: {error}"))?;
+            data.extend_from_slice(bytes);
+            *buffer = Some(e.bytes(data));
+        }
+        let output = Self::target(e, plan, self.samples.get_mut(slot).ok_or("Timewarp GPU: missing motion output slot")?);
+        let mut parameters = Params::default();
+        parameters.u[0] = [if field.v.is_empty() { 0 } else { field.cols as u32 }, field.rows as u32, plan.pm.extreme as u32, plan.pm.build_from_one as u32];
+        parameters.f[0] = [field.block as f32, fraction, plan.pm.error_threshold, 0.0];
+        e.pixels("ftm_motion", &parameters, &first, Some(&second), &output, buffer.as_ref());
+        Ok(output)
+    }
+}
+
+/// Run a checked Timewarp over resident pixels. A missing host/source retains the input;
+/// rejected controls/plans/kernels remain errors rather than legacy Option pass-through.
+pub(crate) fn checked(e: &mut Enc, ctx: &EffectCtx, input: GBuf) -> Result<GBuf, String> {
+    if !input.scale.is_finite() || input.scale <= 0.0 || input.offset.iter().any(|value| !value.is_finite() || value.abs() > 1e12) {
+        return Err("Timewarp GPU: resident input geometry is invalid".into());
+    }
+    let plan = effectcraft_effects::timewarp::plan_for_input(ctx, [input.img.width, input.img.height])?;
+    prepared(e, input, plan.as_ref())
+}
+
+pub(crate) fn prepared(e: &mut Enc, input: GBuf, plan: Option<&effectcraft_effects::TimewarpPlan>) -> Result<GBuf, String> {
+    e.g.check_health()?;
+    let Some(plan) = plan else { return Ok(input) };
+    plan.validate()?;
+    if !e.g.fits(plan.grid.width, plan.grid.height) {
+        return Err("Timewarp GPU: output grid exceeds the device texture limit".into());
+    }
+    if plan.steps.len() > 1 && !e.g.has_kernel("ftm_acc") {
+        return Err("Timewarp GPU: unavailable accumulation kernel ftm_acc; use Software Only".into());
+    }
+    for (step, _) in &plan.steps {
+        let entries: &[&str] = match step {
+            TwStep::Whole(_) => &[],
+            TwStep::Mix(..) => &["ftm_mix"],
+            TwStep::Motion { .. } => &["ftm_motion"],
+            TwStep::Layered { .. } => &["ftm_motion", "ftm_layer"],
+        };
+        for entry in entries {
+            if !e.g.has_kernel(entry) {
+                return Err(format!("Timewarp GPU: unavailable kernel {entry}; use Software Only"));
+            }
+        }
+    }
+    let mut cache = WarpGpu {
+        raw: vec![None; plan.frames.len()],
+        cropped: vec![None; plan.frames.len()],
+        flows: vec![None; plan.flows.len()],
+        samples: [None, None, None],
+        accumulators: [None, None],
+    };
+    let mut accumulator = e.zeros(plan.grid.width, plan.grid.height);
+    for (sample, (step, weight)) in plan.steps.iter().enumerate() {
+        let image = match *step {
+            TwStep::Whole(index) => cache.frame(e, plan, index, false)?,
+            TwStep::Mix(a, b, fraction) => {
+                let first = cache.frame(e, plan, a, false)?;
+                let second = cache.frame(e, plan, b, false)?;
+                let output = WarpGpu::target(e, plan, &mut cache.samples[0]);
+                let mut parameters = Params::default();
+                parameters.f[0][0] = fraction;
+                e.pixels("ftm_mix", &parameters, &first, Some(&second), &output, None);
+                output
+            }
+            TwStep::Motion { a, b, w, flow } => cache.motion(e, plan, [a, b, flow], w, 0)?,
             TwStep::Layered { fg, bg, w, show } => {
-                let f = motion(e, fg[0], fg[1], w, fg[2])?;
-                let g = motion(e, bg[0], bg[1], w, bg[2])?;
-                let mut p = Params::default();
-                p.u[0][0] = show;
-                kernel(e, "ftm_layer", &p, &f, Some(&g), None)
+                let foreground = cache.motion(e, plan, fg, w, 1)?;
+                let background = cache.motion(e, plan, bg, w, 2)?;
+                let output = WarpGpu::target(e, plan, &mut cache.samples[0]);
+                let mut parameters = Params::default();
+                parameters.u[0][0] = show;
+                e.pixels("ftm_layer", &parameters, &foreground, Some(&background), &output, None);
+                output
             }
         };
-        imgs.push(img);
+        if plan.steps.len() == 1 {
+            return Ok(GBuf { img: image, offset: plan.grid.offset, scale: plan.grid.scale });
+        }
+        let output = WarpGpu::target(e, plan, &mut cache.accumulators[sample % 2]);
+        let mut parameters = Params::default();
+        parameters.f[0][0] = *weight;
+        e.pixels("ftm_acc", &parameters, &accumulator, Some(&image), &output, None);
+        accumulator = output;
     }
-    let img = if imgs.len() == 1 {
-        imgs.pop()?
-    } else {
-        let weights: Vec<f32> = plan.steps.iter().map(|(_, w)| *w).collect();
-        average(e, &imgs, &weights)?
-    };
-    Some(on_grid(img, &plan.grid))
+    Ok(GBuf { img: accumulator, offset: plan.grid.offset, scale: plan.grid.scale })
 }

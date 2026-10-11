@@ -36,15 +36,16 @@ The fragmented remux starts its video at a positive timestamp. Exact rational PT
 all-frame thumbnail comparisons matched all 26 selected fragmented reads to the expected
 container frame; the original comparison incorrectly assumed the remux retained each source
 frame number at the same requested time. That is diagnostic frame-selection evidence, not
-full-resolution decoder conformance. The first regular clip I-frame's three decoded YUV planes
-also matched the independent decoder byte for byte (5,529,600 samples). Its visible difference
+full-resolution decoder conformance. All 26 selected regular-clip frames' decoded YUV planes
+also matched the independent decoder byte for byte (143,769,600 samples, including first-frame
+and GOP-boundary selections). The first I-frame's visible difference
 is therefore in RGB conversion/chroma handling; the fixture signals left-sited chroma while the
 current decoded-frame API does not expose siting.
 An explicit centered bilinear oracle conversion with full chroma interpolation matched that
 first frame to at most one 8-bit step (82.99 dB PSNR). The corresponding left-sited conversion
 still differs. This verifies the current centered conversion's math for this frame, while
 leaving the fixture's signaled chroma-siting contract unresolved; the default-oracle failure
-remains recorded and is not converted into a quality pass. These checks do not cover every B/P frame,
+remains recorded and is not converted into a quality pass. These checks do not cover every frame,
 actual OBS Hybrid MP4 finalization, or HDR. They use Thin LTO disabled and establish no playback
 or export throughput.
 

@@ -440,7 +440,13 @@ pub(crate) fn effect_direct(id: &str, vals: &[(&str, Value)], adjustment: bool) 
         let buf = effectcraft_effects::Buf { img, offset: [0.0, 0.0], scale };
         let ctx = || effectcraft_effects::EffectCtx { params: &params, time: 0.25, layer_size: size, seed: 11, adjustment, env: Default::default() };
         let cpu = effectcraft_effects::apply(spec, &ctx(), buf.clone()).unwrap();
-        let out = effectcraft_render::Accelerator::effects(g, &[effectcraft_render::FxStep { spec, ctx: ctx() }], &buf, None).expect("the GPU runs the effect");
+        let step = effectcraft_render::FxStep { spec, ctx: ctx() };
+        let out = if matches!(spec.render, effectcraft_effects::EffectRender::Checked(_)) {
+            effectcraft_render::Accelerator::effect_checked(g, &step, &buf, None).unwrap()
+        } else {
+            effectcraft_render::Accelerator::effects(g, &[step], &buf, None)
+        }
+        .expect("the GPU runs the effect");
         assert_eq!((out.offset, out.scale), (cpu.offset, cpu.scale), "{id}: geometry");
         let d = diff(&cpu.img, &out.img, 1e-3);
         let allow = if on_gl() { (d.total as f64 * GL_BOUNDARY_FLIPS) as usize } else { 0 };

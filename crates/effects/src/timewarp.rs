@@ -1,0 +1,987 @@
+//! Checked Timewarp preparation. Source times share unique frames; shutter outputs stream
+//! through one accumulator in their original order. Matching and interpolation are unchanged.
+
+use effectcraft_keyframe::Value;
+use effectcraft_project::ParamUi;
+use effectcraft_raster::{Image, flow::Flow};
+use effectcraft_time::{TICKS_PER_SECOND, Tick};
+use rayon::prelude::*;
+
+use crate::time_fx::{PixelMotion, layered, matte_image, matte_of, times_mask, timewarp_flow, timewarp_interpolate, timewarp_source_time};
+use crate::{Buf, EffectCtx, LayerPixels};
+
+pub const ID: &str = "ec.time.timewarp";
+pub const MAX_DIMENSION: u32 = 16_384;
+pub const MAX_IMAGE_PIXELS: u64 = 32 * 1024 * 1024;
+pub const MAX_TOTAL_BYTES: u64 = 1536 * 1024 * 1024;
+/// Conservative SAD comparisons, smoothing neighbours and interpolation taps per invocation.
+pub const MAX_WORK: u64 = 32_000_000_000;
+pub const MAX_SAMPLES: usize = 64;
+const MAX_PREPARED_FRAMES: usize = MAX_SAMPLES * 2 * 4;
+const MAX_PREPARED_FLOWS: usize = MAX_SAMPLES * 2;
+const MAX_OFFSET: f64 = 1e12;
+
+fn invalid(message: impl std::fmt::Display) -> String {
+    format!("Timewarp: {message}")
+}
+
+fn add(a: u64, b: u64) -> Result<u64, String> {
+    a.checked_add(b).ok_or_else(|| invalid("budget arithmetic overflow"))
+}
+
+fn mul(a: u64, b: u64) -> Result<u64, String> {
+    a.checked_mul(b).ok_or_else(|| invalid("budget arithmetic overflow"))
+}
+
+fn sampling_domain(coordinates: &[f64]) -> Result<(), String> {
+    if coordinates.iter().any(|value| !value.is_finite() || value.abs() > MAX_OFFSET) {
+        return Err(invalid("resampling coordinates exceed the finite +/-1e12-pixel supported range"));
+    }
+    Ok(())
+}
+
+fn area(width: u32, height: u32) -> Result<u64, String> {
+    let pixels = mul(u64::from(width), u64::from(height))?;
+    if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION || pixels > MAX_IMAGE_PIXELS {
+        return Err(invalid(format!("unsupported frame {width} × {height}; maximum dimension {MAX_DIMENSION}, maximum pixels {MAX_IMAGE_PIXELS}")));
+    }
+    Ok(pixels)
+}
+
+/// Validate host storage and geometry before resampling or GPU upload. This does not allocate.
+pub fn validate_input(input: &Buf) -> Result<(), String> {
+    let pixels = area(input.img.width, input.img.height)?;
+    if usize::try_from(pixels).ok() != Some(input.img.data.len()) {
+        return Err(invalid("frame storage does not match its dimensions"));
+    }
+    if !input.scale.is_finite() || input.scale <= 0.0 || input.offset.iter().any(|v| !v.is_finite() || v.abs() > MAX_OFFSET) {
+        return Err(invalid("frame scale must be positive and finite, and offsets must be finite and within +/-1e12 pixels"));
+    }
+    Ok(())
+}
+
+/// Controls are checked even when the host has no frames. A malformed expression must not
+/// become a saturating integer cast or a successful pass-through.
+pub fn validate_controls(ctx: &EffectCtx) -> Result<(), String> {
+    checked_time(ctx.time)?;
+    checked_time(ctx.env.comp_time)?;
+    if !ctx.env.frame_rate.is_finite() || ctx.env.frame_rate < 0.0 || !ctx.fps().is_finite() || ctx.fps() > 1000.0 {
+        return Err(invalid("frame rate must be finite and within (0, 1000] (zero means unknown)"));
+    }
+    if ctx.layer_size.iter().any(|v| !v.is_finite() || *v < 0.0) {
+        return Err(invalid("layer dimensions must be finite and nonnegative"));
+    }
+    let spec = crate::find(ID).ok_or_else(|| invalid("effect registry is unavailable"))?;
+    for parameter in &spec.params {
+        let Some(value) = ctx.params.get(parameter.id) else { continue };
+        let valid = match (&parameter.ui, value) {
+            (ParamUi::Slider { min, max, .. }, Value::Scalar(value)) => value.is_finite() && (*min..=*max).contains(value),
+            (ParamUi::Popup { options }, Value::Enum(value)) => (*value as usize) < options.len(),
+            (ParamUi::Popup { options }, Value::Scalar(value)) => value.is_finite() && value.fract() == 0.0 && *value >= 0.0 && *value < options.len() as f64,
+            (ParamUi::Checkbox, Value::Bool(_)) | (ParamUi::Layer, Value::Layer(_)) => true,
+            _ => false,
+        };
+        if !valid {
+            return Err(invalid(format!("{} must match its documented type and range", parameter.name)));
+        }
+    }
+    Ok(())
+}
+
+fn checked_time(seconds: f64) -> Result<(), String> {
+    if !seconds.is_finite() || seconds < Tick::MIN.seconds() || seconds > Tick::MAX.seconds() {
+        return Err(invalid("source/comp time exceeds the supported finite Tick range"));
+    }
+    Ok(())
+}
+
+/// Retain the existing source fetch's microsecond quantization, represented by exact Tick
+/// keys rather than unchecked NaN/overflow casts. The host sees the same rounded seconds.
+fn time_key(seconds: f64) -> Result<Tick, String> {
+    checked_time(seconds)?;
+    let microseconds = (seconds * 1e6).round();
+    let ticks_per_microsecond = TICKS_PER_SECOND / 1_000_000;
+    if microseconds < (Tick::MIN.0 / ticks_per_microsecond) as f64 || microseconds > (Tick::MAX.0 / ticks_per_microsecond) as f64 {
+        return Err(invalid("rounded source time exceeds the supported Tick range"));
+    }
+    Ok(Tick((microseconds as i64).checked_mul(ticks_per_microsecond).ok_or_else(|| invalid("source time overflow"))?))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TimewarpGrid {
+    pub width: u32,
+    pub height: u32,
+    pub offset: [f64; 2],
+    pub scale: f64,
+}
+
+impl TimewarpGrid {
+    fn wrap(self, img: Image) -> Buf {
+        Buf { img, offset: self.offset, scale: self.scale }
+    }
+
+    fn image(self) -> Result<Image, String> {
+        let pixels = usize::try_from(area(self.width, self.height)?).map_err(|_| invalid("frame exceeds address space"))?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(pixels).map_err(|error| invalid(format!("cannot allocate a planned frame: {error}")))?;
+        data.resize(pixels, [0.0; 4]);
+        Ok(Image { width: self.width, height: self.height, data })
+    }
+
+    /// Consume already aligned pixels, avoiding the former full-frame clone.
+    fn place(self, source: Option<Buf>) -> Result<Image, String> {
+        let Some(source) = source else { return self.image() };
+        let [x0, y0] = self.offset.map(|v| -v);
+        if (source.scale - self.scale).abs() < 1e-9
+            && source.img.width == self.width
+            && source.img.height == self.height
+            && (source.offset[0] + x0).abs() < 1e-6
+            && (source.offset[1] + y0).abs() < 1e-6
+        {
+            return Ok(source.img);
+        }
+        let k = source.scale / self.scale;
+        let same_scale = (k - 1.0).abs() < 1e-9;
+        let dx = source.offset[0] + x0;
+        let dy = source.offset[1] + y0;
+        sampling_domain(&[dx, dy, (self.width as f64 + 0.5) * k + dx, (self.height as f64 + 0.5) * k + dy])?;
+        let mut output = self.image()?;
+        output.rows_mut().for_each(|(y, row)| {
+            for (x, pixel) in row.iter_mut().enumerate() {
+                *pixel = if same_scale && dx.fract() == 0.0 && dy.fract() == 0.0 {
+                    source.img.get(x as i64 + dx as i64, y as i64 + dy as i64)
+                } else {
+                    let sx = (x as f64 + 0.5) * k + dx - 0.5;
+                    let sy = (y as f64 + 0.5) * k + dy - 0.5;
+                    source.img.sample_bilinear(sx + 0.5, sy + 0.5)
+                };
+            }
+        });
+        Ok(output)
+    }
+
+    /// fit_layer(..., stretch=false), using geometry without a blank full-resolution Buf.
+    fn fit(self, ctx: &EffectCtx, source: LayerPixels) -> Result<Image, String> {
+        validate_input(&source.buf)?;
+        if source.size.iter().any(|v| !v.is_finite() || *v < 0.0) {
+            return Err(invalid("matte/warp layer dimensions are invalid"));
+        }
+        let (dx, dy) = ((source.size[0] - ctx.layer_size[0]) * 0.5, (source.size[1] - ctx.layer_size[1]) * 0.5);
+        let inv = 1.0 / self.scale.max(1e-9);
+        let coordinates = |x: f64, y: f64| {
+            [
+                ((x + 0.5 - self.offset[0]) * inv + dx) * source.buf.scale + source.buf.offset[0],
+                ((y + 0.5 - self.offset[1]) * inv + dy) * source.buf.scale + source.buf.offset[1],
+            ]
+        };
+        sampling_domain(&coordinates(0.0, 0.0))?;
+        sampling_domain(&coordinates((self.width - 1) as f64, (self.height - 1) as f64))?;
+        let mut output = self.image()?;
+        output.rows_mut().for_each(|(y, row)| {
+            for (x, pixel) in row.iter_mut().enumerate() {
+                let px = (x as f64 + 0.5 - self.offset[0]) * inv;
+                let py = (y as f64 + 0.5 - self.offset[1]) * inv;
+                *pixel =
+                    source.buf.img.sample_bilinear((px + dx) * source.buf.scale + source.buf.offset[0], (py + dy) * source.buf.scale + source.buf.offset[1]);
+            }
+        });
+        Ok(output)
+    }
+}
+
+fn union(bufs: &[Option<Buf>]) -> Result<Option<TimewarpGrid>, String> {
+    let Some(first) = bufs.iter().flatten().next() else { return Ok(None) };
+    let scale = first.scale;
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for source in bufs.iter().flatten() {
+        validate_input(source)?;
+        let k = scale / source.scale;
+        let edges =
+            [-source.offset[0] * k, -source.offset[1] * k, (source.img.width as f64 - source.offset[0]) * k, (source.img.height as f64 - source.offset[1]) * k];
+        if edges.iter().any(|value| !value.is_finite() || value.abs() > MAX_OFFSET) {
+            return Err(invalid("source extent or relative render scale is unsupported"));
+        }
+        x0 = x0.min(edges[0]);
+        y0 = y0.min(edges[1]);
+        x1 = x1.max(edges[2]);
+        y1 = y1.max(edges[3]);
+    }
+    let (x0, y0) = (x0.floor(), y0.floor());
+    let dimensions = [x1.ceil() - x0, y1.ceil() - y0];
+    if dimensions.iter().any(|dimension| !dimension.is_finite() || *dimension > MAX_DIMENSION as f64 || *dimension <= 0.0) {
+        return Err(invalid("union of source frames exceeds the supported dimensions"));
+    }
+    let (width, height) = (dimensions[0] as u32, dimensions[1] as u32);
+    area(width, height)?;
+    Ok(Some(TimewarpGrid { width, height, offset: [-x0, -y0], scale }))
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum TwStep {
+    Whole(usize),
+    Mix(usize, usize, f32),
+    Motion { a: usize, b: usize, w: f32, flow: usize },
+    Layered { fg: [usize; 3], bg: [usize; 3], w: f32, show: u32 },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TimewarpBudget {
+    pub total_bytes: u64,
+    pub work: u64,
+    pub frame_limit: usize,
+    pub flow_limit: usize,
+    preparation_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+struct BudgetRequest {
+    input_pixels: u64,
+    unique: usize,
+    pairs: usize,
+    steps: usize,
+    method: u32,
+    matte: bool,
+    warp: bool,
+    show: u32,
+}
+
+/// A conservative peak across preparation and execution, rather than a sum of scratch whose
+/// lifetimes do not overlap. Includes source placement, masked frames, matte/warp preparation,
+/// matching pyramids/vectors, uploaded unique frames, five private GPU step/accumulator images
+/// and output/readback staging. Renderer/decoder caches and other effects are separate.
+fn budget(grid: TimewarpGrid, raw_bytes: u64, pm: &PixelMotion, request: BudgetRequest) -> Result<TimewarpBudget, String> {
+    let BudgetRequest { input_pixels, unique, pairs, steps, method, matte, warp, show } = request;
+    let pixels = area(grid.width, grid.height)?;
+    if unique == 0 || unique > MAX_SAMPLES * 2 || steps == 0 || steps > MAX_SAMPLES || pairs > steps {
+        return Err(invalid("unsupported source frame or shutter sample count"));
+    }
+    if pm.tile < 2 || pm.window < 4 || pm.tile > MAX_DIMENSION || pm.window > MAX_DIMENSION || pm.iterations > 200 {
+        return Err(invalid("scaled motion spacing/window or smoothing iterations exceed the supported range"));
+    }
+    let derived = if matte {
+        if method == 2 {
+            unique.checked_mul(if show == 3 { 3 } else { 2 })
+        } else if show > 0 {
+            Some(unique)
+        } else {
+            Some(0)
+        }
+    } else {
+        Some(0)
+    }
+    .ok_or_else(|| invalid("derived frame count overflow"))?;
+    let frame_limit = unique.checked_add(derived).ok_or_else(|| invalid("frame count overflow"))?;
+    let flow_limit = if method == 2 { pairs.checked_mul(if matte && !warp { 2 } else { 1 }) } else { Some(0) }.ok_or_else(|| invalid("flow count overflow"))?;
+    let vectors = mul(u64::from(grid.width.div_ceil(pm.tile)), u64::from(grid.height.div_ceil(pm.tile)))?;
+    let retained_vectors = mul(mul(vectors, 8)?, flow_limit as u64)?;
+    let image_bytes = mul(pixels, 16)?;
+    let input_bytes = mul(if input_pixels == 0 { pixels } else { input_pixels }, 16)?;
+    let placement = add(add(raw_bytes, mul(image_bytes, unique as u64)?)?, input_bytes)?;
+    let prep_images = add(frame_limit as u64, if warp { unique as u64 } else { 0 })?;
+    let prep = add(
+        input_bytes,
+        add(
+            add(mul(image_bytes, add(prep_images, 8)?)?, if matte { mul(mul(pixels, 4)?, unique as u64)? } else { 0 })?,
+            add(retained_vectors, mul(vectors, 64)?)?,
+        )?,
+    )?;
+    let copies = if pm.crops == [0; 4] { 2 } else { 3 };
+    let execution = add(mul(input_bytes, 2)?, add(mul(image_bytes, add(mul(frame_limit as u64, copies)?, 8)?)?, mul(retained_vectors, 2)?)?)?;
+    let total_bytes = placement.max(prep).max(execution);
+    let mut matching = 0;
+    if grid.width >= pm.tile && grid.height >= pm.tile && grid.width >= pm.window && grid.height >= pm.window {
+        let mut levels = 1;
+        let (mut w, mut h) = (grid.width, grid.height);
+        while levels < 4 && w / 2 >= pm.tile.max(pm.window) * 2 && h / 2 >= pm.tile.max(pm.window) * 2 {
+            w /= 2;
+            h /= 2;
+            levels += 1;
+        }
+        for level in 0..levels {
+            let window = u64::from((pm.window >> level).max(4));
+            matching = add(matching, mul(mul(window, window)?, if level == levels - 1 { 81 } else { 54 })?)?;
+        }
+        matching = add(matching, mul(mul(u64::from(pm.window), u64::from(pm.window))?, 5)?)?;
+    }
+    let smoothing = add(if pm.local_smoothness > 0.0 { mul(u64::from(pm.iterations), 9)? } else { 0 }, if pm.global_smoothness > 0.0 { 49 } else { 0 })?;
+    let flow_work = mul(mul(vectors, add(matching, add(smoothing, 81)?)?)?, flow_limit as u64)?;
+    let taps = if method == 2 { if pm.extreme { 32 } else { 8 } } else { 2 };
+    let step_work = mul(mul(pixels, steps as u64)?, add(mul(taps, if matte && method == 2 { 2 } else { 1 })?, 8)?)?;
+    let work = add(flow_work, add(step_work, mul(pixels, add(unique as u64, derived as u64)?)?)?)?;
+    if total_bytes > MAX_TOTAL_BYTES || work > MAX_WORK {
+        return Err(invalid(format!(
+            "request needs up to {total_bytes} bytes and {work} work units; limits are {MAX_TOTAL_BYTES} bytes and {MAX_WORK} units. Reduce shutter span, resolution, Vector Detail, Block Size or smoothing; quality is never silently reduced"
+        )));
+    }
+    Ok(TimewarpBudget { total_bytes, work, frame_limit, flow_limit, preparation_bytes: prep })
+}
+
+pub struct TimewarpPlan {
+    pub grid: TimewarpGrid,
+    /// One owned pixel buffer per unique source/derived frame; steps share indices.
+    pub frames: Vec<Image>,
+    pub steps: Vec<(TwStep, f32)>,
+    pub flows: Vec<Flow>,
+    pub pm: PixelMotion,
+    pub budget: TimewarpBudget,
+}
+
+type KeyedFlow = (([usize; 2], bool), Flow);
+
+impl TimewarpPlan {
+    fn frame(&self, index: usize) -> Result<&Image, String> {
+        self.frames.get(index).ok_or_else(|| invalid("step references a missing frame"))
+    }
+    fn flow(&self, index: usize) -> Result<&Flow, String> {
+        self.flows.get(index).ok_or_else(|| invalid("step references a missing motion field"))
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.steps.is_empty()
+            || self.steps.len() > MAX_SAMPLES
+            || self.frames.is_empty()
+            || self.frames.len() > MAX_PREPARED_FRAMES
+            || self.flows.len() > MAX_PREPARED_FLOWS
+            || self.budget.frame_limit > MAX_PREPARED_FRAMES
+            || self.budget.flow_limit > MAX_PREPARED_FLOWS
+            || self.frames.len() > self.budget.frame_limit
+            || self.flows.len() > self.budget.flow_limit
+        {
+            return Err(invalid("malformed prepared frame/sample count"));
+        }
+        if self.budget.total_bytes > MAX_TOTAL_BYTES || self.budget.work > MAX_WORK {
+            return Err(invalid("prepared plan exceeds its byte/work budget"));
+        }
+        let pixels = usize::try_from(area(self.grid.width, self.grid.height)?).map_err(|_| invalid("frame exceeds address space"))?;
+        // Public plans can be modified after preparation. A forged declaration cannot
+        // bypass absolute limits or understate even the retained/execution storage.
+        let image_bytes = mul(pixels as u64, 16)?;
+        let vector_bytes = self.flows.iter().try_fold(0, |bytes, flow| add(bytes, mul(flow.v.len() as u64, 8)?))?;
+        let retained = add(mul(image_bytes, self.frames.len() as u64)?, vector_bytes)?;
+        let copies = if self.pm.crops == [0; 4] { 2 } else { 3 };
+        let execution = add(mul(image_bytes, add(mul(self.frames.len() as u64, copies)?, 8)?)?, mul(vector_bytes, 2)?)?;
+        if retained > self.budget.total_bytes || execution > self.budget.total_bytes || execution > MAX_TOTAL_BYTES {
+            return Err(invalid("prepared storage exceeds the declared/absolute byte budget"));
+        }
+        let work = self.steps.iter().try_fold(0, |work, (step, _)| {
+            let motion_taps = if self.pm.extreme { 32 } else { 8 };
+            let taps = match step {
+                TwStep::Whole(_) => 1,
+                TwStep::Mix(..) => 2,
+                TwStep::Motion { .. } => motion_taps,
+                TwStep::Layered { .. } => motion_taps * 2,
+            };
+            add(work, mul(pixels as u64, taps + 8)?)
+        })?;
+        if work > self.budget.work || work > MAX_WORK {
+            return Err(invalid("prepared interpolation exceeds the declared/absolute work budget"));
+        }
+        if !self.grid.scale.is_finite()
+            || self.grid.scale <= 0.0
+            || self.grid.offset.iter().any(|value| !value.is_finite() || value.abs() > MAX_OFFSET)
+            || self.pm.tile < 2
+            || self.pm.tile > MAX_DIMENSION
+            || self.pm.window < 4
+            || self.pm.window > MAX_DIMENSION
+            || self.pm.iterations > 200
+        {
+            return Err(invalid("prepared geometry or motion settings are invalid"));
+        }
+        if [self.pm.global_smoothness, self.pm.local_smoothness, self.pm.error_threshold]
+            .iter()
+            .chain(self.pm.weights.iter())
+            .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+        {
+            return Err(invalid("prepared motion weights are invalid"));
+        }
+        for frame in &self.frames {
+            if frame.width != self.grid.width || frame.height != self.grid.height || frame.data.len() != pixels {
+                return Err(invalid("prepared frame storage differs from the output grid"));
+            }
+        }
+        for flow in &self.flows {
+            if flow.block < 2
+                || flow.block > MAX_DIMENSION
+                || flow.width != self.grid.width
+                || flow.height != self.grid.height
+                || flow.cols != self.grid.width.div_ceil(flow.block) as usize
+                || flow.rows != self.grid.height.div_ceil(flow.block) as usize
+                || flow.cols.checked_mul(flow.rows) != Some(flow.v.len())
+                || flow.v.iter().flatten().any(|value| !value.is_finite() || value.abs() > (MAX_DIMENSION * 4) as f32)
+            {
+                return Err(invalid("prepared motion field storage or vectors are invalid"));
+            }
+        }
+        for (step, weight) in &self.steps {
+            if !weight.is_finite() || !(0.0..=1.0).contains(weight) {
+                return Err(invalid("shutter weight is invalid"));
+            }
+            let fraction = match *step {
+                TwStep::Whole(index) => {
+                    self.frame(index)?;
+                    None
+                }
+                TwStep::Mix(a, b, fraction) => {
+                    self.frame(a)?;
+                    self.frame(b)?;
+                    Some(fraction)
+                }
+                TwStep::Motion { a, b, w, flow } => {
+                    self.frame(a)?;
+                    self.frame(b)?;
+                    self.flow(flow)?;
+                    Some(w)
+                }
+                TwStep::Layered { fg, bg, w, show } => {
+                    if show > 3 {
+                        return Err(invalid("prepared Show choice is invalid"));
+                    }
+                    for indices in [fg, bg] {
+                        self.frame(indices[0])?;
+                        self.frame(indices[1])?;
+                        self.flow(indices[2])?;
+                    }
+                    Some(w)
+                }
+            };
+            if fraction.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+                return Err(invalid("prepared interpolation fraction is invalid"));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn render_cpu(&self) -> Result<Buf, String> {
+        self.validate()?;
+        let mut output = if self.steps.len() > 1 { Some(self.grid.image()?) } else { None };
+        for (step, weight) in &self.steps {
+            // Whole samples borrow the source; interpolated samples die after this one pass.
+            let sample = match *step {
+                TwStep::Whole(index) => std::borrow::Cow::Borrowed(self.frame(index)?),
+                TwStep::Mix(a, b, fraction) => std::borrow::Cow::Owned(effectcraft_raster::flow::mix(self.frame(a)?, self.frame(b)?, fraction)),
+                TwStep::Motion { a, b, w, flow } => {
+                    std::borrow::Cow::Owned(timewarp_interpolate(self.frame(a)?, self.frame(b)?, w, self.flow(flow)?, &self.pm))
+                }
+                TwStep::Layered { fg, bg, w, show } => {
+                    let foreground = timewarp_interpolate(self.frame(fg[0])?, self.frame(fg[1])?, w, self.flow(fg[2])?, &self.pm);
+                    let background = timewarp_interpolate(self.frame(bg[0])?, self.frame(bg[1])?, w, self.flow(bg[2])?, &self.pm);
+                    std::borrow::Cow::Owned(layered(foreground, background, show))
+                }
+            };
+            if self.steps.len() == 1 {
+                return Ok(self.grid.wrap(sample.into_owned()));
+            }
+            let output = output.as_mut().ok_or_else(|| invalid("shutter accumulator is missing"))?;
+            output.data.par_iter_mut().zip(sample.data.par_iter()).for_each(|(accumulator, pixel)| {
+                for channel in 0..4 {
+                    accumulator[channel] += pixel[channel] * weight;
+                }
+            });
+        }
+        Ok(self.grid.wrap(output.ok_or_else(|| invalid("shutter accumulator is missing"))?))
+    }
+}
+
+fn split(source: f64, fps: f64) -> (f64, f32) {
+    let frame = source * fps;
+    let before = (frame + 1e-6).floor();
+    (before, ((frame - before) as f32).max(0.0))
+}
+
+struct Instants {
+    values: Vec<(f64, f32)>,
+    keys: Vec<Tick>,
+    times: Vec<f64>,
+    indices: Vec<[usize; 2]>,
+}
+
+fn instants(ctx: &EffectCtx) -> Result<Instants, String> {
+    let fps = ctx.fps();
+    let by_frame = ctx.params.e("adjustTimeBy") == 1;
+    let speed = ctx.params.f("speed");
+    let source = timewarp_source_time(ctx.time, by_frame, speed, ctx.params.f("sourceFrame"), fps);
+    checked_time(source)?;
+    let enabled = ctx.params.b("motionBlur/enableMotionBlur");
+    let samples = if enabled { ctx.params.f("motionBlur/shutterSamples").round().clamp(1.0, MAX_SAMPLES as f64) as usize } else { 1 };
+    let angle = if ctx.params.e("motionBlur/shutterControl") == 1 { ctx.params.f("motionBlur/shutterAngle") } else { 180.0 };
+    let span = if enabled { angle / 360.0 * if by_frame { 1.0 } else { speed / 100.0 } / fps } else { 0.0 };
+    if !span.is_finite() {
+        return Err(invalid("shutter span is non-finite"));
+    }
+    let mut instants = Vec::with_capacity(samples);
+    let mut keys = Vec::with_capacity(samples * 2);
+    let mut sample_keys = Vec::with_capacity(samples);
+    let mut raw_times = Vec::with_capacity(samples * 2);
+    for sample in 0..samples {
+        let instant = source + if samples > 1 { span * sample as f64 / (samples - 1) as f64 } else { 0.0 };
+        checked_time(instant)?;
+        let (frame, _) = split(instant, fps);
+        if !frame.is_finite() || frame.abs() > (1_u64 << 52) as f64 {
+            return Err(invalid("source frame arithmetic exceeds exact integer precision"));
+        }
+        let pair = [time_key(frame / fps)?, time_key((frame + 1.0) / fps)?];
+        raw_times.extend([(pair[0], frame / fps), (pair[1], (frame + 1.0) / fps)]);
+        keys.extend(pair);
+        sample_keys.push(pair);
+        instants.push((instant, 1.0 / samples as f32));
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    let indices = sample_keys
+        .into_iter()
+        .map(|pair| {
+            Ok([
+                keys.binary_search(&pair[0]).map_err(|_| invalid("source key is missing"))?,
+                keys.binary_search(&pair[1]).map_err(|_| invalid("source key is missing"))?,
+            ])
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    // Auxiliary layers previously saw the unrounded source frame seconds. Keep those
+    // instants while sharing duplicate pairs, so animated mattes keep the same pixels.
+    let times = keys
+        .iter()
+        .map(|key| raw_times.iter().find_map(|(candidate, time)| (candidate == key).then_some(*time)).ok_or_else(|| invalid("source instant is missing")))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Instants { values: instants, keys, times, indices })
+}
+
+fn fetch_layer(ctx: &EffectCtx, id: &str, times: &[f64], grid: TimewarpGrid, budget: &mut TimewarpBudget) -> Result<Option<Vec<Image>>, String> {
+    let Some(layer) = ctx.params.get(id).and_then(Value::as_layer) else { return Ok(None) };
+    let Some(host) = ctx.env.host else { return Ok(None) };
+    let masks = ctx.params.get(&crate::layer_source_id(id)).is_none_or(|value| value.as_enum() != 0);
+    let shift = ctx.env.comp_time - ctx.time;
+    times
+        .iter()
+        .map(|source_time| {
+            let time = source_time + shift;
+            checked_time(time)?;
+            match host.layer_at(layer, time, masks) {
+                Some(source) => {
+                    validate_input(&source.buf)?;
+                    let peak = add(budget.preparation_bytes, mul(area(source.buf.img.width, source.buf.img.height)?, 16)?)?;
+                    if peak > MAX_TOTAL_BYTES {
+                        return Err(invalid("matte/warp source and planned scratch exceed the per-effect byte budget"));
+                    }
+                    budget.total_bytes = budget.total_bytes.max(peak);
+                    grid.fit(ctx, source)
+                }
+                None => grid.image(),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+/// Returns no plan only when there is no host/source. Invalid controls, extents and budgets
+/// are checked errors, propagated to preview/export by the registered checked effect.
+pub fn timewarp_plan(ctx: &EffectCtx) -> Result<Option<TimewarpPlan>, String> {
+    prepare(ctx, 0)
+}
+
+pub fn plan_for_input(ctx: &EffectCtx, size: [u32; 2]) -> Result<Option<TimewarpPlan>, String> {
+    prepare(ctx, area(size[0], size[1])?)
+}
+
+fn prepare(ctx: &EffectCtx, input_pixels: u64) -> Result<Option<TimewarpPlan>, String> {
+    validate_controls(ctx)?;
+    let Instants { values: instants, keys, times, indices } = instants(ctx)?;
+    let Some(host) = ctx.env.host else { return Ok(None) };
+    let mut raw_bytes = 0;
+    let mut sources = Vec::with_capacity(keys.len());
+    for key in &keys {
+        let source = host.self_at(key.seconds(), 0);
+        if let Some(source) = &source {
+            validate_input(source)?;
+            raw_bytes = add(raw_bytes, mul(area(source.img.width, source.img.height)?, 16)?)?;
+            if add(raw_bytes, mul(input_pixels, 16)?)? > MAX_TOTAL_BYTES {
+                return Err(invalid("unique decoded source frames and input exceed the per-effect byte budget"));
+            }
+        }
+        sources.push(source);
+    }
+    let Some(grid) = union(&sources)? else { return Ok(None) };
+    // Validate floating products before PixelMotion's integer conversions.
+    for value in [32.0 * grid.scale, ctx.params.get("tuning/blockSize").map(Value::as_f64).unwrap_or(8.0).max(4.0) * grid.scale] {
+        if !value.is_finite() || value > MAX_DIMENSION as f64 {
+            return Err(invalid("scaled motion spacing/window exceeds 16384 pixels"));
+        }
+    }
+    for crop in ["sourceCrops/leftCrop", "sourceCrops/rightCrop", "sourceCrops/topCrop", "sourceCrops/bottomCrop"] {
+        let value = ctx.params.f(crop) * grid.scale;
+        if !value.is_finite() || value > u32::MAX as f64 {
+            return Err(invalid("scaled source crop exceeds its integer range"));
+        }
+    }
+    let pm = PixelMotion::from(ctx, grid.scale);
+    let method = ctx.params.e("method");
+    let matte = ctx.params.get("matteLayer").and_then(Value::as_layer).is_some();
+    let warp = ctx.params.get("warpLayer").and_then(Value::as_layer).is_some();
+    let show = ctx.params.e("show");
+    // Integer-aligned/Whole samples do not estimate motion, even with expensive tuning.
+    let mut pairs: Vec<_> =
+        instants.iter().zip(&indices).filter_map(|((source, _), pair)| (method == 2 && split(*source, ctx.fps()).1 >= 1e-4).then_some(*pair)).collect();
+    pairs.sort_unstable();
+    pairs.dedup();
+    let mut budget =
+        budget(grid, raw_bytes, &pm, BudgetRequest { input_pixels, unique: keys.len(), pairs: pairs.len(), steps: instants.len(), method, matte, warp, show })?;
+    let mut frames = sources.into_iter().map(|source| grid.place(source)).collect::<Result<Vec<_>, _>>()?;
+    let mattes = fetch_layer(ctx, "matteLayer", &times, grid, &mut budget)?
+        .map(|images| images.iter().map(|image| matte_of(image, ctx.params.e("matteChannel"))).collect::<Vec<_>>());
+    let warps = fetch_layer(ctx, "warpLayer", &times, grid, &mut budget)?;
+    let mut derived: Vec<((usize, u32), usize)> = Vec::new();
+    let mut flows: Vec<KeyedFlow> = Vec::new();
+    let mut steps = Vec::with_capacity(instants.len());
+    let one = method > 0 && ctx.params.b("tuning/buildFromOneImage");
+    let derive = |frames: &mut Vec<Image>, cache: &mut Vec<((usize, u32), usize)>, index: usize, mode: u32| -> Result<usize, String> {
+        let Some(mattes) = &mattes else { return Ok(index) };
+        if let Some((_, derived)) = cache.iter().find(|(key, _)| *key == (index, mode)) {
+            return Ok(*derived);
+        }
+        let frame = frames.get(index).ok_or_else(|| invalid("derived source frame is missing"))?;
+        let matte = mattes.get(index).ok_or_else(|| invalid("derived matte frame is missing"))?;
+        let image = if mode == 3 { matte_image(matte, frame) } else { times_mask(frame, matte, mode == 2) };
+        let derived = frames.len();
+        frames.push(image);
+        cache.push(((index, mode), derived));
+        Ok(derived)
+    };
+    for ((source, weight), [a, b]) in instants.into_iter().zip(indices) {
+        let (_, fraction) = split(source, ctx.fps());
+        let step = if method == 0 || fraction < 1e-4 || (one && method == 1) {
+            let pick = if method == 0 || fraction < 1e-4 || fraction < 0.5 { a } else { b };
+            TwStep::Whole(if show > 0 { derive(&mut frames, &mut derived, pick, show)? } else { pick })
+        } else if method == 1 {
+            let (a, b) = if show > 0 { (derive(&mut frames, &mut derived, a, show)?, derive(&mut frames, &mut derived, b, show)?) } else { (a, b) };
+            TwStep::Mix(a, b, fraction)
+        } else if matte {
+            // Derive each foreground/background source once, regardless of sample count.
+            let fa = derive(&mut frames, &mut derived, a, 1)?;
+            let fb = derive(&mut frames, &mut derived, b, 1)?;
+            let ga = derive(&mut frames, &mut derived, a, 2)?;
+            let gb = derive(&mut frames, &mut derived, b, 2)?;
+            // The warp layer supplies one field shared by both masks.
+            let (fg_flow, bg_flow) = if warp {
+                let index = prepare_flow(&frames, warps.as_deref(), &mut flows, [a, b], &pm)?;
+                (index, index)
+            } else {
+                (prepare_flow(&frames, None, &mut flows, [fa, fb], &pm)?, prepare_flow(&frames, None, &mut flows, [ga, gb], &pm)?)
+            };
+            TwStep::Layered { fg: [fa, fb, fg_flow], bg: [ga, gb, bg_flow], w: fraction, show }
+        } else {
+            TwStep::Motion { a, b, w: fraction, flow: prepare_flow(&frames, warps.as_deref(), &mut flows, [a, b], &pm)? }
+        };
+        steps.push((step, weight));
+    }
+    Ok(Some(TimewarpPlan { grid, frames, steps, flows: flows.into_iter().map(|(_, flow)| flow).collect(), pm, budget }))
+}
+
+fn prepare_flow(frames: &[Image], warps: Option<&[Image]>, flows: &mut Vec<KeyedFlow>, pair: [usize; 2], pm: &PixelMotion) -> Result<usize, String> {
+    let key = (pair, warps.is_some());
+    if let Some(index) = flows.iter().position(|(cached, _)| *cached == key) {
+        return Ok(index);
+    }
+    let sources = warps.unwrap_or(frames);
+    let first = sources.get(pair[0]).ok_or_else(|| invalid("motion/warp source is missing"))?;
+    let second = sources.get(pair[1]).ok_or_else(|| invalid("motion/warp source is missing"))?;
+    let index = flows.len();
+    flows.push((key, timewarp_flow(first, second, pm)));
+    Ok(index)
+}
+
+pub fn render_checked(ctx: &EffectCtx, input: Buf) -> Result<Buf, String> {
+    validate_input(&input)?;
+    match plan_for_input(ctx, [input.img.width, input.img.height])? {
+        Some(plan) => plan.render_cpu(),
+        None => Ok(input),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{EffectEnv, EffectHost, Params};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const SIZE: [f64; 2] = [32.0, 20.0];
+
+    #[derive(Default)]
+    struct Host {
+        source_reads: AtomicUsize,
+        layer_reads: AtomicUsize,
+    }
+    impl EffectHost for Host {
+        fn layer(&self, _: u64, _: bool) -> Option<LayerPixels> {
+            None
+        }
+        fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+            None
+        }
+        fn self_at(&self, time: f64, effects: usize) -> Option<Buf> {
+            assert_eq!(effects, 0);
+            self.source_reads.fetch_add(1, Ordering::Relaxed);
+            let mut image = Image::new(32, 20);
+            for (index, pixel) in image.data.iter_mut().enumerate() {
+                let x = index % 32;
+                let y = index / 32;
+                let value = (0.5 + 0.3 * (x as f64 * 0.43 - time * 4.0).sin() + 0.1 * (y as f64 * 0.19).cos()) as f32;
+                *pixel = [value * 0.7, value * 0.3, value * 0.5, 0.7];
+            }
+            Some(Buf { img: image, offset: [0.0; 2], scale: 1.0 })
+        }
+        fn layer_at(&self, _: u64, time: f64, _: bool) -> Option<LayerPixels> {
+            self.layer_reads.fetch_add(1, Ordering::Relaxed);
+            let mut image = Image::new(32, 20);
+            for (index, pixel) in image.data.iter_mut().enumerate() {
+                let alpha = ((index % 32) as f32 / 32.0 + time as f32 * 0.2).clamp(0.0, 1.0);
+                *pixel = [alpha, alpha, alpha, alpha];
+            }
+            Some(LayerPixels { buf: Buf { img: image, offset: [0.0; 2], scale: 1.0 }, size: SIZE })
+        }
+    }
+
+    fn parameters(samples: usize, method: u32) -> Params {
+        let spec = crate::find(ID).unwrap();
+        let mut parameters = Params { values: spec.params.iter().map(|parameter| (parameter.id.into(), crate::default_value(parameter, SIZE))).collect() };
+        for (key, value) in [
+            ("method", Value::Enum(method)),
+            ("adjustTimeBy", Value::Enum(1)),
+            ("sourceFrame", Value::Scalar(4.4)),
+            ("motionBlur/enableMotionBlur", Value::Bool(true)),
+            ("motionBlur/shutterControl", Value::Enum(1)),
+            ("motionBlur/shutterAngle", Value::Scalar(0.0)),
+            ("motionBlur/shutterSamples", Value::Scalar(samples as f64)),
+        ] {
+            parameters.values.insert(key.into(), value);
+        }
+        parameters
+    }
+
+    fn context<'a>(parameters: &'a Params, host: &'a dyn EffectHost) -> EffectCtx<'a> {
+        EffectCtx {
+            params: parameters,
+            time: 0.7,
+            layer_size: SIZE,
+            seed: 1,
+            adjustment: false,
+            env: EffectEnv { host: Some(host), frame_rate: 10.0, comp_time: 0.7, ..Default::default() },
+        }
+    }
+
+    /// The previous materialized-output path: retain every output, then sum per pixel in
+    /// shutter order. Tiny synthetic frames test arithmetic without large allocations.
+    fn collected_reference(plan: &TimewarpPlan) -> Image {
+        let frames = &plan.frames;
+        let images: Vec<Image> = plan
+            .steps
+            .iter()
+            .map(|(step, _)| match *step {
+                TwStep::Whole(index) => frames[index].clone(),
+                TwStep::Mix(a, b, fraction) => effectcraft_raster::flow::mix(&frames[a], &frames[b], fraction),
+                TwStep::Motion { a, b, w, flow } => timewarp_interpolate(&frames[a], &frames[b], w, &plan.flows[flow], &plan.pm),
+                TwStep::Layered { fg, bg, w, show } => layered(
+                    timewarp_interpolate(&frames[fg[0]], &frames[fg[1]], w, &plan.flows[fg[2]], &plan.pm),
+                    timewarp_interpolate(&frames[bg[0]], &frames[bg[1]], w, &plan.flows[bg[2]], &plan.pm),
+                    show,
+                ),
+            })
+            .collect();
+        if images.len() == 1 {
+            return images[0].clone();
+        }
+        let mut output = Image::new(plan.grid.width, plan.grid.height);
+        for (index, pixel) in output.data.iter_mut().enumerate() {
+            for (image, (_, weight)) in images.iter().zip(&plan.steps) {
+                for channel in 0..4 {
+                    pixel[channel] += image.data[index][channel] * weight;
+                }
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn repeated_sixty_four_samples_share_unique_sources_mattes_and_motion_fields() {
+        let host = Host::default();
+        let mut parameters = parameters(64, 2);
+        parameters.values.insert("matteLayer".into(), Value::Layer(Some(7)));
+        let plan = timewarp_plan(&context(&parameters, &host)).unwrap().unwrap();
+        assert_eq!(host.source_reads.load(Ordering::Relaxed), 2);
+        assert_eq!(host.layer_reads.load(Ordering::Relaxed), 2);
+        assert_eq!(plan.steps.len(), 64);
+        assert_eq!(plan.frames.len(), 6, "two source and four masked frames, rather than one set per sample");
+        assert_eq!(plan.flows.len(), 2, "foreground and background fields are shared by all fractions");
+        assert_eq!(plan.frames.iter().map(|image| image.data.len()).sum::<usize>(), 6 * 32 * 20);
+        assert_eq!(plan.render_cpu().unwrap().img.data, collected_reference(&plan).data);
+    }
+
+    #[test]
+    fn streaming_matches_collected_outputs_at_all_supported_sample_counts() {
+        for samples in [1, 2, 8, 16, 32, 64] {
+            for method in 0..=2 {
+                for (matte, show) in [(false, 0), (true, 0), (true, 1), (true, 2), (true, 3)] {
+                    let mut parameters = parameters(samples, method);
+                    parameters.values.insert("motionBlur/shutterAngle".into(), Value::Scalar(180.0));
+                    parameters.values.insert("show".into(), Value::Enum(show));
+                    if matte {
+                        parameters.values.insert("matteLayer".into(), Value::Layer(Some(7)));
+                    }
+                    let host = Host::default();
+                    let plan = timewarp_plan(&context(&parameters, &host)).unwrap().unwrap();
+                    assert_eq!(
+                        plan.render_cpu().unwrap().img.data,
+                        collected_reference(&plan).data,
+                        "samples {samples}, method {method}, matte {matte}, show {show}"
+                    );
+                    assert!(plan.frames.len() <= plan.budget.frame_limit);
+                    assert!(plan.flows.len() <= plan.budget.flow_limit);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hostile_controls_fail_before_host_reads_and_integer_casts() {
+        let host = Host::default();
+        for (key, value) in [
+            ("speed", f64::NAN),
+            ("speed", f64::INFINITY),
+            ("sourceFrame", f64::MAX),
+            ("motionBlur/shutterSamples", 1e30),
+            ("motionBlur/shutterAngle", -1.0),
+            ("tuning/blockSize", f64::MAX),
+            ("tuning/vectorDetail", 101.0),
+            ("tuning/weighting/redWeighting", f64::NEG_INFINITY),
+            ("method", 1.5),
+        ] {
+            let mut parameters = parameters(1, 2);
+            parameters.values.insert(key.into(), Value::Scalar(value));
+            assert!(timewarp_plan(&context(&parameters, &host)).is_err(), "{key}: {value}");
+        }
+        let parameters = parameters(1, 2);
+        for time in [f64::NAN, f64::INFINITY, f64::MAX] {
+            let mut context = context(&parameters, &host);
+            context.time = time;
+            assert!(timewarp_plan(&context).is_err());
+        }
+        for fps in [f64::NAN, f64::INFINITY, -1.0, 1001.0, 1e-300] {
+            let mut context = context(&parameters, &host);
+            context.env.frame_rate = fps;
+            assert!(timewarp_plan(&context).is_err());
+        }
+        assert_eq!(host.source_reads.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn capacity_overflow_and_union_extents_are_rejected_without_allocating_pixels() {
+        let malformed = Buf { img: Image { width: u32::MAX, height: u32::MAX, data: Vec::new() }, offset: [0.0; 2], scale: 1.0 };
+        assert!(validate_input(&malformed).is_err());
+        let parameters = parameters(1, 2);
+        let host = Host::default();
+        let context = context(&parameters, &host);
+        for scale in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
+            let input = Buf { img: Image::new(1, 1), offset: [0.0; 2], scale };
+            assert!(render_checked(&context, input).is_err());
+        }
+        let first = Buf { img: Image::new(1, 1), offset: [-1e9, 0.0], scale: 1.0 };
+        let second = Buf { img: Image::new(1, 1), offset: [1e9, 0.0], scale: 1.0 };
+        assert!(union(&[Some(first), Some(second)]).is_err());
+        for scale in [f64::NAN, f64::INFINITY, 0.0, -1.0, 1e-300] {
+            let first = Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: 1.0 };
+            let second = Buf { img: Image::new(1, 1), offset: [0.0; 2], scale };
+            assert!(union(&[Some(first), Some(second)]).is_err());
+        }
+        // The reverse scale ratio can keep the union small while making sample coordinates
+        // enormous. Previously this escaped into i64::MAX + 1 in bilinear sampling.
+        let tiny = Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: 1e-300 };
+        let ordinary = Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: 1.0 };
+        let grid = union(&[Some(tiny), Some(ordinary)]).unwrap().unwrap();
+        assert!(grid.place(Some(Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: 1.0 })).is_err());
+        let grid = TimewarpGrid { width: 1, height: 1, offset: [0.0; 2], scale: 1.0 };
+        let source = LayerPixels { buf: Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: 1e300 }, size: [1.0; 2] };
+        assert!(grid.fit(&context, source).is_err());
+    }
+
+    #[test]
+    fn aggregate_budget_bounds_quality_without_allocating_1440p_frames() {
+        let parameters = parameters(64, 2);
+        let host = Host::default();
+        let context = context(&parameters, &host);
+        let motion = PixelMotion::from(&context, 1.0);
+        let grid = TimewarpGrid { width: 2560, height: 1440, offset: [0.0; 2], scale: 1.0 };
+        let request = BudgetRequest { input_pixels: 2560 * 1440, unique: 2, pairs: 1, steps: 64, method: 2, matte: false, warp: false, show: 0 };
+        let plan = budget(grid, 2 * 2560 * 1440 * 16, &motion, request).unwrap();
+        assert!(plan.total_bytes < MAX_TOTAL_BYTES);
+        assert_eq!(plan.frame_limit, 2);
+        assert_eq!(plan.flow_limit, 1);
+        assert!(budget(grid, 0, &motion, BudgetRequest { unique: 128, pairs: 64, ..request }).is_err());
+        let maximum_matching = PixelMotion { tile: 2, window: 64, ..motion };
+        assert!(budget(grid, 0, &maximum_matching, request).is_err(), "SAD work must be bounded independently of memory");
+        assert!(budget(grid, 0, &maximum_matching, BudgetRequest { pairs: 0, ..request }).is_ok(), "integer-aligned samples do not do SAD work");
+        assert!(budget(grid, u64::MAX, &motion, request).is_err());
+        assert!(budget(grid, 0, &motion, BudgetRequest { unique: usize::MAX, ..request }).is_err());
+        assert!(budget(TimewarpGrid { width: u32::MAX, height: u32::MAX, ..grid }, 0, &motion, request).is_err());
+    }
+
+    #[test]
+    fn prepared_bad_indices_fractions_and_fields_return_errors() {
+        let parameters = parameters(2, 2);
+        let host = Host::default();
+        let mut plan = timewarp_plan(&context(&parameters, &host)).unwrap().unwrap();
+        let saved = plan.steps.clone();
+        for step in [TwStep::Whole(usize::MAX), TwStep::Mix(0, 1, f32::NAN), TwStep::Motion { a: 0, b: 1, w: 0.5, flow: usize::MAX }] {
+            plan.steps[0].0 = step;
+            assert!(plan.render_cpu().is_err());
+        }
+        plan.steps = saved;
+        plan.flows[0].v.clear();
+        assert!(plan.render_cpu().is_err());
+    }
+
+    #[test]
+    fn public_plan_cannot_forge_limits_storage_work_or_vector_spacing() {
+        let parameters = parameters(2, 2);
+        let host = Host::default();
+        let context = context(&parameters, &host);
+        for change in 0..7 {
+            let mut plan = timewarp_plan(&context).unwrap().unwrap();
+            match change {
+                0 => plan.budget.frame_limit = usize::MAX,
+                1 => plan.budget.flow_limit = usize::MAX,
+                2 => plan.budget.total_bytes = 0,
+                3 => plan.budget.work = 0,
+                4 => {
+                    plan.frames = vec![Image::new(1, 1); MAX_PREPARED_FRAMES + 1];
+                    plan.budget.frame_limit = MAX_PREPARED_FRAMES + 1;
+                }
+                5 => {
+                    plan.flows = vec![Flow::default(); MAX_PREPARED_FLOWS + 1];
+                    plan.budget.flow_limit = MAX_PREPARED_FLOWS + 1;
+                }
+                _ => {
+                    let flow = &mut plan.flows[0];
+                    flow.block = MAX_DIMENSION + 1;
+                    flow.cols = 1;
+                    flow.rows = 1;
+                    flow.v = vec![[0.0; 2]];
+                }
+            }
+            assert!(plan.render_cpu().is_err(), "mutation {change} must fail before output allocation");
+        }
+    }
+
+    #[test]
+    fn tiny_former_placement_coordinate_overflow_is_checked_before_sampling() {
+        let grid = TimewarpGrid { width: 1, height: 1, offset: [0.0; 2], scale: 1e-300 };
+        let source = Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: 1.0 };
+        let formerly_unchecked_x = 0.5 * source.scale / grid.scale;
+        let cast = (formerly_unchecked_x - 0.5).floor() as i64;
+        assert_eq!(cast, i64::MAX);
+        assert!(cast.checked_add(1).is_none(), "the old bilinear neighbour arithmetic overflowed");
+        // One pixel and no large allocation. Debug overflow checks expose the former panic;
+        // release builds use the checked arithmetic witness rather than relying on a panic.
+        if cfg!(debug_assertions) {
+            assert!(std::panic::catch_unwind(|| source.img.sample_bilinear(formerly_unchecked_x, 0.5)).is_err());
+        }
+        assert!(grid.place(Some(source)).unwrap_err().contains("resampling coordinates"));
+    }
+}

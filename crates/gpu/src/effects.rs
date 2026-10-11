@@ -107,21 +107,40 @@ fn readback_buf(r: crate::deferred::Readback) -> Option<Buf> {
 /// A checked effect over host pixels: validate before uploading or consulting deferred
 /// results. A pending keyed readback returns the input placeholder and raises the miss gate.
 pub(crate) fn run_checked(e: &mut Enc, step: &FxStep, input: &Buf, levels: Option<f32>) -> Result<Option<Buf>, String> {
-    if step.spec.id != effectcraft_effects::bloom::ID {
+    if ![effectcraft_effects::bloom::ID, effectcraft_effects::timewarp::ID].contains(&step.spec.id) {
         return Ok(None);
     }
-    let plan = effectcraft_effects::bloom::plan(&step.ctx, [input.img.width, input.img.height], input.scale).map_err(|error| error.to_string())?;
-    effectcraft_effects::bloom::validate_input(input, &plan).map_err(|error| error.to_string())?;
+    let deferred = e.g.deferred.clone();
+    // Timewarp's source host may request deferred data while preparing its plan.
+    let misses = deferred.as_ref().map(|deferred| deferred.misses());
+    let bloom = if step.spec.id == effectcraft_effects::bloom::ID {
+        let plan = effectcraft_effects::bloom::plan(&step.ctx, [input.img.width, input.img.height], input.scale).map_err(|error| error.to_string())?;
+        effectcraft_effects::bloom::validate_input(input, &plan).map_err(|error| error.to_string())?;
+        Some(plan)
+    } else {
+        effectcraft_effects::timewarp::validate_input(input)?;
+        None
+    };
+    let warp = if step.spec.id == effectcraft_effects::timewarp::ID {
+        effectcraft_effects::timewarp::plan_for_input(&step.ctx, [input.img.width, input.img.height])?
+    } else {
+        None
+    };
+    let (size, offset, scale) = match (&bloom, &warp) {
+        (Some(plan), _) => (plan.output, input.offset.map(|value| value + plan.pad as f64), input.scale),
+        (_, Some(plan)) => ([plan.grid.width, plan.grid.height], plan.grid.offset, plan.grid.scale),
+        _ => ([input.img.width, input.img.height], input.offset, input.scale),
+    };
     e.g.check_health()?;
     if !e.g.can_readback() {
         return Err("checked GPU effect cannot return a completed image".into());
     }
     let ready = |readback: Option<crate::deferred::Readback>| -> Result<Option<Buf>, String> {
         let readback = readback.ok_or("checked GPU effect readback failed")?;
-        if [readback.width, readback.height] != plan.output {
+        if [readback.width, readback.height] != size {
             return Err("checked GPU effect readback dimensions differ from the validated plan".into());
         }
-        if readback.offset != input.offset.map(|value| value + plan.pad as f64) || readback.scale != input.scale {
+        if readback.offset != offset || readback.scale != scale {
             return Err("checked GPU effect readback geometry differs from the validated plan".into());
         }
         let count = usize::try_from(u64::from(readback.width) * u64::from(readback.height)).map_err(|_| "checked readback exceeds address space")?;
@@ -138,7 +157,6 @@ pub(crate) fn run_checked(e: &mut Enc, step: &FxStep, input: &Buf, levels: Optio
             scale: readback.scale,
         }))
     };
-    let deferred = e.g.deferred.clone();
     let key = deferred.as_ref().map(|_| crate::deferred::chain_key(std::slice::from_ref(step), input, levels));
     if let (Some(deferred), Some(key)) = (&deferred, key) {
         match deferred.lookup(key) {
@@ -150,9 +168,13 @@ pub(crate) fn run_checked(e: &mut Enc, step: &FxStep, input: &Buf, levels: Optio
             crate::deferred::Lookup::Absent => {}
         }
     }
-    let misses = deferred.as_ref().map(|deferred| deferred.misses());
     let image = e.g.upload_image(&input.img).ok_or("checked GPU effect cannot upload its validated input")?;
-    let mut output = crate::bloom::resident(e, &step.ctx, GBuf { img: image, offset: input.offset, scale: input.scale }).map_err(|error| error.to_string())?;
+    let resident_input = GBuf { img: image, offset: input.offset, scale: input.scale };
+    let mut output = if bloom.is_some() {
+        crate::bloom::resident(e, &step.ctx, resident_input).map_err(|error| error.to_string())?
+    } else {
+        crate::fx_time::prepared(e, resident_input, warp.as_ref())?
+    };
     if let Some(levels) = levels {
         output.img = ops::quantize(e, &output.img, levels);
     }
@@ -222,13 +244,17 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
         self.b = self.e.g.upload_image(&out.img).map(|img| GBuf { img, offset: out.offset, scale: out.scale });
     }
     fn gpu_checked(&mut self, step: &FxStep) -> Result<bool, String> {
-        if step.spec.id != effectcraft_effects::bloom::ID {
+        if ![effectcraft_effects::bloom::ID, effectcraft_effects::timewarp::ID].contains(&step.spec.id) {
             return Ok(false);
         }
         let input = self.b.as_ref().ok_or("checked effect has no resident input")?;
         let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let input = GBuf { img: input.img.clone(), offset: input.offset, scale: input.scale };
-            let mut output = crate::bloom::resident(self.e, &step.ctx, input).map_err(|error| error.to_string())?;
+            let mut output = if step.spec.id == effectcraft_effects::bloom::ID {
+                crate::bloom::resident(self.e, &step.ctx, input).map_err(|error| error.to_string())?
+            } else {
+                crate::fx_time::checked(self.e, &step.ctx, input)?
+            };
             if let Some(levels) = self.levels {
                 output.img = ops::quantize(self.e, &output.img, levels);
             }

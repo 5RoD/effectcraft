@@ -17,6 +17,7 @@ effectcraft-project = { workspace = true }
 effectcraft-raster = { workspace = true }
 effectcraft-segment = { workspace = true }
 effectcraft-track = { workspace = true }
+effectcraft-time = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
