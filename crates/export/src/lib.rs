@@ -32,6 +32,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod encode;
+mod geometry;
 mod hevc_av1;
 mod out;
 mod pipeline;
@@ -189,18 +190,21 @@ pub async fn export_async(job: &Job<'_>, progress: &mut dyn FnMut(&Progress) -> 
 
 async fn export_with(cx: &Cx<'_>, progress: &mut dyn FnMut(&Progress) -> bool, t0: Instant) -> Result<Report> {
     let comp = cx.comp().ok_or(ExportError::NoComp)?;
-    if !cx.output.format.is_audio_only() {
+    let (w, h) = if !cx.output.format.is_audio_only() {
         // Codec setup precedes rendering; reject hostile composition sizes before it can
         // allocate a frame. Finite positive settings retain the existing resolution clamp.
         let scale = cx.settings.resolution;
         let scale = if scale.is_finite() && scale > 0.0 { scale.clamp(0.01, 4.0) } else { scale };
-        effectcraft_render::raster_bounds::frame(comp.width, comp.height, scale, None)
+        let raster = effectcraft_render::raster_bounds::frame(comp.width, comp.height, scale, None)
             .map_err(|message| ExportError::Render(format!("Render failed in comp {} / raster geometry before export: {message}", cx.comp.0)))?;
-    }
+        let plan = geometry::Geometry::new(raster.size[0], raster.size[1], scale, cx.output)?;
+        (plan.coded[0], plan.coded[1])
+    } else {
+        output_size(comp, cx.settings, cx.output)
+    };
     let total = cx.settings.frame_count(comp);
     let mut st = State { t0, total, done: 0, progress };
     st.advance(0)?;
-    let (w, h) = output_size(comp, cx.settings, cx.output);
     let mut report = match cx.output.format {
         OutputFormat::H264 | OutputFormat::Hevc | OutputFormat::Av1 | OutputFormat::ProRes => encode::movie(cx, comp, w, h, &mut st).await?,
         OutputFormat::Gif => gif_export(cx, comp, w, h, &mut st).await?,

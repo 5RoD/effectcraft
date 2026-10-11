@@ -159,7 +159,7 @@ impl<'a> Cx<'a> {
         {
             img.quantize(levels);
         }
-        let img = self.crop_resize(img);
+        let img = self.crop_resize(img)?;
         if let Some(ft) = &self.frame_times {
             ft.lock().unwrap_or_else(|e| e.into_inner()).push((i, t0.elapsed().as_secs_f64()));
         }
@@ -167,20 +167,22 @@ impl<'a> Cx<'a> {
     }
 
     /// Output Module ▸ Crop, then Resize.
-    fn crop_resize(&self, img: Image) -> Image {
+    fn crop_resize(&self, img: Image) -> Result<Image> {
         let om = self.job.output;
         let scale = self.job.settings.resolution.clamp(0.01, 4.0);
-        let (t, l, b, r) = om.crop.edges(img.width, img.height, scale);
-        let img = if (t, l, b, r) == (0, 0, 0, 0) { img } else { crop(&img, t, l, b, r) };
+        crate::geometry::validate_image(&img)?;
+        let plan = crate::geometry::Geometry::new(img.width, img.height, scale, om)?;
+        let (t, l, b, r) = plan.edges;
+        let img = if (t, l, b, r) == (0, 0, 0, 0) { img } else { crop(&img, t, l, b, r)? };
         if !om.resize.enabled {
-            return img;
+            return Ok(img);
         }
-        let (w, h) = om.frame_size(img.width, img.height, 1.0);
+        let [w, h] = plan.resized;
         if (w, h) == (img.width, img.height) {
-            return img;
+            return Ok(img);
         }
         match om.resize.quality {
-            ResizeQuality::Low => effectcraft_raster::warp::resample(&img, w, h),
+            ResizeQuality::Low => Ok(effectcraft_raster::warp::resample(&img, w, h)),
             ResizeQuality::High => bicubic(&img, w, h),
         }
     }
@@ -310,34 +312,47 @@ pub(crate) fn interleave(first: &Image, second: &Image, upper_first: bool) -> Im
 }
 
 /// Remove `t`/`l`/`b`/`r` pixels from the edges (negative values add transparent pixels).
-pub(crate) fn crop(img: &Image, t: i32, l: i32, b: i32, r: i32) -> Image {
-    let w = (img.width as i32 - l - r).max(1) as u32;
-    let h = (img.height as i32 - t - b).max(1) as u32;
-    let mut out = Image::new(w, h);
-    for y in 0..h as i32 {
-        let sy = y + t;
-        if sy < 0 || sy >= img.height as i32 {
+pub(crate) fn crop(img: &Image, t: i32, l: i32, b: i32, r: i32) -> Result<Image> {
+    crate::geometry::validate_image(img)?;
+    let [w, h] = crate::geometry::cropped_size(img.width, img.height, (t, l, b, r))?;
+    let mut out = crate::geometry::image(w, h)?;
+    // Copy each visible span once; padding remains transparent. Bounds are checked per row,
+    // avoiding a source-index check and branch for every output pixel.
+    let x0 = (-i64::from(l)).clamp(0, i64::from(w)) as usize;
+    let x1 = (i64::from(img.width) - i64::from(l)).clamp(0, i64::from(w)) as usize;
+    if x0 >= x1 {
+        return Ok(out);
+    }
+    let source_x = (x0 as i64 + i64::from(l)) as usize;
+    let count = x1 - x0;
+    for (y, row) in out.data.chunks_mut(w as usize).enumerate() {
+        let sy = y as i64 + i64::from(t);
+        if sy < 0 || sy >= i64::from(img.height) {
             continue;
         }
-        for x in 0..w as i32 {
-            let sx = x + l;
-            if sx >= 0 && sx < img.width as i32 {
-                let o = out.idx(x as u32, y as u32);
-                out.data[o] = img.data[img.idx(sx as u32, sy as u32)];
-            }
-        }
+        // Validated geometry bounds both row arithmetic and the visible source span.
+        let start = (sy as usize)
+            .checked_mul(img.width as usize)
+            .and_then(|row| row.checked_add(source_x))
+            .ok_or_else(|| ExportError::Render("cropped frame source offset overflow".into()))?;
+        let end = start.checked_add(count).ok_or_else(|| ExportError::Render("cropped frame source length overflow".into()))?;
+        let source = img.data.get(start..end).ok_or_else(|| ExportError::Render("cropped frame source span exceeds its buffer".into()))?;
+        let destination = row.get_mut(x0..x1).ok_or_else(|| ExportError::Render("cropped frame destination span exceeds its buffer".into()))?;
+        destination.copy_from_slice(source);
     }
-    out
+    Ok(out)
 }
 
 /// Bicubic resize (Resize Quality: High).
-fn bicubic(src: &Image, w: u32, h: u32) -> Image {
+fn bicubic(src: &Image, w: u32, h: u32) -> Result<Image> {
+    crate::geometry::validate_image(src)?;
+    crate::geometry::size(w, h)?;
     // Shrinking a lot: bilinear with its box pre-filter first, then bicubic for the last step.
     if src.width > w * 2 && src.height > h * 2 {
         let mid = effectcraft_raster::warp::resample(src, w * 2, h * 2);
         return bicubic(&mid, w, h);
     }
-    let mut out = Image::new(w, h);
+    let mut out = crate::geometry::image(w, h)?;
     let (sx, sy) = (src.width as f64 / w as f64, src.height as f64 / h as f64);
     for y in 0..h {
         for x in 0..w {
@@ -347,10 +362,11 @@ fn bicubic(src: &Image, w: u32, h: u32) -> Image {
             let fy = ((y as f64 + 0.5) * sy).clamp(0.5, src.height as f64 - 0.5);
             let mut p = src.sample_bicubic(fx, fy);
             p[3] = p[3].min(1.0);
-            out.data[o] = p;
+            let pixel = out.data.get_mut(o).ok_or_else(|| ExportError::Render("resized frame destination index exceeds its buffer".into()))?;
+            *pixel = p;
         }
     }
-    out
+    Ok(out)
 }
 
 /// Premultiplied 8-bit RGBA (colour matted with black).
@@ -436,13 +452,31 @@ mod tests {
         for (i, p) in img.data.iter_mut().enumerate() {
             *p = [i as f32, 0.0, 0.0, 1.0];
         }
-        let c = crop(&img, 1, 1, 0, 1);
+        let c = crop(&img, 1, 1, 0, 1).unwrap();
         assert_eq!((c.width, c.height), (2, 2));
         assert_eq!(c.data[0][0], 5.0);
-        let p = crop(&img, -1, 0, 0, 0);
+        let p = crop(&img, -1, 0, 0, 0).unwrap();
         assert_eq!((p.width, p.height), (4, 4));
         assert_eq!(p.data[0], [0.0; 4]);
         assert_eq!(p.data[4][0], 0.0);
         assert_eq!(p.data[5][0], 1.0);
+        let horizontal = crop(&img, 0, -2, 0, 1).unwrap();
+        assert_eq!((horizontal.width, horizontal.height), (5, 3));
+        for (source, padded) in img.data.chunks(4).zip(horizontal.data.chunks(5)) {
+            assert_eq!(&padded[..2], &[[0.0; 4]; 2]);
+            assert_eq!(&padded[2..], &source[..3]);
+        }
+    }
+
+    #[test]
+    fn crop_rejects_hostile_padding_and_truncated_frames() {
+        let img = Image::filled(4, 3, [1.0; 4]);
+        assert!(crop(&img, 0, i32::MIN, 0, 0).is_err());
+        let far = crop(&img, 0, i32::MAX, 0, i32::MIN).unwrap();
+        assert_eq!((far.width, far.height), (5, 3));
+        assert!(far.data.iter().all(|pixel| *pixel == [0.0; 4]));
+        let malformed = Image { width: 4, height: 3, data: vec![[1.0; 4]] };
+        assert!(crop(&malformed, 0, 1, 0, 0).is_err());
+        assert!(bicubic(&malformed, 2, 2).is_err());
     }
 }

@@ -175,6 +175,29 @@ fn crop_roi_and_resize() {
 }
 
 #[test]
+fn locked_aspect_resize_applies_crop_once_without_extra_transparent_rows() {
+    let mut p = Project::default();
+    let mut comp = Comp::new(8, 8, FrameRate::FPS_25, Tick::from_seconds_f64(0.04));
+    let solid = p.add_item("Opaque", Label::Red, None, ItemKind::Solid(Solid { color: [1.0; 3], width: 8, height: 8, pixel_aspect: 1.0 }));
+    let layer = build::layer(&mut p, &comp, "Opaque", LayerSource::Solid { item: solid }, (8, 8), None);
+    comp.layers.push(layer);
+    let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.into()));
+    let settings = custom(0.0, 0.04);
+    let mut output = OutputModule::for_format(OutputFormat::PngSequence);
+    output.channels = Channels::Rgba;
+    output.crop = Crop { enabled: true, top: 2, left: 1, bottom: 1, ..Default::default() };
+    for quality in [ResizeQuality::Low, ResizeQuality::High] {
+        output.resize = Resize { enabled: true, width: 8, lock_aspect: true, quality, ..Default::default() };
+        let image = png(&run(&p, cid, &settings, &output, "/c/once_[#####].png"), 0);
+        assert_eq!((image.width(), image.height()), (8, 6));
+        // Low quality bilinear sampling has its existing fractional edge coverage when
+        // upscaling. The old double crop instead added three fully transparent bottom rows.
+        assert!(image.pixels().all(|pixel| pixel[3] >= 200), "{quality:?}: cropping twice changes the aspect and pads the export");
+        assert!(image.get_pixel(4, 5)[3] >= 230, "{quality:?}: bottom row must contain the resized source");
+    }
+}
+
+#[test]
 fn alpha_only_and_premultiplied() {
     let (p, cid) = project(FrameRate::new(25, 1), |p, comp| {
         // A half-transparent green layer over the right half.

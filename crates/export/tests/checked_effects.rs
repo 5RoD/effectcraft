@@ -10,6 +10,60 @@ use effectcraft_render::{NoFootage, RenderOpts, Renderer};
 use effectcraft_time::{FrameRate, Tick};
 
 #[test]
+fn checked_output_geometry_preserves_destination_before_rendering_or_codec_setup() {
+    let mut project = Project::default();
+    let comp = Comp::new(8, 8, FrameRate::FPS_30, Tick::from_seconds_f64(1.0));
+    let cid = project.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.into()));
+    let before = project.clone();
+    let settings = RenderSettings::default();
+    let directory = std::env::temp_dir().join(format!("ec-checked-output-geometry-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let destination = directory.join("completed.gif");
+    std::fs::write(&destination, b"previous successful export").unwrap();
+    let mut cases = Vec::new();
+    let mut output = OutputModule::for_format(OutputFormat::Gif);
+    output.crop = Crop { enabled: true, left: i32::MIN, ..Default::default() };
+    cases.push(output.clone());
+    output.resize = Resize { enabled: true, width: 1, height: 1, lock_aspect: false, ..Default::default() };
+    cases.push(output.clone());
+    output.crop = Crop { enabled: true, use_roi: true, roi: Some([-f64::MAX, 0.0, 1.0, 1.0]), ..Default::default() };
+    cases.push(output.clone());
+    output.crop.roi = Some([0.0, f64::NAN, 1.0, 1.0]);
+    cases.push(output.clone());
+    output.crop = Crop::default();
+    output.resize = Resize { enabled: true, width: 8192, height: 8192, lock_aspect: false, ..Default::default() };
+    cases.push(output);
+    for output in cases {
+        let job = Job {
+            project: &project,
+            footage: &NoFootage,
+            expr: None,
+            accel: None,
+            comp: cid,
+            settings: &settings,
+            output: &output,
+            path: destination.to_str().unwrap(),
+            sink: None,
+            nested_switches: true,
+            options: JobOptions::default(),
+        };
+        let mut advances = 0;
+        let error = export(&job, &mut |_| {
+            advances += 1;
+            true
+        })
+        .unwrap_err();
+        assert!(matches!(error, ExportError::Render(_)));
+        assert!(error.to_string().contains("output crop/resize geometry"));
+        assert_eq!(advances, 0, "reject geometry before starting the render/encode loop");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"previous successful export");
+        assert_eq!(project, before);
+        assert!(std::fs::read_dir(&directory).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with(".effectcraft-export-")));
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn checked_media_late_decode_failure_preserves_completed_export() {
     use effectcraft_project::{Footage, FootageKind, ItemId};
     use effectcraft_render::{FootageSource, Image};

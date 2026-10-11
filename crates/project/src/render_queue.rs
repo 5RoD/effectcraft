@@ -765,8 +765,10 @@ impl Crop {
         {
             let l = (x * scale).round() as i32;
             let t = (y * scale).round() as i32;
-            let r = w as i32 - ((x + rw) * scale).round() as i32;
-            let b = h as i32 - ((y + rh) * scale).round() as i32;
+            // This infallible display query saturates hostile coordinates. Export validates
+            // the original ROI before using it, rather than treating saturation as a repair.
+            let r = (f64::from(w) - ((x + rw) * scale).round()) as i32;
+            let b = (f64::from(h) - ((y + rh) * scale).round()) as i32;
             return (t, l, b, r);
         }
         (self.top, self.left, self.bottom, self.right)
@@ -1088,8 +1090,14 @@ impl OutputModule {
     /// scale `scale`: after Crop and Resize (before codec rounding).
     pub fn frame_size(&self, w: u32, h: u32, scale: f64) -> (u32, u32) {
         let (t, l, b, r) = self.crop.edges(w, h, scale);
-        let cw = (w as i32 - l - r).max(1) as u32;
-        let ch = (h as i32 - t - b).max(1) as u32;
+        let cw = (i64::from(w) - i64::from(l) - i64::from(r)).clamp(1, i64::from(u32::MAX)) as u32;
+        let ch = (i64::from(h) - i64::from(t) - i64::from(b)).clamp(1, i64::from(u32::MAX)) as u32;
+        self.resized_size(cw, ch)
+    }
+    /// Resize an already cropped frame. Infallible size queries saturate hostile dimensions;
+    /// exporters must validate the cropped and resized sizes before allocating either frame.
+    pub fn resized_size(&self, cw: u32, ch: u32) -> (u32, u32) {
+        let (cw, ch) = (cw.max(1), ch.max(1));
         if !self.resize.enabled {
             return (cw, ch);
         }
@@ -1469,6 +1477,20 @@ pub fn sanitize(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minimum_crop_edge_does_not_panic_in_public_size_query() {
+        let output = OutputModule { crop: Crop { enabled: true, left: i32::MIN, ..Default::default() }, ..Default::default() };
+        assert_eq!(output.frame_size(64, 48, 1.0), (2_147_483_712, 48));
+        let output = OutputModule { crop: Crop { enabled: true, left: i32::MIN, right: i32::MIN, ..Default::default() }, ..Default::default() };
+        assert_eq!(output.frame_size(u32::MAX, 48, 1.0), (u32::MAX, 48));
+    }
+
+    #[test]
+    fn hostile_roi_origin_does_not_panic_in_public_edge_query() {
+        let crop = Crop { enabled: true, use_roi: true, roi: Some([-f64::MAX, 0.0, 1.0, 1.0]), ..Default::default() };
+        assert_eq!(crop.edges(64, 48, 1.0), (0, i32::MIN, 47, i32::MAX));
+    }
 
     #[test]
     fn templates_and_sequences() {

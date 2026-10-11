@@ -30,6 +30,10 @@ application and Desktop shortcut have not been removed or replaced.
   field and blended reads and composition proxies. Failed pixels cannot enter the compositor
   cache or replace a completed export. Explicitly missing footage remains distinguishable from
   a decode failure; this does not establish decoder conformance or a total media memory budget.
+- Export checks crop, resize and coded dimensions before encoder setup, including the cropped
+  intermediate when the final resize is small. Infallible size queries no longer overflow on
+  hostile crop edges or ROI origins. Locked-aspect resize uses the cropped frame once, removing
+  unintended transparent output rows. See [output geometry bounds](../output-geometry-safety.md).
 - Timewarp shares unique source/matte/warp frames and motion fields, streams shutter samples
   in their original order, and reuses private GPU scratch textures. Checked controls, geometry,
   storage/work budgets and kernels produce actionable errors. The renderer cache version
@@ -131,8 +135,8 @@ and the inherited [gap assessment](../gaps.md).
 ## Validation
 
 The complete repository gate is `cargo xtask ci`: formatting, clippy, workspace tests, dependency
-layering, licensed assets and WebAssembly checks. The viewer-observer increment passed
-on 2026-10-12 (local date): 2,999 tests passed, 27 explicitly optional tests were ignored, all 31 assets were attributed,
+layering, licensed assets and WebAssembly checks. The output-geometry increment passed
+on 2026-10-12 (local date): 3,006 tests passed, 27 explicitly optional tests were ignored, all 31 assets were attributed,
 dependency layering passed, and 32 crates passed the WebAssembly check. Formatting and native
 clippy with warnings denied also passed. The WebAssembly check reports an inherited dead-code
 warning for the native shortcut-suspension state.
@@ -154,6 +158,10 @@ Retiming regressions cover exact frame boundaries and neighbouring Ticks at nega
 multi-day times, rational rates, interpreted sources and auxiliary matte/warp reads. Actual
 renderer-host and required GPU identity checks exercise the native Tick path; float-only
 custom hosts retain their documented precision limit.
+Output-geometry regressions reproduce the former debug overflows with tiny synthetic inputs,
+reject oversized crop/resize intermediates before encoder setup, preserve existing destinations,
+and check both resize quality choices through PNG output. The former unwanted transparent rows
+are removed; existing bilinear fractional edge coverage is retained.
 
 Windows validation uses release optimization with Thin LTO disabled for the large test suite;
 the production build and comparable performance measurements use the repository's normal release
