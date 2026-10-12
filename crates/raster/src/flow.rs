@@ -13,6 +13,7 @@
 //! instead of double-exposing as with a plain frame mix.
 
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::Image;
 
@@ -102,6 +103,72 @@ pub fn block_flow(a: &Image, b: &Image, block: u32, radius: i32) -> Flow {
 /// `tile × tile` tile, each matched with the `window × window` block centred on its tile
 /// (Timewarp's Vector Detail and Block Size).
 pub fn block_flow_window(a: &Image, b: &Image, tile: u32, window: u32, radius: i32) -> Flow {
+    block_flow_window_with_fit(a, b, tile, window, radius, |em, e0, ep| subpixel_fit(em, e0, ep).unwrap_or(0.0))
+}
+
+/// Checked shape/controls and subpixel arithmetic, sharing the legacy matcher.
+/// Images must match, have exact storage, at most 16384 pixels per dimension and
+/// 32 million pixels. Tile/window ranges are 2..=16384 / 4..=16384, and radius is
+/// 0..=64. Callers must still validate their aggregate matching-work budget.
+/// The normal per-vector path performs no atomic operations or added image scans;
+/// one final error-flag load is performed after matching.
+pub fn block_flow_window_checked(a: &Image, b: &Image, tile: u32, window: u32, radius: i32) -> Result<Flow, String> {
+    let pixels = u64::from(a.width).checked_mul(u64::from(a.height)).ok_or_else(|| "motion matching dimensions overflow".to_string())?;
+    if a.width == 0
+        || a.height == 0
+        || a.width > 16_384
+        || a.height > 16_384
+        || pixels > 32 * 1024 * 1024
+        || (a.width, a.height) != (b.width, b.height)
+        || usize::try_from(pixels).ok() != Some(a.data.len())
+        || a.data.len() != b.data.len()
+    {
+        return Err("motion matching requires equal images with exact storage, at most 16384 pixels per dimension and 32 million pixels".into());
+    }
+    if !(2..=16_384).contains(&tile) || !(4..=16_384).contains(&window) || !(0..=64).contains(&radius) {
+        return Err("motion matching requires tile 2..=16384, window 4..=16384 and radius 0..=64".into());
+    }
+    let invalid = AtomicBool::new(false);
+    let flow = block_flow_window_with_fit(a, b, tile, window, radius, |em, e0, ep| match subpixel_fit(em, e0, ep) {
+        Ok(value) => value,
+        Err(_) => {
+            // Record before the median can hide an invalid vector among valid neighbours.
+            invalid.store(true, Ordering::Relaxed);
+            0.0
+        }
+    });
+    if invalid.load(Ordering::Relaxed) {
+        Err("motion matching produced non-finite SAD or subpixel curvature; check the source channels and luminance correction".into())
+    } else {
+        Ok(flow)
+    }
+}
+
+fn subpixel_fit(em: f32, e0: f32, ep: f32) -> Result<f32, &'static str> {
+    let denominator = em - 2.0 * e0 + ep;
+    if !em.is_finite() || !e0.is_finite() || !ep.is_finite() || !denominator.is_finite() {
+        return Err("non-finite subpixel curvature");
+    }
+    if denominator <= 1e-6 {
+        return Ok(0.0);
+    }
+    let numerator = 0.5 * (em - ep);
+    if !numerator.is_finite() {
+        return Err("non-finite subpixel numerator");
+    }
+    // The final offset is constrained to +/-0.5. Comparing first keeps the
+    // division bounded, instead of computing infinity and clamping afterwards.
+    let half = denominator * 0.5;
+    if numerator >= half {
+        Ok(0.5)
+    } else if numerator <= -half {
+        Ok(-0.5)
+    } else {
+        Ok((numerator / denominator).clamp(-0.5, 0.5))
+    }
+}
+
+fn block_flow_window_with_fit(a: &Image, b: &Image, tile: u32, window: u32, radius: i32, fit: impl Fn(f32, f32, f32) -> f32 + Sync) -> Flow {
     let bs = tile.max(2) as usize;
     let win = window.max(4) as i64;
     // Window origin relative to the tile origin.
@@ -177,12 +244,8 @@ pub fn block_flow_window(a: &Image, b: &Image, tile: u32, window: u32, radius: i
             let (bx, by) = ((i % cols) as i64 * bsi + wo, (i / cols) as i64 * bsi + wo);
             let d = cur[i];
             let e0 = sad(la, lb, bx, by, wsi, d[0], d[1]);
-            let fit = |em: f32, ep: f32| {
-                let den = em - 2.0 * e0 + ep;
-                if den > 1e-6 { (0.5 * (em - ep) / den).clamp(-0.5, 0.5) } else { 0.0 }
-            };
-            let sx = fit(sad(la, lb, bx, by, wsi, d[0] - 1, d[1]), sad(la, lb, bx, by, wsi, d[0] + 1, d[1]));
-            let sy = fit(sad(la, lb, bx, by, wsi, d[0], d[1] - 1), sad(la, lb, bx, by, wsi, d[0], d[1] + 1));
+            let sx = fit(sad(la, lb, bx, by, wsi, d[0] - 1, d[1]), e0, sad(la, lb, bx, by, wsi, d[0] + 1, d[1]));
+            let sy = fit(sad(la, lb, bx, by, wsi, d[0], d[1] - 1), e0, sad(la, lb, bx, by, wsi, d[0], d[1] + 1));
             [d[0] as f32 + sx, d[1] as f32 + sy]
         })
         .collect();
@@ -252,6 +315,79 @@ pub fn interpolate(a: &Image, b: &Image, w: f32) -> Image {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subpixel_fit_bounds_the_ratio_before_it_overflows() {
+        let (em, e0, ep) = (1e35f32, 5e34f32, 1e-5f32);
+        let denominator = em - 2.0 * e0 + ep;
+        let formerly_unchecked = 0.5 * (em - ep) / denominator;
+        assert!(denominator > 1e-6 && formerly_unchecked.is_infinite());
+        assert_eq!(subpixel_fit(em, e0, ep), Ok(0.5));
+        for e0 in [1.0f32.next_down(), 1.0, 1.0f32.next_up()] {
+            for (em, ep) in [(2.0, 1.0), (1.0, 2.0)] {
+                let denominator = em - 2.0 * e0 + ep;
+                assert_eq!(subpixel_fit(em, e0, ep), Ok((0.5 * (em - ep) / denominator).clamp(-0.5, 0.5)));
+            }
+        }
+        assert_eq!(subpixel_fit(1.0, 1.0, 1.0), Ok(0.0));
+        assert_eq!(subpixel_fit(1.0, 2.0, 1.0), Ok(0.0));
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX] {
+            assert!(subpixel_fit(0.0, value, 0.0).is_err());
+        }
+        for em in [0.0, 1e-8, 1e-5, 0.1, 1.0, 1e10, 1e25] {
+            for e0 in [0.0, 1e-8, 1e-5, 0.1, 1.0, 1e10, 1e25] {
+                for ep in [0.0, 1e-8, 1e-5, 0.1, 1.0, 1e10, 1e25] {
+                    let den = em - 2.0 * e0 + ep;
+                    let old = if den > 1e-6 { (0.5f32 * (em - ep) / den).clamp(-0.5, 0.5) } else { 0.0 };
+                    assert_eq!(subpixel_fit(em, e0, ep), Ok(old));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn checked_matching_keeps_finite_vectors_and_reports_invalid_refinement() {
+        let a = texture(16, 16, 0.0);
+        let b = texture(16, 16, 1.0);
+        assert_eq!(block_flow_window_checked(&a, &b, 4, 4, 4).unwrap(), block_flow_window(&a, &b, 4, 4, 4));
+        for value in [f32::NAN, f32::INFINITY, f32::MAX] {
+            let invalid = Image::filled(8, 8, [value; 4]);
+            let error = block_flow_window_checked(&invalid, &Image::new(8, 8), 4, 4, 4).unwrap_err();
+            assert!(error.contains("non-finite SAD or subpixel curvature"));
+        }
+        assert!(block_flow_window_checked(&a, &b, 4, 4, 4).is_ok());
+    }
+
+    #[test]
+    fn checked_matching_rejects_malformed_shape_and_controls_before_indexing() {
+        let valid = Image::new(8, 8);
+        let mut truncated = valid.clone();
+        truncated.data.pop();
+        assert!(
+            std::panic::catch_unwind(|| block_flow_window(&truncated, &valid, 4, 4, 4)).is_err(),
+            "the former unchecked path panicked on truncated storage"
+        );
+        for invalid in [
+            truncated,
+            Image::new(8, 7),
+            Image { width: u32::MAX, height: u32::MAX, data: vec![] },
+            Image { width: 16_385, height: 1, data: vec![] },
+            Image::default(),
+        ] {
+            assert!(block_flow_window_checked(&invalid, &valid, 4, 4, 4).unwrap_err().contains("exact storage"));
+            assert!(block_flow_window_checked(&valid, &invalid, 4, 4, 4).is_err());
+        }
+        for tile in [0, 1, u32::MAX] {
+            assert!(block_flow_window_checked(&valid, &valid, tile, 4, 4).is_err());
+        }
+        for window in [0, 3, u32::MAX] {
+            assert!(block_flow_window_checked(&valid, &valid, 4, window, 4).is_err());
+        }
+        for radius in [-1, 65, i32::MAX] {
+            assert!(block_flow_window_checked(&valid, &valid, 4, 4, radius).is_err());
+        }
+        assert_eq!(block_flow_window_checked(&valid, &valid, 4, 4, 0).unwrap(), block_flow_window(&valid, &valid, 4, 4, 0));
+    }
 
     /// A textured image shifted right by `dx` pixels.
     fn texture(w: u32, h: u32, dx: f64) -> Image {

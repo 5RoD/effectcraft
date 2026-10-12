@@ -1,5 +1,5 @@
 //! Checked Timewarp preparation. Source times share unique frames; shutter outputs stream
-//! through one accumulator in their original order. Matching and interpolation are unchanged.
+//! through one accumulator in their original order, with checked geometry, storage and pixels.
 
 use effectcraft_keyframe::Value;
 use effectcraft_project::ParamUi;
@@ -13,6 +13,8 @@ use crate::{Buf, EffectCtx, LayerPixels};
 pub const ID: &str = "ec.time.timewarp";
 pub const MAX_DIMENSION: u32 = 16_384;
 pub const MAX_IMAGE_PIXELS: u64 = 32 * 1024 * 1024;
+/// Source/prepared RGBA magnitude bound; matching and brightness correction use f32.
+pub const MAX_CHANNEL_MAGNITUDE: f32 = 1e12;
 pub const MAX_TOTAL_BYTES: u64 = 1536 * 1024 * 1024;
 /// Conservative SAD comparisons, smoothing neighbours and interpolation taps per invocation.
 pub const MAX_WORK: u64 = 32_000_000_000;
@@ -48,8 +50,14 @@ fn area(width: u32, height: u32) -> Result<u64, String> {
     Ok(pixels)
 }
 
-/// Validate host storage and geometry before resampling or GPU upload. This does not allocate.
-pub fn validate_input(input: &Buf) -> Result<(), String> {
+fn finite_pixels(image: &Image) -> Result<(), String> {
+    if image.data.par_iter().any(|pixel| pixel.iter().any(|channel| !channel.is_finite() || channel.abs() > MAX_CHANNEL_MAGNITUDE)) {
+        return Err(invalid("frame contains non-finite RGBA channels or exceeds supported +/-1e12 magnitude"));
+    }
+    Ok(())
+}
+
+fn validate_input_geometry(input: &Buf) -> Result<(), String> {
     let pixels = area(input.img.width, input.img.height)?;
     if usize::try_from(pixels).ok() != Some(input.img.data.len()) {
         return Err(invalid("frame storage does not match its dimensions"));
@@ -58,6 +66,13 @@ pub fn validate_input(input: &Buf) -> Result<(), String> {
         return Err(invalid("frame scale must be positive and finite, and offsets must be finite and within +/-1e12 pixels"));
     }
     Ok(())
+}
+
+/// Validate host geometry, storage and RGBA before resampling or GPU upload.
+/// This performs one source-channel scan and does not allocate.
+pub fn validate_input(input: &Buf) -> Result<(), String> {
+    validate_input_geometry(input)?;
+    finite_pixels(&input.img)
 }
 
 /// Controls are checked even when the host has no frames. A malformed expression must not
@@ -166,7 +181,8 @@ impl TimewarpGrid {
 
     /// fit_layer(..., stretch=false), using geometry without a blank full-resolution Buf.
     fn fit(self, ctx: &EffectCtx, source: LayerPixels) -> Result<Image, String> {
-        validate_input(&source.buf)?;
+        // fetch_layer checked these owned source channels before budgeting/fitting.
+        validate_input_geometry(&source.buf)?;
         if source.size.iter().any(|v| !v.is_finite() || *v < 0.0) {
             return Err(invalid("matte/warp layer dimensions are invalid"));
         }
@@ -198,7 +214,8 @@ fn union(bufs: &[Option<Buf>]) -> Result<Option<TimewarpGrid>, String> {
     let scale = first.scale;
     let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
     for source in bufs.iter().flatten() {
-        validate_input(source)?;
+        // plan_for_input checked every owned host frame before this geometry walk.
+        validate_input_geometry(source)?;
         let k = scale / source.scale;
         let edges =
             [-source.offset[0] * k, -source.offset[1] * k, (source.img.width as f64 - source.offset[0]) * k, (source.img.height as f64 - source.offset[1]) * k];
@@ -402,6 +419,7 @@ impl TimewarpPlan {
             if frame.width != self.grid.width || frame.height != self.grid.height || frame.data.len() != pixels {
                 return Err(invalid("prepared frame storage differs from the output grid"));
             }
+            finite_pixels(frame)?;
         }
         for flow in &self.flows {
             if flow.block < 2
@@ -732,7 +750,7 @@ fn prepare_flow(frames: &[Image], warps: Option<&[Image]>, flows: &mut Vec<Keyed
     let first = sources.get(pair[0]).ok_or_else(|| invalid("motion/warp source is missing"))?;
     let second = sources.get(pair[1]).ok_or_else(|| invalid("motion/warp source is missing"))?;
     let index = flows.len();
-    flows.push((key, timewarp_flow(first, second, pm)));
+    flows.push((key, timewarp_flow(first, second, pm)?));
     Ok(index)
 }
 
@@ -1022,6 +1040,121 @@ mod tests {
         plan.steps = saved;
         plan.flows[0].v.clear();
         assert!(plan.render_cpu().is_err());
+    }
+
+    #[test]
+    fn nonfinite_source_channels_and_mutated_motion_controls_are_checked() {
+        struct InvalidSource(f32);
+        impl EffectHost for InvalidSource {
+            fn layer(&self, _: u64, _: bool) -> Option<LayerPixels> {
+                None
+            }
+            fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+                None
+            }
+            fn self_at(&self, _: f64, _: usize) -> Option<Buf> {
+                Some(Buf { img: Image::filled(1, 1, [self.0, 0.0, 0.0, 1.0]), offset: [0.0; 2], scale: 1.0 })
+            }
+        }
+        let parameters = parameters(1, 2);
+        let host = Host::default();
+        let ctx = context(&parameters, &host);
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX, -f32::MAX, MAX_CHANNEL_MAGNITUDE.next_up(), -MAX_CHANNEL_MAGNITUDE.next_up()] {
+            assert!(timewarp_plan(&context(&parameters, &InvalidSource(value))).err().unwrap().contains("non-finite RGBA"));
+            for channel in 0..4 {
+                let mut input = Buf { img: Image::filled(1, 1, [0.25; 4]), offset: [0.0; 2], scale: 1.0 };
+                input.img.data[0][channel] = value;
+                assert!(validate_input(&input).unwrap_err().contains("non-finite RGBA"));
+                let mut plan = timewarp_plan(&ctx).unwrap().unwrap();
+                plan.frames[0].data[0][channel] = value;
+                assert!(plan.render_cpu().unwrap_err().contains("non-finite RGBA"));
+            }
+        }
+        for threshold in [f32::NAN, f32::INFINITY, -0.01, 1.01] {
+            let mut plan = timewarp_plan(&ctx).unwrap().unwrap();
+            plan.pm.error_threshold = threshold;
+            assert!(plan.render_cpu().unwrap_err().contains("motion weights"));
+        }
+        let mut malformed = timewarp_plan(&ctx).unwrap().unwrap();
+        malformed.frames[0].data.pop();
+        assert!(malformed.render_cpu().unwrap_err().contains("frame storage"));
+        assert!(timewarp_plan(&ctx).unwrap().unwrap().render_cpu().is_ok(), "a later valid plan still works");
+    }
+
+    #[test]
+    fn auxiliary_channels_are_checked_before_fitting_can_hide_them() {
+        struct InvalidLayer(f32);
+        impl EffectHost for InvalidLayer {
+            fn layer(&self, _: u64, _: bool) -> Option<LayerPixels> {
+                None
+            }
+            fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+                None
+            }
+            fn self_at(&self, time: f64, effects: usize) -> Option<Buf> {
+                Host::default().self_at(time, effects)
+            }
+            fn layer_at(&self, _: u64, _: f64, _: bool) -> Option<LayerPixels> {
+                Some(LayerPixels { buf: Buf { img: Image::filled(32, 20, [self.0; 4]), offset: [10_000.0, 0.0], scale: 1.0 }, size: SIZE })
+            }
+        }
+        for control in ["matteLayer", "warpLayer"] {
+            let mut params = parameters(1, 2);
+            params.values.insert(control.into(), Value::Layer(Some(7)));
+            for value in [f32::NAN, f32::INFINITY, MAX_CHANNEL_MAGNITUDE.next_up()] {
+                let error = timewarp_plan(&context(&params, &InvalidLayer(value))).err().unwrap();
+                assert!(error.contains("non-finite RGBA"), "{control}: {error}");
+            }
+            let host = Host::default();
+            assert!(timewarp_plan(&context(&params, &host)).unwrap().unwrap().render_cpu().is_ok());
+        }
+    }
+
+    #[test]
+    fn channel_limit_keeps_matching_brightness_and_filter_intermediates_finite() {
+        // Conservative arithmetic bounds, not a large image/expensive matching test.
+        let magnitude = MAX_CHANNEL_MAGNITUDE as f64 * 1.01;
+        let mean_sum = magnitude * MAX_IMAGE_PIXELS as f64;
+        let brightness_gain = 2.0 * magnitude / 1e-4;
+        let corrected = magnitude * brightness_gain;
+        let luma = corrected * 1.26;
+        // A nonnegative f32 accumulation can round an individual increment up;
+        // reserve a further factor two instead of assuming a 1% long-sum error.
+        let sad = 4.0 * luma * (MAX_DIMENSION as f64).powi(2);
+        let parabola_sum = 4.0 * sad;
+        let bicubic_sum = magnitude * 16.0 * 1.5 * 1.5;
+        let matte_composite = magnitude + magnitude * (1.0 + magnitude);
+        let shutter_sum = matte_composite * MAX_SAMPLES as f64;
+        for bound in [mean_sum, brightness_gain, corrected, luma, sad, parabola_sum, bicubic_sum, matte_composite, shutter_sum] {
+            assert!(bound.is_finite() && bound < f32::MAX as f64 * 0.5, "insufficient f32 headroom: {bound}");
+        }
+        for magnitude in [-MAX_CHANNEL_MAGNITUDE, MAX_CHANNEL_MAGNITUDE] {
+            assert!(validate_input(&Buf { img: Image::filled(1, 1, [magnitude, 0.0, 0.0, 1.0]), offset: [0.0; 2], scale: 1.0 }).is_ok());
+        }
+        // Near the largest allowed luminance ratio, normal and Extreme filters keep
+        // finite pixels. Flat windows also exercise the zero-curvature denominator.
+        let a = Image::filled(8, 8, [MAX_CHANNEL_MAGNITUDE; 4]);
+        let b = Image::filled(8, 8, [1.0001e-4; 4]);
+        let parameters = parameters(1, 2);
+        let host = Host::default();
+        let mut motion = PixelMotion::from(&context(&parameters, &host), 1.0);
+        motion.tile = 2;
+        motion.window = 4;
+        motion.correct_luminance = true;
+        let flow = timewarp_flow(&a, &b, &motion).unwrap();
+        assert!(flow.v.iter().flatten().all(|value| value.is_finite()));
+        for extreme in [false, true] {
+            motion.extreme = extreme;
+            let output = timewarp_interpolate(&a, &b, 0.9, &flow, &motion);
+            assert!(output.data.iter().flatten().all(|value| value.is_finite()));
+        }
+        for value in [f32::NAN, f32::INFINITY, f32::MAX, 3.0 * MAX_CHANNEL_MAGNITUDE] {
+            let invalid = Image::filled(8, 8, [value; 4]);
+            assert!(timewarp_flow(&invalid, &b, &motion).unwrap_err().contains("luminance mean"));
+        }
+        motion.correct_luminance = false;
+        assert!(timewarp_flow(&Image::filled(8, 8, [f32::NAN; 4]), &b, &motion).unwrap_err().contains("non-finite SAD"));
+        assert!(timewarp_flow(&a, &b, &motion).is_ok(), "matching remains usable after a checked error");
     }
 
     #[test]

@@ -144,22 +144,30 @@ fn ftm_displace(@builtin(global_invocation_id) gid: vec3<u32>) {
 // u[0] = (columns, rows, extreme filtering, build from one image); f[0] = (vector spacing,
 // fraction w, error threshold).
 
-// raster::flow::Flow::at.
-fn ftm_flow_at(x: f32, y: f32) -> vec2<f32> {
+// Integral anchors keep fractional motion independent of the full-frame coordinate.
+// Checked plans bound dimensions, grid spacing and displacements before dispatch.
+fn ftm_grid_axis(pixel: i32, block: i32, count: u32) -> vec2<f32> {
+    let denominator = 2 * block;
+    let numerator = clamp(2 * pixel + 1 - block, 0, denominator * i32(count - 1u));
+    return vec2<f32>(f32(numerator / denominator), f32(numerator % denominator) / f32(denominator));
+}
+
+// raster::flow::Flow::at, dividing only the local fractional remainder in f32.
+fn ftm_flow_at(p: vec2<i32>) -> vec2<f32> {
     let cols = P.u[0].x;
     let rows = P.u[0].y;
     if (cols == 0u || rows == 0u) {
         return vec2<f32>(0.0);
     }
-    let b = P.f[0].x;
-    let fx = clamp(x / b - 0.5, 0.0, f32(cols - 1u));
-    let fy = clamp(y / b - 0.5, 0.0, f32(rows - 1u));
-    let x0 = u32(floor(fx));
-    let y0 = u32(floor(fy));
+    let block = i32(P.f[0].x);
+    let x = ftm_grid_axis(p.x, block, cols);
+    let y = ftm_grid_axis(p.y, block, rows);
+    let x0 = u32(x.x);
+    let y0 = u32(y.x);
     let x1 = min(x0 + 1u, cols - 1u);
     let y1 = min(y0 + 1u, rows - 1u);
-    let tx = fx - f32(x0);
-    let ty = fy - f32(y0);
+    let tx = x.y;
+    let ty = y.y;
     let g00 = vec2<f32>(data[(y0 * cols + x0) * 2u], data[(y0 * cols + x0) * 2u + 1u]);
     let g10 = vec2<f32>(data[(y0 * cols + x1) * 2u], data[(y0 * cols + x1) * 2u + 1u]);
     let g01 = vec2<f32>(data[(y1 * cols + x0) * 2u], data[(y1 * cols + x0) * 2u + 1u]);
@@ -169,11 +177,52 @@ fn ftm_flow_at(x: f32, y: f32) -> vec2<f32> {
     return top + (bot - top) * ty;
 }
 
-fn ftm_sample(t: texture_2d<f32>, x: f32, y: f32) -> vec4<f32> {
+fn ftm_sample(t: texture_2d<f32>, p: vec2<i32>, displacement: vec2<f32>) -> vec4<f32> {
+    let shift = floor(displacement);
+    let base = p + vec2<i32>(shift);
+    let fraction = displacement - shift;
     if (P.u[0].z != 0u) {
-        return sample_bicubic(t, x, y);
+        let wx = cubic_w(fraction.x);
+        let wy = cubic_w(fraction.y);
+        var output = vec4<f32>(0.0);
+        for (var j = 0; j < 4; j++) {
+            for (var i = 0; i < 4; i++) {
+                output += tex_get(t, base.x - 1 + i, base.y - 1 + j) * (wx[i] * wy[j]);
+            }
+        }
+        return max(output, vec4<f32>(0.0));
     }
-    return sample_bilinear_clamped(t, x, y);
+    let a = tex_get_clamped(t, base.x, base.y);
+    let b = tex_get_clamped(t, base.x + 1, base.y);
+    let c = tex_get_clamped(t, base.x, base.y + 1);
+    let d = tex_get_clamped(t, base.x + 1, base.y + 1);
+    let top = a + (b - a) * fraction.x;
+    let bottom = c + (d - c) * fraction.x;
+    return top + (bottom - top) * fraction.y;
+}
+
+// time_fx::motion_fallback. The smooth band prevents a one-ULP difference in
+// sampling from switching abruptly between visibly different warped/plain mixes.
+fn ftm_fallback(a: vec4<f32>, b: vec4<f32>, threshold: f32) -> f32 {
+    if (threshold <= 0.0 || threshold >= 1.0) {
+        return 0.0;
+    }
+    let delta = abs(a - b);
+    let error = max(max(delta.x, delta.y), max(delta.z, delta.w));
+    let magnitude4 = max(abs(a), abs(b));
+    let magnitude = max(1.0, max(max(magnitude4.x, magnitude4.y), max(magnitude4.z, magnitude4.w)));
+    let band = min(min(0.00015 * magnitude, 0.001), threshold * 0.5);
+    if (band == 0.0) {
+        return select(0.0, 1.0, error > threshold);
+    }
+    if (error <= threshold - band) {
+        return 0.0;
+    }
+    if (error >= threshold + band) {
+        return 1.0;
+    }
+    let t = clamp((error - (threshold - band)) / (2.0 * band), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
 }
 
 @compute @workgroup_size(16, 16)
@@ -182,22 +231,26 @@ fn ftm_motion(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (!ftm_inside(p)) {
         return;
     }
-    let cx = f32(p.x) + 0.5;
-    let cy = f32(p.y) + 0.5;
-    let f = ftm_flow_at(cx, cy);
+    let f = ftm_flow_at(p);
     let w = P.f[0].y;
-    var pa = ftm_sample(src, cx - w * f.x, cy - w * f.y);
-    var pb = ftm_sample(aux, cx + (1.0 - w) * f.x, cy + (1.0 - w) * f.y);
+    let pa = ftm_sample(src, p, -w * f);
+    let pb = ftm_sample(aux, p, (1.0 - w) * f);
     if (P.u[0].w != 0u) {
         textureStore(out, p, select(pb, pa, w < 0.5));
         return;
     }
-    let d = abs(pa - pb);
-    let err = max(max(d.x, d.y), max(d.z, d.w));
-    let thr = P.f[0].z;
-    if (thr > 0.0 && err > thr && thr < 1.0) {
-        pa = textureLoad(src, p, 0);
-        pb = textureLoad(aux, p, 0);
+    let fallback = ftm_fallback(pa, pb, P.f[0].z);
+    let warped = pa + (pb - pa) * w;
+    if (fallback == 0.0) {
+        textureStore(out, p, warped);
+        return;
     }
-    textureStore(out, p, pa + (pb - pa) * w);
+    let a = textureLoad(src, p, 0);
+    let b = textureLoad(aux, p, 0);
+    let plain = a + (b - a) * w;
+    if (fallback == 1.0) {
+        textureStore(out, p, plain);
+        return;
+    }
+    textureStore(out, p, warped + (plain - warped) * fallback);
 }

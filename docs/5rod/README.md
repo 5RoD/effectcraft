@@ -40,8 +40,10 @@ application and Desktop shortcut have not been removed or replaced.
   excludes older unchecked-media/Timewarp pixels. The measured retiming increment preserves
   each backend's previous output. A subsequent correction uses exact Tick reads in the native
   renderer, removing source-fetch microsecond rounding and frame-selection epsilon. Float-only
-  custom hosts retain their precision limit. An existing Pixel Motion CPU/GPU difference
-  remains separate correctness work. See [retiming measurements](retiming-performance.md).
+  custom hosts retain their precision limit. A separate Pixel Motion correction keeps GPU
+  sampling in local coordinates and uses a narrow continuous fallback around Error Threshold.
+  Raw source and public mutable-plan channel checks reject unsupported arithmetic before
+  interpolation or GPU transfer. See [retiming measurements](retiming-performance.md).
 - Native and WebAssembly plug-ins render into provisional frames. Invalid geometry, parameters,
   transfer bounds and trapped execution return checked errors; failed frames cannot become valid
   previews or replace an existing export. Time-dependent API 1 plug-ins keep their layer clock in
@@ -135,8 +137,8 @@ and the inherited [gap assessment](../gaps.md).
 ## Validation
 
 The complete repository gate is `cargo xtask ci`: formatting, clippy, workspace tests, dependency
-layering, licensed assets and WebAssembly checks. The output-geometry increment passed
-on 2026-10-12 (local date): 3,006 tests passed, 27 explicitly optional tests were ignored, all 31 assets were attributed,
+layering, licensed assets and WebAssembly checks. The Pixel Motion correctness increment passed
+on 2026-10-12 (local date): 3,017 tests passed, 27 explicitly optional tests were ignored, all 31 assets were attributed,
 dependency layering passed, and 32 crates passed the WebAssembly check. Formatting and native
 clippy with warnings denied also passed. The WebAssembly check reports an inherited dead-code
 warning for the native shortcut-suspension state.
@@ -158,6 +160,11 @@ Retiming regressions cover exact frame boundaries and neighbouring Ticks at nega
 multi-day times, rational rates, interpreted sources and auxiliary matte/warp reads. Actual
 renderer-host and required GPU identity checks exercise the native Tick path; float-only
 custom hosts retain their documented precision limit.
+Pixel Motion regressions retain the original strict CPU/GPU tolerance at threshold neighbours,
+negative/HDR/alpha values and odd output dimensions. Checked raw ingress rejects hostile channels
+even when fitting an offscreen matte/warp layer would hide them; public mutable plans are checked
+again before execution. The isolated captured comparisons are recorded separately from production
+speed in [retiming measurements](retiming-performance.md).
 Output-geometry regressions reproduce the former debug overflows with tiny synthetic inputs,
 reject oversized crop/resize intermediates before encoder setup, preserve existing destinations,
 and check both resize quality choices through PNG output. The former unwanted transparent rows

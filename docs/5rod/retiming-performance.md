@@ -77,6 +77,38 @@ full-resolution Pixel Motion CPU/GPU comparison.
 
 ## Reproduction identity
 
+### Separate Pixel Motion correctness increment
+
+A subsequent correction uses integral GPU anchors and local fractional coordinates,
+with a narrow smooth transition at Error Threshold shared by CPU and GPU. This intentionally
+changes pixels inside the documented transition band. The frozen memory A/B failures and
+performance measurements above remain unchanged; they do not measure this correction.
+See [arithmetic and fallback limits](../timewarp-performance-safety.md).
+
+The isolated RTX 3050/Vulkan correctness build passed strict absolute 0.001 comparisons:
+39 tiny records (91,884 channels), 18 1440p/120 records with 1/4 samples (265,420,800 channels),
+and 12 1440p/120 records with 64 samples and Extreme filtering (176,947,200 channels).
+All 442,459,884 channels passed; the three suite maxima were 6.71e-7, 2.39e-7 and 5.97e-7.
+Targeted threshold, negative/HDR/alpha and odd-resolution fixtures had maximum error
+0.0008995235. The original hard-threshold failure (0.05850003) and the unsuccessful smaller
+transition coefficient (0.0013388097) are retained. Acceptance tolerance was not widened.
+
+The correctness executable SHA-256 is
+`ad247034c9d8697fb8c7b1dbb0d7d874698dd817eff271e34463947e1b9fae52`;
+the delivered patch SHA-256 is
+`d411167daba3f7d097d13f9c05f43e6af06657844714e1291ebf587142e1a17c`.
+Root integration additionally removes repeated raw-channel scans from private geometry
+walks while retaining ingress and public mutable-plan validation. These correctness builds
+disabled LTO and used 16 codegen units; their durations are not production speed evidence.
+They establish no actual timeline, codec/export throughput or commercial plug-in parity.
+The merged root increment passed `cargo xtask ci` on 2026-10-12: 3,017 tests passed,
+27 optional tests ignored, strict formatting/Clippy, dependency layering, 31 attributed
+assets and 32 WebAssembly crates passed. The root gate includes the additional offscreen
+matte/warp ingress regression and requires GPU availability. These checks also use LTO
+disabled; production playback and throughput acceptance remain separate.
+
+### Frozen memory benchmark identity
+
 Use the [comparison script](../../scripts/compare-timewarp.ps1) with the frozen binaries
 and keep compilation/GPU jobs idle. Its strict playback comparison reports the failure above.
 The local captures, JSON records and timing-only wrappers remain available for investigation.

@@ -96,6 +96,210 @@ fn exact_timewarp_source_boundaries_reach_gpu_without_float_host_roundtrips() {
     }
 }
 
+/// This five-pixel fixture originally switched CPU/GPU fallback branches by one ULP,
+/// producing a 0.0585 channel error. Keep the strict tolerance through the new transition.
+#[test]
+fn pixel_motion_threshold_neighbours_are_continuous_on_cpu_and_gpu() {
+    use effectcraft_effects::{Buf, EffectHost, LayerPixels};
+    use effectcraft_raster::Image;
+    struct Samples;
+    impl EffectHost for Samples {
+        fn layer(&self, _: u64, _: bool) -> Option<LayerPixels> {
+            None
+        }
+        fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+            None
+        }
+        fn self_at(&self, time: f64, _: usize) -> Option<Buf> {
+            let values = if time < 0.05 { [0.0, 0.25, 0.5, 0.75, 1.0] } else { [0.75, 0.5, 0.25, 0.0, 0.0] };
+            Some(Buf { img: Image { width: 5, height: 1, data: values.into_iter().map(|r| [r, 0.0, 0.0, 1.0]).collect() }, offset: [0.0; 2], scale: 1.0 })
+        }
+    }
+    let gpu = crate::tests::gpu();
+    assert!(std::env::var("EFFECTCRAFT_REQUIRE_GPU").as_deref() != Ok("1") || gpu.is_some());
+    let Some(gpu) = gpu else { return };
+    let mut parameters = timewarp_parameters(2, 1);
+    parameters.values.insert("sourceFrame".into(), n(0.9));
+    parameters.values.insert("motionBlur/enableMotionBlur".into(), Value::Bool(false));
+    let mut ctx = timewarp_context(&parameters);
+    ctx.layer_size = [5.0, 1.0];
+    ctx.env.host = Some(&Samples);
+    let mut plan = effectcraft_effects::timewarp_plan(&ctx).unwrap().unwrap();
+    let effectcraft_effects::TwStep::Motion { a, b, w, flow } = plan.steps[0].0 else { panic!("fractional frame must use motion") };
+    plan.flows[flow].v.fill([1.3, 0.0]);
+    let f = plan.flows[flow].at(2.5, 0.5);
+    let pa = plan.frames[a].sample_bilinear_clamped(2.5 - w as f64 * f[0] as f64, 0.5);
+    let pb = plan.frames[b].sample_bilinear_clamped(2.5 + (1.0 - w as f64) * f[0] as f64, 0.5);
+    let error = (pa[0] - pb[0]).abs();
+    assert!(error > 0.0 && error < 1.0);
+    for threshold in [error.next_down(), error, error.next_up()] {
+        plan.pm.error_threshold = threshold;
+        let cpu = plan.render_cpu().unwrap();
+        let mut encoder = crate::context::Enc::new(gpu.context());
+        let input = crate::effects::GBuf { img: gpu.context().upload_image(&Image::new(5, 1)).unwrap(), offset: [0.0; 2], scale: 1.0 };
+        let output = crate::fx_time::prepared(&mut encoder, input, Some(&plan)).unwrap();
+        let output = encoder.download(&output.img).unwrap();
+        eprintln!("motion threshold={threshold:?}, CPU error={error:?}, warped={pa:?}/{pb:?}, CPU={:?}, GPU={:?}", cpu.img.data[2], output.data[2]);
+        assert!(output.data.iter().flatten().zip(cpu.img.data.iter().flatten()).all(|(a, b)| a.is_finite() && b.is_finite() && (a - b).abs() <= 1e-3));
+    }
+}
+
+fn motion_plan(a: effectcraft_raster::Image, b: effectcraft_raster::Image, fraction: f32, extreme: bool) -> effectcraft_effects::TimewarpPlan {
+    struct Frames(effectcraft_raster::Image, effectcraft_raster::Image);
+    impl effectcraft_effects::EffectHost for Frames {
+        fn layer(&self, _: u64, _: bool) -> Option<effectcraft_effects::LayerPixels> {
+            None
+        }
+        fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+            None
+        }
+        fn self_at(&self, time: f64, _: usize) -> Option<effectcraft_effects::Buf> {
+            Some(effectcraft_effects::Buf { img: if time < 0.05 { self.0.clone() } else { self.1.clone() }, offset: [0.0; 2], scale: 1.0 })
+        }
+    }
+    let size = [a.width as f64, a.height as f64];
+    let host = Frames(a, b);
+    let mut parameters = timewarp_parameters(2, 1);
+    parameters.values.insert("sourceFrame".into(), n(fraction as f64));
+    parameters.values.insert("motionBlur/enableMotionBlur".into(), Value::Bool(false));
+    parameters.values.insert("tuning/filtering".into(), e(u32::from(extreme)));
+    let mut context = timewarp_context(&parameters);
+    context.layer_size = size;
+    context.env.host = Some(&host);
+    let mut plan = effectcraft_effects::timewarp_plan(&context).unwrap().unwrap();
+    for flow in &mut plan.flows {
+        flow.v.fill([1.3, -0.17]);
+    }
+    plan
+}
+
+fn assert_motion_plan_parity(gpu: &crate::Gpu, plan: &effectcraft_effects::TimewarpPlan) {
+    let cpu = plan.render_cpu().unwrap();
+    let mut encoder = crate::context::Enc::new(gpu.context());
+    let input = crate::effects::GBuf { img: gpu.context().upload_image(&effectcraft_raster::Image::new(1, 1)).unwrap(), offset: [0.0; 2], scale: 1.0 };
+    let output = crate::fx_time::prepared(&mut encoder, input, Some(plan)).unwrap();
+    let output = encoder.download(&output.img).unwrap();
+    assert_eq!((output.width, output.height), (cpu.img.width, cpu.img.height));
+    let mut maximum = 0.0f32;
+    for (index, (a, b)) in output.data.iter().flatten().zip(cpu.img.data.iter().flatten()).enumerate() {
+        assert!(a.is_finite() && b.is_finite(), "non-finite output channel {index}");
+        maximum = maximum.max((a - b).abs());
+    }
+    eprintln!(
+        "motion {}x{}, extreme={}, threshold={}, maximum absolute error={maximum}",
+        output.width, output.height, plan.pm.extreme, plan.pm.error_threshold
+    );
+    assert!(maximum <= 1e-3, "strict absolute error={maximum}, extreme={}, threshold={}", plan.pm.extreme, plan.pm.error_threshold);
+}
+
+#[test]
+fn pixel_motion_transition_covers_hdr_negative_alpha_extreme_and_local_coordinates() {
+    use effectcraft_raster::Image;
+    let gpu = crate::tests::gpu();
+    assert!(std::env::var("EFFECTCRAFT_REQUIRE_GPU").as_deref() != Ok("1") || gpu.is_some());
+    let Some(gpu) = gpu else { return };
+    for (gain, shift, vary_alpha) in [(1.0, 0.0, false), (1.0, -0.75, false), (8.0, -3.0, true), (0.0, 0.0, true)] {
+        let frame = |values: [f32; 5]| Image {
+            width: 5,
+            height: 1,
+            data: values.map(|r| [r * gain + shift, r * gain * 0.4 + shift, -r * gain * 0.25, if vary_alpha { 0.1 + r * 0.7 } else { 1.0 }]).to_vec(),
+        };
+        for extreme in [false, true] {
+            let mut plan = motion_plan(frame([0.0, 0.25, 0.5, 0.75, 1.0]), frame([0.75, 0.5, 0.25, 0.0, 0.0]), 0.9, extreme);
+            let effectcraft_effects::TwStep::Motion { a, b, w, flow } = plan.steps[0].0 else { panic!("expected fractional motion") };
+            let f = plan.flows[flow].at(2.5, 0.5);
+            let sample = |image: &Image, x, y| if extreme { image.sample_bicubic(x, y) } else { image.sample_bilinear_clamped(x, y) };
+            let pa = sample(&plan.frames[a], 2.5 - w as f64 * f[0] as f64, 0.5 - w as f64 * f[1] as f64);
+            let pb = sample(&plan.frames[b], 2.5 + (1.0 - w as f64) * f[0] as f64, 0.5 + (1.0 - w as f64) * f[1] as f64);
+            let error = pa.iter().zip(pb).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            let magnitude = pa.iter().chain(pb.iter()).map(|v| v.abs()).fold(1.0f32, f32::max);
+            let band = (0.00015 * magnitude).min(0.001).min(error * 0.5);
+            for threshold in
+                [0.0, 1.0, error.next_down(), error, error.next_up(), error - band * 0.5, error + band * 0.5, error - band * 1.01, error + band * 1.01]
+            {
+                if !(0.0..=1.0).contains(&threshold) {
+                    continue;
+                }
+                plan.pm.error_threshold = threshold;
+                assert_motion_plan_parity(gpu, &plan);
+            }
+        }
+    }
+    // Odd dimensions and a far-away coordinate expose loss from adding displacement
+    // to a full f32 pixel coordinate. Large *bounded* displacements exercise safe taps.
+    let frame = |phase: f32| {
+        let mut image = Image::new(1291, 17);
+        for (index, pixel) in image.data.iter_mut().enumerate() {
+            let x = (index % 1291) as f32;
+            let y = (index / 1291) as f32;
+            let value = 0.5 + 0.25 * (x * 0.7 + y * 0.13 + phase).sin();
+            *pixel = [value, value * 2.0, -value, 0.6];
+        }
+        image
+    };
+    for extreme in [false, true] {
+        let mut plan = motion_plan(frame(0.0), frame(0.3), 0.9, extreme);
+        for threshold in [0.0, 0.1, 1.0] {
+            plan.pm.error_threshold = threshold;
+            assert_motion_plan_parity(gpu, &plan);
+        }
+        for flow in &mut plan.flows {
+            flow.v.fill([65_536.0, -65_536.0]);
+        }
+        assert_motion_plan_parity(gpu, &plan);
+    }
+}
+
+#[test]
+fn pixel_motion_invalid_public_plan_fails_before_transfers_then_recovers() {
+    use effectcraft_raster::Image;
+    let gpu = crate::tests::gpu();
+    assert!(std::env::var("EFFECTCRAFT_REQUIRE_GPU").as_deref() != Ok("1") || gpu.is_some());
+    let Some(gpu) = gpu else { return };
+    let mut plan = motion_plan(Image::filled(3, 1, [0.1; 4]), Image::filled(3, 1, [0.2; 4]), 0.9, false);
+    let mut encoder = crate::context::Enc::new(gpu.context());
+    let image = gpu.context().upload_image(&Image::new(1, 1)).unwrap();
+    let input = || crate::effects::GBuf { img: image.clone(), offset: [0.0; 2], scale: 1.0 };
+    let before = gpu.context().transfer_stats();
+    for value in [
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::MAX,
+        -f32::MAX,
+        effectcraft_effects::timewarp::MAX_CHANNEL_MAGNITUDE.next_up(),
+        -effectcraft_effects::timewarp::MAX_CHANNEL_MAGNITUDE.next_up(),
+    ] {
+        for channel in 0..4 {
+            let saved = plan.frames[0].data[0][channel];
+            plan.frames[0].data[0][channel] = value;
+            assert!(crate::fx_time::prepared(&mut encoder, input(), Some(&plan)).err().unwrap().contains("non-finite RGBA"));
+            plan.frames[0].data[0][channel] = saved;
+        }
+        for field in 0..3 {
+            let (threshold, weight, vector) = (plan.pm.error_threshold, plan.pm.weights[0], plan.flows[0].v[0][0]);
+            match field {
+                0 => plan.pm.error_threshold = value,
+                1 => plan.pm.weights[0] = value,
+                _ => plan.flows[0].v[0][0] = value,
+            }
+            assert!(crate::fx_time::prepared(&mut encoder, input(), Some(&plan)).is_err());
+            (plan.pm.error_threshold, plan.pm.weights[0], plan.flows[0].v[0][0]) = (threshold, weight, vector);
+        }
+    }
+    let pixel = plan.frames[0].data.pop().unwrap();
+    assert!(crate::fx_time::prepared(&mut encoder, input(), Some(&plan)).err().unwrap().contains("frame storage"));
+    plan.frames[0].data.push(pixel);
+    let after = gpu.context().transfer_stats();
+    assert_eq!((before.uploads, before.readbacks), (after.uploads, after.readbacks));
+    assert_motion_plan_parity(gpu, &plan);
+    // The inclusive support limit is not a clamp: exact whole-frame transport retains
+    // positive/negative channels at the limit on both backends.
+    plan.steps[0].0 = effectcraft_effects::TwStep::Whole(0);
+    plan.frames[0].data.fill([effectcraft_effects::timewarp::MAX_CHANNEL_MAGNITUDE, -effectcraft_effects::timewarp::MAX_CHANNEL_MAGNITUDE, 0.0, 1.0]);
+    assert_motion_plan_parity(gpu, &plan);
+}
+
 fn timewarp_parameters(method: u32, samples: usize) -> effectcraft_effects::Params {
     let spec = effectcraft_effects::find(effectcraft_effects::timewarp::ID).unwrap();
     let mut parameters = effectcraft_effects::Params {

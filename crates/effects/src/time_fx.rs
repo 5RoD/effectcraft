@@ -466,8 +466,7 @@ pub struct PixelMotion {
     pub build_from_one: bool,
     pub correct_luminance: bool,
     pub extreme: bool,
-    /// Error Threshold (0..1): pixels whose two warped frames disagree by more fall back to a
-    /// frame mix.
+    /// Error Threshold (0..1), with a narrow continuous transition to a frame mix.
     pub error_threshold: f32,
     pub weights: [f32; 3],
     /// Left, right, top, bottom crops in pixels.
@@ -586,23 +585,36 @@ fn smooth_flow(flow: &mut Flow, pm: &PixelMotion) {
 }
 
 /// The motion field from frame `a` to frame `b` (or from the warp layer's frames).
-pub fn timewarp_flow(a: &Image, b: &Image, pm: &PixelMotion) -> Flow {
+pub fn timewarp_flow(a: &Image, b: &Image, pm: &PixelMotion) -> Result<Flow, String> {
     let ga = motion_grey(&crop_edges(a, pm.crops), pm.weights, 1.0);
     let gain = if pm.correct_luminance {
         let (ma, mb) = (mean_grey(&ga), mean_grey(&motion_grey(b, pm.weights, 1.0)));
+        if !ma.is_finite() || !mb.is_finite() {
+            return Err("Timewarp: non-finite luminance mean".into());
+        }
+        // A computed bound is required here: a long f32 reduction can round more
+        // than its individual source pixels. This bounds the ratio without
+        // changing ordinary finite matching or adding another image scan.
+        if ma.abs().max(mb.abs()) > 2.0 * crate::timewarp::MAX_CHANNEL_MAGNITUDE {
+            return Err("Timewarp: luminance mean exceeds the supported +/-2e12 range".into());
+        }
         if mb > 1e-4 { ma / mb } else { 1.0 }
     } else {
         1.0
     };
+    if !gain.is_finite() {
+        return Err("Timewarp: non-finite luminance correction gain".into());
+    }
     let gb = motion_grey(&crop_edges(b, pm.crops), pm.weights, gain);
-    let mut flow = effectcraft_raster::flow::block_flow_window(&ga, &gb, pm.tile, pm.window, 4);
+    let mut flow = effectcraft_raster::flow::block_flow_window_checked(&ga, &gb, pm.tile, pm.window, 4).map_err(|error| format!("Timewarp: {error}"))?;
     smooth_flow(&mut flow, pm);
-    flow
+    Ok(flow)
 }
 
 /// Pixel Motion: the frame at fraction `w` between `a` and `b` built by warping along `flow`
 /// (Build From One Image: from the nearer frame only), falling back to a mix where the two
-/// warped frames disagree by more than the Error Threshold.
+/// warped frames disagree. A narrow smooth transition around the Error Threshold avoids
+/// a large output jump when CPU/GPU sampling differs by a few floating-point ULPs.
 pub fn timewarp_interpolate(a: &Image, b: &Image, w: f32, flow: &Flow, pm: &PixelMotion) -> Image {
     let (a, b) = (crop_edges(a, pm.crops), crop_edges(b, pm.crops));
     let mut out = Image::new(a.width, a.height);
@@ -620,18 +632,49 @@ pub fn timewarp_interpolate(a: &Image, b: &Image, w: f32, flow: &Flow, pm: &Pixe
                 *px = if w < 0.5 { pa } else { pb };
                 continue;
             }
-            let err = (0..4).map(|c| (pa[c] - pb[c]).abs()).fold(0.0f32, f32::max);
-            let (pa, pb) = if pm.error_threshold > 0.0 && err > pm.error_threshold && pm.error_threshold < 1.0 {
-                (a.get(x as i64, y as i64), b.get(x as i64, y as i64))
-            } else {
-                (pa, pb)
-            };
+            let fallback = motion_fallback(pa, pb, pm.error_threshold);
+            if fallback == 0.0 || fallback == 1.0 {
+                let (pa, pb) = if fallback == 1.0 { (a.get(x as i64, y as i64), b.get(x as i64, y as i64)) } else { (pa, pb) };
+                for c in 0..4 {
+                    px[c] = pa[c] + (pb[c] - pa[c]) * w;
+                }
+                continue;
+            }
+            let (plain_a, plain_b) = (a.get(x as i64, y as i64), b.get(x as i64, y as i64));
             for c in 0..4 {
-                px[c] = pa[c] + (pb[c] - pa[c]) * w;
+                let warped = pa[c] + (pb[c] - pa[c]) * w;
+                let plain = plain_a[c] + (plain_b[c] - plain_a[c]) * w;
+                px[c] = warped + (plain - warped) * fallback;
             }
         }
     });
     out
+}
+
+// Shared with ftm_fallback in fx_time.wgsl. Keep exact warped/plain output outside
+// the band; 0 and 1 retain the historical disabled-fallback behavior. The half-band
+// is 0.00015 times the larger RGBA magnitude (at least 1), capped at 0.001 and half
+// the threshold. CPU coordinates and bicubic weights remain f64.
+fn motion_fallback(a: [f32; 4], b: [f32; 4], threshold: f32) -> f32 {
+    if threshold <= 0.0 || threshold >= 1.0 {
+        return 0.0;
+    }
+    let error = a.iter().zip(b).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let magnitude = a.iter().chain(b.iter()).map(|value| value.abs()).fold(1.0f32, f32::max);
+    let band = (0.00015 * magnitude).min(0.001).min(threshold * 0.5);
+    // A subnormal threshold can underflow its half-band. The original comparison
+    // is safe here and equal warped frames still stay warped.
+    if band == 0.0 {
+        return if error > threshold { 1.0 } else { 0.0 };
+    }
+    if error <= threshold - band {
+        return 0.0;
+    }
+    if error >= threshold + band {
+        return 1.0;
+    }
+    let t = ((error - (threshold - band)) / (2.0 * band)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 /// Timewarp's Matte Channel options.
@@ -723,6 +766,80 @@ fn pixel_motion_blur(ctx: &EffectCtx, b: Buf) -> Buf {
 mod tests {
     use super::*;
     use crate::{EffectEnv, EffectHost, LayerPixels, run_fx};
+
+    #[test]
+    fn timewarp_fallback_is_continuous_and_preserves_the_outside_branches() {
+        for (a, channel, threshold, band) in [
+            ([0.0; 4], 0, 0.01, 0.00015),
+            ([-2.0, 4.0, 0.0, 0.25], 1, 0.25, 0.0006),
+            ([16.0, -12.0, 0.0, 0.25], 0, 0.25, 0.001),
+            ([0.1, 0.2, 0.3, 0.4], 3, 0.1, 0.00015),
+            ([0.0; 4], 0, 0.00001, 0.000005),
+        ] {
+            let pixels = |error| {
+                let mut b = a;
+                b[channel] -= error;
+                b
+            };
+            assert_eq!(motion_fallback(a, pixels(threshold * 2.0), 0.0), 0.0);
+            assert_eq!(motion_fallback(a, pixels(threshold * 2.0), 1.0), 0.0);
+            assert_eq!(motion_fallback(a, pixels(threshold - band * 1.01), threshold), 0.0);
+            assert_eq!(motion_fallback(a, pixels(threshold + band * 1.01), threshold), 1.0);
+            let mut previous = 0.0;
+            for step in 0..=100 {
+                let error = threshold - band * 1.01 + band * 2.02 * step as f32 / 100.0;
+                let weight = motion_fallback(a, pixels(error), threshold);
+                assert!(weight.is_finite() && (0.0..=1.0).contains(&weight));
+                assert!(weight >= previous, "non-monotonic transition at {error}: {weight} < {previous}");
+                assert!(weight - previous < 0.032, "transition jumped at {error}");
+                previous = weight;
+            }
+            assert!((motion_fallback(a, pixels(threshold), threshold) - 0.5).abs() < 0.001);
+        }
+        assert_eq!(motion_fallback([0.0; 4], [0.0; 4], f32::from_bits(1)), 0.0);
+        assert_eq!(motion_fallback([0.0; 4], [0.1; 4], f32::from_bits(1)), 1.0);
+    }
+
+    #[test]
+    fn timewarp_fallback_blends_only_inside_the_documented_band() {
+        let a = Image { width: 5, height: 1, data: [0.0, 0.25, 0.5, 0.75, 1.0].map(|r| [r, 0.0, 0.0, 1.0]).to_vec() };
+        let b = Image { width: 5, height: 1, data: [0.75, 0.5, 0.25, 0.0, 0.0].map(|r| [r, 0.0, 0.0, 1.0]).to_vec() };
+        let flow = Flow { width: 5, height: 1, block: 2, cols: 3, rows: 1, v: vec![[1.3, 0.0]; 3] };
+        let w = 0.9f32;
+        let pa = a.sample_bilinear_clamped(2.5 - w as f64 * 1.3f32 as f64, 0.5);
+        let pb = b.sample_bilinear_clamped(2.5 + (1.0 - w as f64) * 1.3f32 as f64, 0.5);
+        let error = (pa[0] - pb[0]).abs();
+        let warped = pa[0] + (pb[0] - pa[0]) * w;
+        let plain = 0.5 + (0.25 - 0.5) * w;
+        let mut pm = PixelMotion {
+            tile: 2,
+            window: 4,
+            global_smoothness: 0.0,
+            local_smoothness: 0.0,
+            iterations: 0,
+            build_from_one: false,
+            correct_luminance: false,
+            extreme: false,
+            error_threshold: 0.0,
+            weights: [0.3, 0.59, 0.11],
+            crops: [0; 4],
+        };
+        for threshold in [0.0, 1.0, error + 0.0002] {
+            pm.error_threshold = threshold;
+            assert_eq!(timewarp_interpolate(&a, &b, w, &flow, &pm).data[2][0], warped);
+        }
+        pm.error_threshold = error - 0.0002;
+        assert_eq!(timewarp_interpolate(&a, &b, w, &flow, &pm).data[2][0], plain);
+        for threshold in [error.next_down(), error, error.next_up()] {
+            pm.error_threshold = threshold;
+            let pixel = timewarp_interpolate(&a, &b, w, &flow, &pm).data[2];
+            assert!((pixel[0] - (warped + plain) * 0.5).abs() < 1e-5);
+            assert_eq!(pixel[3], 1.0);
+        }
+        pm.build_from_one = true;
+        pm.error_threshold = error - 0.0002;
+        assert_eq!(timewarp_interpolate(&a, &b, w, &flow, &pm).data[2], pb);
+    }
 
     /// A layer whose every pixel at layer time `t` is grey `t` (clamped), alpha 1, on a 6×4 grid.
     struct Clock {
