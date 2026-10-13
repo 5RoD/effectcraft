@@ -71,7 +71,16 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let side = rect.width() >= SIDE_BY_SIDE;
     let w = if side { 300.0 } else { (rect.width() - 20.0).max(210.0) };
     let room = rect.height() - 16.0 - CONTROLS - if side { 0.0 } else { TILE.y + GAP };
-    let g = Rect::from_min_size(pos2(x0, rect.min.y + 10.0), vec2(w, (w * 0.6).min(room).clamp(90.0, 220.0)));
+    let graph_height = (w * 0.6).min(room).clamp(90.0, 220.0);
+    let list_width = rect.width() - if side { w + 36.0 } else { 20.0 };
+    let rows = ease_presets::presets(&app.session).count().div_ceil(columns(list_width));
+    let list_height = rows as f32 * (TILE.y + GAP);
+    let content_height = if side { (16.0 + graph_height + CONTROLS).max(34.0 + list_height) } else { 16.0 + graph_height + CONTROLS + list_height };
+    // The graph, controls and full preset grid share one scroll owner, so short docks keep
+    // library controls reachable and a wheel over the grid does not scroll two regions.
+    let scroll = widgets::PanelScroll::begin(ui, egui::Id::new("ease-presets-scroll"), rect);
+    let content = Rect::from_min_size(rect.min - vec2(0.0, scroll.offset), vec2(rect.width(), rect.height().max(content_height)));
+    let g = Rect::from_min_size(pos2(x0, content.min.y + 10.0), vec2(w, graph_height));
     graph(app, ui, g, &mut st.curve);
     let c = st.curve;
     let mut y = g.max.y + 4.0;
@@ -140,9 +149,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     };
     p.text(pos2(x0, y + 4.0), Align2::LEFT_CENTER, msg, Tokens::ui(11.0), t.text_faint);
     y += 16.0;
-    let head = if side { pos2(x0 + w + 16.0, rect.min.y + 6.0) } else { pos2(x0, y) };
+    let head = if side { pos2(x0 + w + 16.0, content.min.y + 6.0) } else { pos2(x0, y) };
     kit::label(ui, head, "Presets", &t);
-    let list = Rect::from_min_max(head + vec2(0.0, 22.0), pos2(rect.max.x - 10.0, rect.max.y - 6.0));
+    let list = Rect::from_min_max(head + vec2(0.0, 22.0), pos2(content.max.x - 10.0, content.max.y - 6.0));
     if let Some((name, curve)) = grid(app, ui, list, st.selected.as_deref()) {
         st.curve = curve;
         if pairs > 0 {
@@ -153,6 +162,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if st != app.ui.ease_presets {
         app.ui.ease_presets = st;
     }
+    scroll.end(ui, &mut app.auto, "easePresets.scroll", content_height, &t);
 }
 
 fn apply(app: &mut EffectcraftApp, params: serde_json::Value, pairs: usize, what: &str) {
@@ -167,7 +177,7 @@ fn apply(app: &mut EffectcraftApp, params: serde_json::Value, pairs: usize, what
 /// the two handles, dragged to edit the curve.
 fn graph(app: &mut EffectcraftApp, ui: &mut egui::Ui, g: Rect, curve: &mut EaseCurve) {
     let t = app.tokens;
-    let p = ui.painter().with_clip_rect(g);
+    let p = ui.painter().with_clip_rect(g.intersect(ui.clip_rect()));
     p.rect_filled(g, 3.0, t.field_bg);
     p.rect_stroke(g, 3.0, Stroke::new(1.0, t.field_border), StrokeKind::Inside);
     app.auto.add("easePresets.graph", g, "Ease curve");
@@ -203,21 +213,24 @@ fn graph(app: &mut EffectcraftApp, ui: &mut egui::Ui, g: Rect, curve: &mut EaseC
     }
 }
 
-/// Preset thumbnails in a wrapping grid that scrolls with the wheel; returns the clicked one.
+fn columns(width: f32) -> usize {
+    (((width + GAP) / (TILE.x + GAP)).floor() as usize).max(1)
+}
+
+/// Preset thumbnails in the panel's scrolling content; returns the clicked one.
 fn grid(app: &mut EffectcraftApp, ui: &mut egui::Ui, list: Rect, selected: Option<&str>) -> Option<(String, EaseCurve)> {
     let t = app.tokens;
-    let p = ui.painter().with_clip_rect(list);
-    let scroll = widgets::PanelScroll::begin(ui, egui::Id::new("ease-presets-scroll"), list);
-    let cols = (((list.width() + GAP) / (TILE.x + GAP)).floor() as usize).max(1);
-    let (mut clicked, mut count) = (None, 0);
+    let visible = list.intersect(ui.clip_rect());
+    let p = ui.painter().with_clip_rect(visible);
+    let cols = columns(list.width());
+    let mut clicked = None;
     for (n, (name, curve, built_in)) in ease_presets::presets(&app.session).enumerate() {
-        count = n + 1;
-        let r = Rect::from_min_size(list.min + vec2((n % cols) as f32 * (TILE.x + GAP), (n / cols) as f32 * (TILE.y + GAP) - scroll.offset), TILE);
-        if !r.intersects(list) {
+        let r = Rect::from_min_size(list.min + vec2((n % cols) as f32 * (TILE.x + GAP), (n / cols) as f32 * (TILE.y + GAP)), TILE);
+        if !r.intersects(visible) {
             continue;
         }
-        let resp = ui.interact(r.intersect(list), egui::Id::new(("easePresets.preset", n)), Sense::click());
-        app.auto.add(&format!("easePresets.preset.{count}"), r, name);
+        let resp = ui.interact(r.intersect(visible), egui::Id::new(("easePresets.preset", n)), Sense::click());
+        app.auto.add(&format!("easePresets.preset.{}", n + 1), r, name);
         let on = selected == Some(name);
         p.rect_filled(
             r,
@@ -247,6 +260,5 @@ fn grid(app: &mut EffectcraftApp, ui: &mut egui::Ui, list: Rect, selected: Optio
             clicked = Some((name.to_string(), curve));
         }
     }
-    scroll.end(ui, &mut app.auto, "easePresets.scroll", count.div_ceil(cols) as f32 * (TILE.y + GAP), &t);
     clicked
 }

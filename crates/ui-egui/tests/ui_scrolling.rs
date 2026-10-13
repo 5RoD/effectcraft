@@ -163,3 +163,51 @@ fn settings_dialog_does_not_scroll_sideways() {
     h.run_steps(20);
     assert_eq!((rect(&h, "settings.ok"), rect(&h, "settings.page.general")), (ok, page), "nothing moved sideways");
 }
+
+/// The Ease Presets graph and library used to overflow a short panel without any way to
+/// reach Export/Import. Real wheel/drag/click input must still reach controls and thumbnails.
+#[test]
+fn short_ease_panels_scroll_to_library_controls_and_keep_graph_handles() {
+    use effectcraft_ui_egui::dock::PanelKind;
+    for (width, height) in [(420.0, 480.0), (1200.0, 240.0)] {
+        let mut h = harness(width, height);
+        h.state_mut().show_panel(PanelKind::EasePresets);
+        h.state_mut().ui.maximized = Some(PanelKind::EasePresets);
+        h.run_steps(3);
+        let panel = rect(&h, "panel.EasePresets");
+        for id in ["easePresets.handle.out", "easePresets.handle.in"] {
+            assert!(panel.contains_rect(rect(&h, id)), "{id} must be visible before scrolling");
+        }
+        let initial_curve = h.state().ui.ease_presets.curve;
+        let handle = rect(&h, "easePresets.handle.out").center();
+        drag(&mut h, handle, handle + vec2(8.0, -5.0));
+        assert_ne!(h.state().ui.ease_presets.curve, initial_curve, "the graph still accepts drags");
+        assert!(scrolled(&h, "easePresets.scroll").1 > 0.0);
+        let ids = ["apply", "fromKeys", "name", "save", "rename", "delete", "export", "import"];
+        let mut reachable = [false; 8];
+        let last = effectcraft_engine::ease_presets::presets(&h.state().session).count();
+        let last_id = format!("easePresets.preset.{last}");
+        let mut thumbnail_clicked = false;
+        for _ in 0..24 {
+            for (n, id) in ids.iter().enumerate() {
+                reachable[n] |= panel.contains_rect(rect(&h, &format!("easePresets.{id}")));
+            }
+            if !thumbnail_clicked && h.state().auto.find(&last_id).is_some() {
+                let preset = rect(&h, &last_id);
+                if panel.contains_rect(preset) {
+                    let name = h.state().auto.find(&last_id).unwrap().label.clone();
+                    click_at(&mut h, preset.center());
+                    assert_eq!(h.state().ui.ease_presets.selected.as_deref(), Some(name.as_str()), "the visible thumbnail receives clicks");
+                    thumbnail_clicked = true;
+                }
+            }
+            wheel(&mut h, panel.center(), -40.0);
+        }
+        assert!(reachable.into_iter().all(|visible| visible), "every library control must scroll fully into the panel: {reachable:?}");
+        assert!(thumbnail_clicked, "the last thumbnail must be reachable");
+        wheel(&mut h, panel.center(), 2000.0);
+        for id in ["easePresets.handle.out", "easePresets.handle.in"] {
+            assert!(panel.contains_rect(rect(&h, id)), "{id} must be reachable again after scrolling up");
+        }
+    }
+}
