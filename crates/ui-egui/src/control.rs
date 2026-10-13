@@ -10,7 +10,7 @@
 //! - `ui.set {tool?, workspace?, theme?, focused?, viewer?: {zoom, res, pan, grid, …}, timeline?: {pps, start, graphEditor, showModes}}`
 //! - `ui.panel.show {panel}` / `ui.panel.close {panel}`
 //! - `ui.click {id | x,y, button?, count?, modifiers?}` / `ui.move {x,y}` / `ui.scroll {x,y,dx,dy}`
-//! - `ui.drag {from:{id|x,y}, to:{id|x,y}, steps?, modifiers?}`: synthetic press-move-release
+//! - `ui.drag {from:{id|x,y}, to:{id|x,y}, steps?, button?, modifiers?}`: synthetic press-move-release
 //! - `ui.key {key, command?, shift?, alt?, ctrl?}` / `ui.type {text}`
 //! - `ui.viewer.locate {x, y}`: screen point of a comp pixel; `ui.viewer.hit {x, y}`: comp pixel at a screen point
 //! - `ui.timeline.locate {layer, time?}`: screen point of a layer bar (at a comp time)
@@ -360,13 +360,21 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             };
             let steps = p.get("steps").and_then(Value::as_u64).unwrap_or(12).max(2);
             let m = modifiers(p);
+            let button = match s("button") {
+                Some("right") => egui::PointerButton::Secondary,
+                Some("middle") => egui::PointerButton::Middle,
+                _ => egui::PointerButton::Primary,
+            };
+            let previous_modifiers = ctx.input(|i| i.modifiers);
+            app.synthetic.push(egui::Event::ModifiersChanged(m));
             app.synthetic.push(egui::Event::PointerMoved(a));
-            app.synthetic.push(egui::Event::PointerButton { pos: a, button: egui::PointerButton::Primary, pressed: true, modifiers: m });
+            app.synthetic.push(egui::Event::PointerButton { pos: a, button, pressed: true, modifiers: m });
             for i in 1..=steps {
                 let f = i as f32 / steps as f32;
                 app.synthetic.push(egui::Event::PointerMoved(a + (b - a) * f));
             }
-            app.synthetic.push(egui::Event::PointerButton { pos: b, button: egui::PointerButton::Primary, pressed: false, modifiers: m });
+            app.synthetic.push(egui::Event::PointerButton { pos: b, button, pressed: false, modifiers: m });
+            app.synthetic.push(egui::Event::ModifiersChanged(previous_modifiers));
             Outcome::AfterInput
         }
         "ui.scroll" => {

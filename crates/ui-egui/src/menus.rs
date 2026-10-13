@@ -108,9 +108,12 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("tool.selection", "Selection Tool", [], Some("V")),
     uic!("tool.hand", "Hand Tool", [], Some("H")),
     uic!("tool.zoom", "Zoom Tool", [], Some("Z")),
+    uic!("tool.camera", "Cycle Camera Tools", [], Some("C")),
     uic!("tool.orbit", "Orbit Tool", [], Some("1")),
     uic!("tool.panCamera", "Pan Camera Tool", [], Some("2")),
     uic!("tool.dolly", "Dolly Tool", [], Some("3")),
+    uic!("view.cameraLookAtSelected", "Frame Selected 3D Layers (Camera Tool)", [], Some("F")),
+    uic!("view.cameraLookAtAll", "Frame All 3D Layers (Camera Tool)", [], Some("Cmd+Shift+F")),
     uic!("tool.rotate", "Rotation Tool", [], Some("W")),
     uic!("tool.panBehind", "Pan Behind Tool", [], Some("Y")),
     uic!("tool.shape", "Shape Tools", [], Some("Q")),
@@ -354,6 +357,21 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
         return frontend(app, ctx, "window.workspace", json!({"name": ws}));
     }
     if let Some(t) = id.strip_prefix("tool.") {
+        if t == "camera" {
+            let next = match app.ui.tool {
+                Tool::UnifiedCamera => Tool::Orbit,
+                Tool::Orbit => Tool::PanCamera,
+                Tool::PanCamera => Tool::Dolly,
+                _ => Tool::UnifiedCamera,
+            };
+            app.ui.tool = next;
+            if matches!(next, Tool::UnifiedCamera | Tool::Orbit)
+                && let Some(saved) = app.ui.slot_tools.get_mut(3)
+            {
+                *saved = next;
+            }
+            return Ok(json!({"tool": next}));
+        }
         // Slot shortcuts cycle through the slot's tools.
         let slot = match t {
             "shape" => Some(8),
@@ -382,7 +400,19 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
         }
         let tool = Tool::from_name(t).ok_or_else(|| format!("unknown tool `{t}`"))?;
         app.ui.tool = tool;
+        if tool == Tool::Orbit
+            && let Some(saved) = app.ui.slot_tools.get_mut(3)
+        {
+            *saved = tool;
+        }
         return Ok(json!({"tool": tool}));
+    }
+    if matches!(id, "view.cameraLookAtSelected" | "view.cameraLookAtAll") {
+        if !app.ui.tool.is_camera() {
+            return Err("select a camera tool first".into());
+        }
+        let cmd = if id == "view.cameraLookAtAll" { "view.lookAtAll" } else { "view.lookAtSelected" };
+        return run_engine(app, ctx, cmd, json!({"threeDOnly": true}));
     }
     if let Some(dir) = id.strip_prefix("viewer.nudge.") {
         return nudge(app, ctx, dir);
@@ -1581,7 +1611,13 @@ fn scoped_bindings(session: &effectcraft_engine::Session, focused: Option<PanelK
             v.push(((m, k, b.command.clone(), b.params.clone()), panel_override));
         }
     }
-    v.sort_by_key(|((m, ..), panel)| std::cmp::Reverse((m.command as u8 + m.shift as u8 + m.alt as u8 + m.ctrl as u8, *panel)));
+    v.sort_by_key(|((m, _, id, _), panel)| {
+        std::cmp::Reverse((
+            m.command as u8 + m.shift as u8 + m.alt as u8 + m.ctrl as u8,
+            *panel,
+            matches!(id.as_str(), "view.cameraLookAtSelected" | "view.cameraLookAtAll"),
+        ))
+    });
     v.into_iter().map(|(binding, _)| binding).collect()
 }
 
@@ -1784,7 +1820,9 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
             let _ = invoke(app, ctx, "edit.clear", json!({}));
             continue;
         }
-        if let Some((_, _, id, params)) = binds.iter().find(|(m, k, ..)| *k == key && mods_match(*m, mods)) {
+        if let Some((_, _, id, params)) = binds.iter().find(|(m, k, id, _)| {
+            *k == key && mods_match(*m, mods) && (!matches!(id.as_str(), "view.cameraLookAtSelected" | "view.cameraLookAtAll") || app.ui.tool.is_camera())
+        }) {
             let (id, params) = (id.clone(), if params.is_null() { json!({}) } else { params.clone() });
             if let Err(e) = invoke(app, ctx, &id, params) {
                 app.ui.status = e;
@@ -2009,6 +2047,16 @@ mod tests {
             let key = (format!("{m:?}"), format!("{k:?}"));
             let target = (id.clone(), params.to_string());
             if let Some(prev) = seen.get(&key) {
+                // Camera-tool framing intentionally overrides these keys only in a viewer
+                // with a camera tool active; real input coverage checks both contexts.
+                let camera_override = match (prev.0.as_str(), target.0.as_str()) {
+                    ("view.cameraLookAtSelected", "timeline.reveal.feather") => prev.1 == "null" && target.1 == "null",
+                    ("view.cameraLookAtAll", "layer.mask.set") => prev.1 == "null" && params == json!({"field": "feather"}),
+                    _ => false,
+                };
+                if camera_override {
+                    continue;
+                }
                 assert_eq!(prev, &target, "{key:?} bound to {prev:?} and {target:?}");
             } else {
                 seen.insert(key, target);

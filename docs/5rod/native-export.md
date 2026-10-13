@@ -7,8 +7,8 @@ other output formats and browser exports retain their existing encoders.
 The Windows local CLI now shares the desktop's native source-decoder registration.
 `EFFECTCRAFT_HARDWARE_DECODING=auto|off` selects source decoding independently of
 `EFFECTCRAFT_H264_ENCODER`; `--gpu` selects compositing independently of both. The
-earlier export comparisons below used software source decoding. New native-decoder
-export speed and quality require a controlled production comparison before acceptance.
+earlier export comparisons below used software source decoding. The later controlled
+native source-decoder comparison is recorded below.
 
 Windows H.264 file exports request this backend by default after the production
 footage checks below. Unsupported profiles fall back before rendering starts:
@@ -136,8 +136,23 @@ scored 49.79 dB PSNR and 0.9928 SSIM against the source; central audio correlati
 exceeded 0.999 on both channels. This is one short default acceptance run, not a
 new paired speed comparison, benchmark median, long export or lossless result.
 The earlier generated cancellation/preservation fixture also passed with the
-encoder override unset. CLI source decoding retains its existing software path;
-the desktop native decoder is a separate registration.
+encoder override unset. This earlier build used software source decoding.
+
+## Native source decoding in the production CLI
+
+Clean Thin LTO/codegen-one `1c68edb8` exported the same 120-frame OBS source project
+with source decoding `off` and `auto`, keeping hardware encoding and GPU composition
+identical. Every decoded output frame hash and the decoded stereo audio bytes were
+identical between modes. Frame count, timestamps, BT.709 tags and source quality
+checks passed; native frame counters increased with no software fallback.
+
+For bare video, sampled process CPU consumption fell from 41.81 to 24.89 core-seconds
+(40.5%). With the same Final/32-bpc Bloom video project it fell from 33.19 to 21.95
+core-seconds (33.8%). Export job times changed only 5.734 to 5.632 seconds and 7.478
+to 7.351 seconds respectively. One pair per project establishes CPU efficiency for
+these short cases, not a significant export speed gain or a benchmark median.
+Container bytes differed despite identical decoded video/audio. This does not
+establish all-codec, moving-gameplay or full Hybrid-MP4 conformance.
 
 Public API references: [MediaStreamSource](https://learn.microsoft.com/en-us/uwp/api/windows.media.core.mediastreamsource),
 [MediaTranscoder](https://learn.microsoft.com/en-us/uwp/api/windows.media.transcoding.mediatranscoder),

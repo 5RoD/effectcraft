@@ -432,13 +432,22 @@ fn camera_tool(s: &mut Session, p: &Value, op: ToolOp, cmd: &str, label: &str) -
     let cid = comp_id(s, p)?;
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?.clone();
     let (w, h) = (comp.width as f64, comp.height as f64);
-    let cur = s.state.views3d.get(&cid).map(|v| v.current).unwrap_or_default();
+    let current = s.state.views3d.get(&cid).map(|v| v.current).unwrap_or_default();
+    let t = s.state.times.get(&cid).copied().unwrap_or(Tick::ZERO);
+    let cur =
+        if current == View3D::ActiveCamera && p.get("layer").is_none() && comp.active_camera(t).is_none() && comp.has_3d() { View3D::Default } else { current };
+    if cur.is_ortho() && matches!(op, ToolOp::Orbit(..)) {
+        return Err(bad(cmd, "fixed orthographic views cannot orbit: switch to Default or a custom 3D view"));
+    }
     let apply = |r: &mut Rig, layer: bool| match op {
         ToolOp::Orbit(yaw, pitch) => r.orbit(yaw, pitch),
         ToolOp::Pan(dx, dy) => r.pan(dx, dy),
         ToolOp::Dolly(a) => r.dolly(a, layer),
     };
     if cur != View3D::ActiveCamera {
+        if cur != current {
+            switch_view(s, cid, cur);
+        }
         let vs = views(s, cid);
         let vc = vs.cam(cur, w, h);
         let mut r = Rig::from_view(&vc);
@@ -447,12 +456,12 @@ fn camera_tool(s: &mut Session, p: &Value, op: ToolOp, cmd: &str, label: &str) -
         vs.cams.insert(cur, nc);
         return Ok(json!({"view": cur.id(), "eye": nc.eye, "poi": nc.poi, "zoom": nc.zoom}));
     }
-    let t = s.state.times.get(&cid).copied().unwrap_or(Tick::ZERO);
     let cam = match p.get("layer") {
         Some(v) => super::resolve_layer(&comp, v).filter(|id| comp.layer(*id).is_some_and(|l| l.is_camera())),
         None => comp.active_camera(t).map(|l| l.id),
     }
     .ok_or_else(|| bad(cmd, "the comp has no active camera layer (Layer ▸ New ▸ Camera), or switch to a custom 3D view"))?;
+    super::unlocked(s, cid, vec![cam], cmd)?;
     let merge = merge_p(p).map(str::to_string);
     let r = s.edit(label, merge.as_deref(), |proj, _| {
         let l = layer_mut(proj, cid, cam)?;
@@ -561,12 +570,15 @@ fn look_at(s: &mut Session, p: &Value, all: bool) -> Result<Value> {
     let cid = comp_id(s, p)?;
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?.clone();
     let t = s.state.times.get(&cid).copied().unwrap_or(Tick::ZERO);
-    let ids: Vec<LayerId> = if all {
+    let mut ids: Vec<LayerId> = if all {
         comp.layers.iter().filter(|l| l.is_active_at(t) && !l.is_camera() && !l.is_light()).map(|l| l.id).collect()
     } else {
         let (_, sel) = super::layers_p(s, p)?;
         sel
     };
+    if p.get("threeDOnly").and_then(Value::as_bool).unwrap_or(false) {
+        ids.retain(|id| comp.layer(*id).is_some_and(|l| l.is_3d() && l.is_active_at(t) && !l.is_camera() && !l.is_light()));
+    }
     if ids.is_empty() {
         return Err(bad(cmd, if all { "the composition has no visible layers" } else { "select layers first" }));
     }
@@ -580,7 +592,8 @@ fn look_at(s: &mut Session, p: &Value, all: bool) -> Result<Value> {
     let r = ((hi - lo).length() * 0.5).max(1.0);
     let (w, h) = (comp.width as f64, comp.height as f64);
     let fit = w.min(h);
-    let cur = s.state.views3d.get(&cid).map(|v| v.current).unwrap_or_default();
+    let current = s.state.views3d.get(&cid).map(|v| v.current).unwrap_or_default();
+    let cur = if current == View3D::ActiveCamera && comp.active_camera(t).is_none() && comp.has_3d() { View3D::Default } else { current };
     if !comp.has_3d() {
         // 2D: frame the layers in the viewer (zoom and pan to their comp-space bounds).
         let rect = [lo.x, lo.y, hi.x, hi.y];
@@ -588,6 +601,9 @@ fn look_at(s: &mut Session, p: &Value, all: bool) -> Result<Value> {
         return Ok(json!({"rect": rect}));
     }
     if cur != View3D::ActiveCamera {
+        if cur != current {
+            switch_view(s, cid, cur);
+        }
         let vs = views(s, cid);
         let mut vc = vs.cam(cur, w, h);
         let fwd = (Vec3::from(vc.poi) - Vec3::from(vc.eye)).normalize();
@@ -602,23 +618,23 @@ fn look_at(s: &mut Session, p: &Value, all: bool) -> Result<Value> {
         return Ok(json!({"view": cur.id(), "eye": vc.eye, "poi": vc.poi, "zoom": vc.zoom}));
     }
     let cam = comp.active_camera(t).map(|l| l.id).ok_or_else(|| bad(cmd, "the comp has no camera layer: switch to a 3D view (View ▸ Switch 3D View)"))?;
+    super::unlocked(s, cid, vec![cam], cmd)?;
     s.edit(if all { "Look at All Layers" } else { "Look at Selected Layers" }, None, |proj, _| {
         let l = layer_mut(proj, cid, cam)?;
-        let lt = l.layer_time(t);
-        let pos = Vec3::from(get_at(l, "transform/position", lt).map(|v| v.as_vec3()).unwrap_or([w / 2.0, h / 2.0, -1000.0]));
-        let zoom = get_at(l, "cameraOptions/zoom", lt).map(|v| v.as_f64()).unwrap_or(1000.0);
+        let pos = Vec3::from(get_at(l, "transform/position", t).map(|v| v.as_vec3()).unwrap_or([w / 2.0, h / 2.0, -1000.0]));
+        let zoom = get_at(l, "cameraOptions/zoom", t).map(|v| v.as_f64()).unwrap_or(1000.0);
         let two = camera::is_two_node(l);
         let fwd = if two {
-            let poi = Vec3::from(get_at(l, "transform/poi", lt).map(|v| v.as_vec3()).unwrap_or([w / 2.0, h / 2.0, 0.0]));
+            let poi = Vec3::from(get_at(l, "transform/poi", t).map(|v| v.as_vec3()).unwrap_or([w / 2.0, h / 2.0, 0.0]));
             (poi - pos).normalize()
         } else {
-            let o = get_at(l, "transform/orientation", lt).map(|v| v.as_vec3()).unwrap_or([0.0; 3]);
+            let o = get_at(l, "transform/orientation", t).map(|v| v.as_vec3()).unwrap_or([0.0; 3]);
             Mat4::orientation(Vec3::from(o)).apply_vec(vec3(0.0, 0.0, 1.0)).normalize()
         };
         let eye = c - fwd * (zoom * r * 2.2 / fit);
-        set_at(l, "transform/position", lt, KV::Vec3(camera::arr(eye)));
+        set_at(l, "transform/position", t, KV::Vec3(camera::arr(eye)));
         if two {
-            set_at(l, "transform/poi", lt, KV::Vec3(camera::arr(c)));
+            set_at(l, "transform/poi", t, KV::Vec3(camera::arr(c)));
         }
         Ok(json!({"layer": cam.0, "position": camera::arr(eye), "poi": camera::arr(c)}))
     })
@@ -718,10 +734,16 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("view.3d.custom2", "Custom View 2", ["View", "Switch 3D View"], None, "{comp?}", has_comp, view_custom2),
         cmd!("view.3d.custom3", "Custom View 3", ["View", "Switch 3D View"], None, "{comp?}", has_comp, view_custom3),
         cmd!("view.3d.last", "Switch to Last 3D View", ["View"], None, "{comp?}", has_comp, last_view),
-        cmd!("view.lookAtSelected", "Look at Selected Layers", ["View"], Some("Cmd+Alt+Shift+\\"), "{comp?, layers?}", super::has_layers, |s, p| look_at(
-            s, p, false
-        )),
-        cmd!("view.lookAtAll", "Look at All Layers", ["View"], None, "{comp?}", has_comp, |s, p| look_at(s, p, true)),
+        cmd!(
+            "view.lookAtSelected",
+            "Look at Selected Layers",
+            ["View"],
+            Some("Cmd+Alt+Shift+\\"),
+            "{comp?, layers?, threeDOnly?}",
+            super::has_layers,
+            |s, p| look_at(s, p, false)
+        ),
+        cmd!("view.lookAtAll", "Look at All Layers", ["View"], None, "{comp?, threeDOnly?}", has_comp, |s, p| look_at(s, p, true)),
         cmd!("camera.fromView", "Create Camera from 3D View", ["Layer", "Camera"], None, "{comp?}", has_comp, camera_from_view),
         cmd!("view.reset3DView", "Reset 3D View", ["View"], None, "{comp?}", has_comp, reset_view),
         cmd!("view.set3DViewCamera", "Set 3D View Camera", [], None, "{view, eye? [x,y,z], poi? [x,y,z], zoom?}", has_comp, set_view_camera),

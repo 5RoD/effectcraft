@@ -13,6 +13,7 @@ pub enum Tool {
     Selection,
     Hand,
     Zoom,
+    UnifiedCamera,
     Orbit,
     PanCamera,
     Dolly,
@@ -48,7 +49,7 @@ impl Tool {
         &[Tool::Selection],
         &[Tool::Hand],
         &[Tool::Zoom],
-        &[Tool::Orbit],
+        &[Tool::Orbit, Tool::UnifiedCamera],
         &[Tool::PanCamera],
         &[Tool::Dolly],
         &[Tool::Rotate],
@@ -62,10 +63,11 @@ impl Tool {
         &[Tool::RotoBrush, Tool::RefineEdge],
         &[Tool::Puppet, Tool::PuppetStarch, Tool::PuppetBend, Tool::PuppetAdvanced, Tool::PuppetOverlap],
     ];
-    pub const ALL: [Tool; 30] = [
+    pub const ALL: [Tool; 31] = [
         Tool::Selection,
         Tool::Hand,
         Tool::Zoom,
+        Tool::UnifiedCamera,
         Tool::Orbit,
         Tool::PanCamera,
         Tool::Dolly,
@@ -99,6 +101,7 @@ impl Tool {
             Tool::Selection => "Selection Tool",
             Tool::Hand => "Hand Tool",
             Tool::Zoom => "Zoom Tool",
+            Tool::UnifiedCamera => "Unified Camera Tool",
             Tool::Orbit => "Orbit Around Cursor Tool",
             Tool::PanCamera => "Pan Under Cursor Tool",
             Tool::Dolly => "Dolly Towards Cursor Tool",
@@ -133,6 +136,7 @@ impl Tool {
             Tool::Selection => Some("V"),
             Tool::Hand => Some("H"),
             Tool::Zoom => Some("Z"),
+            Tool::UnifiedCamera => Some("C"),
             Tool::Orbit => Some("1"),
             Tool::PanCamera => Some("2"),
             Tool::Dolly => Some("3"),
@@ -151,7 +155,7 @@ impl Tool {
             Tool::Selection => Icon::Selection,
             Tool::Hand => Icon::Hand,
             Tool::Zoom => Icon::Zoom,
-            Tool::Orbit => Icon::Orbit,
+            Tool::UnifiedCamera | Tool::Orbit => Icon::Orbit,
             Tool::PanCamera => Icon::PanCamera,
             Tool::Dolly => Icon::Dolly,
             Tool::Rotate => Icon::Rotate,
@@ -218,6 +222,9 @@ impl Tool {
     /// The Pen slot's tools (Pen, Add / Delete / Convert Vertex, Mask Feather).
     pub fn is_pen(self) -> bool {
         matches!(self, Tool::Pen | Tool::PenAdd | Tool::PenDelete | Tool::PenConvert | Tool::MaskFeather)
+    }
+    pub fn is_camera(self) -> bool {
+        matches!(self, Tool::UnifiedCamera | Tool::Orbit | Tool::PanCamera | Tool::Dolly)
     }
     pub fn is_shape(self) -> bool {
         matches!(self, Tool::Rectangle | Tool::RoundedRect | Tool::Ellipse | Tool::Polygon | Tool::Star)

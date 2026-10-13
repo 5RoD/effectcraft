@@ -229,6 +229,108 @@ fn camera_tools_edit_active_camera_with_undo() {
 }
 
 #[test]
+fn camera_tools_navigate_default_camera_without_editing_the_project() {
+    let mut s = session();
+    let cid = s.active_comp_id().unwrap();
+    let id = s.execute("layer.newSolid", json!({"width": 100, "height": 100})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.setSwitch", json!({"layer": id, "switch": "threeD", "value": true})).unwrap();
+    let revision = s.revision;
+    let undo = s.history.undo.len();
+    // An invalid explicit target must not silently choose the Default Camera.
+    assert!(s.execute("camera.orbit", json!({"layer": id, "yaw": 20})).is_err());
+    assert!(s.view_camera(cid).is_none());
+    let first = s.execute("camera.orbit", json!({"yaw": 20})).unwrap();
+    assert_eq!(first["view"], "default");
+    let orbit = s.view_camera(cid).unwrap();
+    s.execute("camera.pan", json!({"dx": 30, "dy": 20})).unwrap();
+    assert!((s.view_camera(cid).unwrap().eye - orbit.eye).length() > 1.0);
+    s.execute("camera.dolly", json!({"amount": 100})).unwrap();
+    s.execute("view.lookAtSelected", json!({"layers": [id], "threeDOnly": true})).unwrap();
+    assert_eq!(s.revision, revision);
+    assert_eq!(s.history.undo.len(), undo);
+    assert_eq!(s.active_comp().unwrap().layers.len(), 1);
+    let view = s.view_camera(cid).unwrap();
+    let created = s.execute("camera.fromView", json!({})).unwrap()["layer"].as_u64().unwrap();
+    assert_eq!(prop(&s, created, "transform/position").as_vec3(), effectcraft_render::three_d::camera::arr(view.eye));
+    s.undo();
+    s.execute("view.set3DView", json!({"view": "default"})).unwrap();
+    s.execute("view.reset3DView", json!({})).unwrap();
+    let reset = s.view_camera(cid).unwrap();
+    assert!((reset.eye.x - 320.0).abs() < 1e-9);
+    assert!((reset.eye.y - 180.0).abs() < 1e-9);
+}
+
+#[test]
+fn fixed_orthographic_views_reject_orbit_without_mutating_view_state() {
+    let mut s = session();
+    let cid = s.active_comp_id().unwrap();
+    for name in ["front", "left", "top", "back", "right", "bottom"] {
+        s.execute("view.set3DView", json!({"view": name})).unwrap();
+        let before = s.state.views3d[&cid].clone();
+        assert!(s.execute("camera.orbit", json!({"yaw": 20, "pitch": 10})).unwrap_err().to_string().contains("orthographic"));
+        assert_eq!(s.state.views3d[&cid], before);
+        s.execute("camera.pan", json!({"dx": 10})).unwrap();
+        s.execute("camera.dolly", json!({"amount": 10})).unwrap();
+        assert_ne!(s.state.views3d[&cid], before);
+    }
+}
+
+#[test]
+fn camera_navigation_and_framing_respect_locks_atomically() {
+    let mut s = session();
+    let target = s.execute("layer.newSolid", json!({"width": 100, "height": 100})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.setSwitch", json!({"layer": target, "switch": "threeD", "value": true})).unwrap();
+    let cam = s.execute("layer.newCamera", json!({})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.setSwitch", json!({"layer": cam, "switch": "locked", "value": true})).unwrap();
+    let before = serde_json::to_value(&*s.project).unwrap();
+    let revision = s.revision;
+    let undo = s.history.undo.len();
+    for (cmd, p) in [
+        ("camera.orbit", json!({"yaw": 20})),
+        ("camera.pan", json!({"dx": 10, "layer": cam})),
+        ("camera.dolly", json!({"amount": 10})),
+        ("view.lookAtSelected", json!({"layers": [target]})),
+        ("view.lookAtAll", json!({})),
+    ] {
+        assert!(s.execute(cmd, p).unwrap_err().to_string().contains("locked"));
+        assert_eq!(serde_json::to_value(&*s.project).unwrap(), before);
+        assert_eq!(s.revision, revision);
+        assert_eq!(s.history.undo.len(), undo);
+    }
+}
+
+#[test]
+fn camera_framing_converts_offset_stretched_time_once() {
+    use effectcraft_project::LayerId;
+    use effectcraft_time::Tick;
+    let mut s = session();
+    s.execute("comp.settings", json!({"frameRate": 30})).unwrap();
+    let cid = s.active_comp_id().unwrap();
+    let target = s.execute("layer.newSolid", json!({"width": 100, "height": 100})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.setSwitch", json!({"layer": target, "switch": "threeD", "value": true})).unwrap();
+    let cam = s.execute("layer.newCamera", json!({})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.timing", json!({"layer": cam, "start": 0.2, "in": 0, "out": 2})).unwrap();
+    std::sync::Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().layer_mut(LayerId(cam)).unwrap().stretch = 200.0;
+    for path in ["transform/position", "transform/poi"] {
+        let value = prop(&s, cam, path).as_vec3();
+        s.execute("prop.addKey", json!({"layer": cam, "path": path, "time": 0, "value": value})).unwrap();
+    }
+    s.execute("time.set", json!({"time": 1.0})).unwrap();
+    let before = serde_json::to_value(&*s.project).unwrap();
+    s.execute("view.lookAtSelected", json!({"layers": [target]})).unwrap();
+    for path in ["transform/position", "transform/poi"] {
+        let l = s.active_comp().unwrap().layer(LayerId(cam)).unwrap();
+        let p = l.props.prop(path).unwrap();
+        assert_eq!(p.keys.len(), 2);
+        assert!(p.keys.iter().any(|k| k.time == Tick::from_seconds_f64(0.4)), "{path} changed at comp 1 / layer 0.4, never layer 0.1: {:?}", p.keys);
+    }
+    s.undo();
+    assert_eq!(serde_json::to_value(&*s.project).unwrap(), before);
+    s.redo();
+    assert_eq!(s.active_comp().unwrap().layer(LayerId(cam)).unwrap().props.prop("transform/position").unwrap().keys.len(), 2);
+}
+
+#[test]
 fn demo_has_3d_showcase() {
     let mut s = Session::default();
     s.execute("file.openDemoProject", json!({})).unwrap();

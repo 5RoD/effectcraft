@@ -68,6 +68,9 @@ enum Gesture {
     },
     Camera {
         tool: Tool,
+        unified: bool,
+        /// Shift-orbit keeps the dominant axis from the first movement until Shift is released.
+        horizontal: Option<bool>,
     },
     /// A bounding-box handle: scales about the anchor point so the grabbed point follows the
     /// pointer (corners both axes, edges one), relative to the layer as the drag began; the
@@ -1142,7 +1145,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // Interaction.
     let resp = ui.interact(area, egui::Id::new("viewer-interact"), Sense::click_and_drag());
     let menu_hits_id = egui::Id::new(("viewer-menu-hits", cid.0));
-    if resp.secondary_clicked()
+    if app.ui.tool != Tool::UnifiedCamera
+        && resp.secondary_clicked()
         && let Some(pos) = resp.interact_pointer_pos()
     {
         // Picking an already selected layer preserves the group; an unselected hit
@@ -1155,27 +1159,29 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let context_layers: Vec<u64> =
         app.session.state.selected_layers.iter().filter(|id| comp.layer(**id).is_some_and(|l| !l.switches.locked)).map(|id| id.0).collect();
     let mut context_actions = Vec::new();
-    resp.context_menu(|ui| {
-        let hits = ui.data(|d| d.get_temp::<Vec<(u64, String)>>(menu_hits_id)).unwrap_or_default();
-        if !hits.is_empty() {
-            ui.menu_button(crate::i18n::tr("Select"), |ui| {
-                crate::widgets::menu_scroll(ui, |ui| {
-                    for (id, name) in &hits {
-                        if ui.button(name).clicked() {
-                            context_actions.push(("layer.select".to_owned(), serde_json::json!({"layers":[id]})));
-                            ui.close();
+    if app.ui.tool != Tool::UnifiedCamera {
+        resp.context_menu(|ui| {
+            let hits = ui.data(|d| d.get_temp::<Vec<(u64, String)>>(menu_hits_id)).unwrap_or_default();
+            if !hits.is_empty() {
+                ui.menu_button(crate::i18n::tr("Select"), |ui| {
+                    crate::widgets::menu_scroll(ui, |ui| {
+                        for (id, name) in &hits {
+                            if ui.button(name).clicked() {
+                                context_actions.push(("layer.select".to_owned(), serde_json::json!({"layers":[id]})));
+                                ui.close();
+                            }
                         }
-                    }
-                })
-            });
-            ui.separator();
-        }
-        if context_layers.is_empty() {
-            ui.label(crate::i18n::tr("No unlocked layer selected"));
-        } else {
-            super::timeline::layer_menu(ui, &context_layers, &mut context_actions);
-        }
-    });
+                    })
+                });
+                ui.separator();
+            }
+            if context_layers.is_empty() {
+                ui.label(crate::i18n::tr("No unlocked layer selected"));
+            } else {
+                super::timeline::layer_menu(ui, &context_layers, &mut context_actions);
+            }
+        });
+    }
     for (id, params) in context_actions {
         if let Err(e) = crate::menus::invoke(app, &ctx, &id, params) {
             app.ui.status = e;
@@ -1193,7 +1199,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             Tool::Hand => egui::CursorIcon::Grab,
             Tool::Zoom => egui::CursorIcon::ZoomIn,
             Tool::Type | Tool::TypeVertical => egui::CursorIcon::Text,
-            Tool::Orbit => egui::CursorIcon::Alias,
+            Tool::UnifiedCamera | Tool::Orbit => egui::CursorIcon::Alias,
             Tool::PanCamera => egui::CursorIcon::Move,
             Tool::Dolly => egui::CursorIcon::ResizeVertical,
             t if t.is_pen() => {
@@ -1272,7 +1278,21 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     {
         let cpt = map.to_comp(pos);
         let press = ui.input(|i| i.pointer.press_origin()).unwrap_or(pos);
-        let tool = if space_pan || resp.dragged_by(egui::PointerButton::Middle) { Tool::Hand } else { app.ui.tool };
+        let tool = if space_pan {
+            Tool::Hand
+        } else if app.ui.tool == Tool::UnifiedCamera {
+            if resp.dragged_by(egui::PointerButton::Middle) {
+                Tool::PanCamera
+            } else if resp.dragged_by(egui::PointerButton::Secondary) {
+                Tool::Dolly
+            } else {
+                Tool::Orbit
+            }
+        } else if resp.dragged_by(egui::PointerButton::Middle) {
+            Tool::Hand
+        } else {
+            app.ui.tool
+        };
         let g = match tool {
             Tool::Hand => Some(Gesture::Pan { start_pan: app.ui.viewer.pan }),
             // Region of Interest armed: the drag draws it.
@@ -1368,7 +1388,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
                 Some(Gesture::PuppetPin { layer: h.layer, pin: h.pin, inv })
             }),
-            Tool::Orbit | Tool::PanCamera | Tool::Dolly => Some(Gesture::Camera { tool }),
+            Tool::Orbit | Tool::PanCamera | Tool::Dolly => Some(Gesture::Camera { tool, unified: app.ui.tool == Tool::UnifiedCamera, horizontal: None }),
             Tool::Selection if super::tracker::hit_at(&track_hits, press).is_some() => {
                 let hit = super::tracker::hit_at(&track_hits, press);
                 track_cur.zip(hit).and_then(|((tl, tu), hit)| {
@@ -1537,11 +1557,25 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     let _ = app.session.execute("prop.set", json!({"layer": layer.0, "path": "transform/position", "value": np, "merge": merge}));
                 }
             }
-            Gesture::Camera { tool } => {
-                let d = resp.drag_delta();
+            Gesture::Camera { tool, unified, mut horizontal } => {
+                let mut d = resp.drag_delta();
+                if !mods.shift {
+                    horizontal = None;
+                }
                 if d != egui::Vec2::ZERO {
+                    let active_tool = if unified && mods.shift {
+                        let horizontal = *horizontal.get_or_insert(d.x.abs() >= d.y.abs());
+                        if horizontal {
+                            d.y = 0.0;
+                        } else {
+                            d.x = 0.0;
+                        }
+                        Tool::Orbit
+                    } else {
+                        tool
+                    };
                     let (dx, dy) = ((d.x / zoom) as f64, (d.y / zoom) as f64);
-                    let (id, params) = match tool {
+                    let (id, params) = match active_tool {
                         Tool::Orbit => ("camera.orbit", json!({"yaw": -d.x as f64 * 0.4, "pitch": d.y as f64 * 0.4, "merge": merge})),
                         Tool::PanCamera => ("camera.pan", json!({"dx": dx, "dy": dy, "merge": merge})),
                         _ => ("camera.dolly", json!({"amount": -dy * 2.0, "merge": merge})),
@@ -1550,6 +1584,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         app.ui.status = e.to_string();
                     }
                 }
+                ui.data_mut(|d| d.insert_temp(gid, Gesture::Camera { tool, unified, horizontal }));
             }
             Gesture::Create { tool, start } => {
                 if let Some(d) = shape_drag(app, tool, start, cpt, mods) {

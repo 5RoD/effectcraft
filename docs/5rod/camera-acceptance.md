@@ -2,6 +2,39 @@
 
 This is a behavior and test plan for the camera workflows the user emphasized. It is based on Adobe's public help pages and EffectCraft's checked-in docs/source only. It does not claim the checklist has been run, and it does not claim missing behavior has been implemented.
 
+## 5ROD.27 navigation increment
+
+Unified Camera is available in the Orbit toolbar flyout. `C` cycles Unified, Orbit,
+Pan Camera, Dolly and back to Unified; `1/2/3` still select the individual tools.
+Unified primary/middle/secondary drags dispatch orbit/pan/dolly commands. Holding
+Shift constrains Unified orbit to the first movement's dominant axis, including
+when the middle or secondary button started the drag. Space panning and middle
+panning with other tools keep their existing behavior.
+
+In a 3D composition without an active camera layer, navigation and framing switch
+to the Default view without editing the project or creating a camera. Fixed
+orthographic views permit pan/dolly but reject orbit with a recoverable error.
+Active camera edits respect camera locks, merge one drag into one undo step, and
+framing converts composition time to offset/stretched layer time exactly once.
+
+`F` and `Ctrl+Shift+F` frame selected/all active 3D content when a camera tool is
+selected and a viewer panel has focus. Timeline `F` continues to reveal Feather;
+the shortcut editor still supplies these bindings. Camera layers and lights are
+excluded from the camera-tool framing targets. The ordinary View menu framing
+commands retain their existing 2D behavior.
+
+Synthetic engine regressions are in `tests_3d.rs`; real keyboard and mouse events
+are exercised by `ui_camera_navigation.rs`. This is an implementation acceptance
+increment, not an After Effects pixel comparison. Cursor-centered interaction
+modes, `Shift+1/2/3`, temporary single-letter tools, parented camera transforms,
+transform gizmos and the broader checklist below remain open. Existing navigation
+uses the camera's point of interest rather than a depth hit under the cursor.
+
+Adobe's [current 3D navigation documentation](https://helpx.adobe.com/after-effects/desktop/work-with-3d-composition/work-in-3d-design-space/work-in-3D-space.html)
+and [Default Camera documentation](https://helpx.adobe.com/after-effects/desktop/work-with-3d-composition/adjust-default-camera-settings/adjust-default-camera-settings-for-3d-compositions.html)
+explicitly permit navigation without a camera layer. The older shortcut-table
+note requiring a camera layer must not override that behavior.
+
 ## Current EffectCraft surface
 
 EffectCraft has camera creation/settings commands (`layer.newCamera`, `layer.cameraSettings`), one-node/two-node camera orientation, custom 3D viewer cameras with Orbit/Pan/Dolly tools, camera-from-view creation, keyframeable camera transforms/options, orbit-null/focus-link helpers, Classic and Advanced 3D depth of field, and a 3D Camera Tracker with solve-to-camera/text/solid/null/shadow-catcher workflows. The 3D Tracker analysis is explicitly CPU-only in the current parity notes. Useful implementation references:

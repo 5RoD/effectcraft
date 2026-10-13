@@ -40,8 +40,12 @@ object with the selected mode/backend, hardware-frame/session/decline/fallback c
 and source-decode/conversion work counters. These are process-wide totals, including
 project loading and read-ahead. A positive hardware-frame count establishes decoder
 use in that process; registration alone does not. Diagnostics and registration warnings
-go to stderr so stdout remains one JSON document. CLI export speed, frame/audio quality,
-backward seeks and software overrides require separate production comparisons.
+go to stderr so stdout remains one JSON document. The controlled production CLI
+comparison in [native-export.md](native-export.md#native-source-decoding-in-the-production-cli)
+accepted identical decoded frames/audio with lower sampled CPU consumption, without
+establishing a significant export speed gain. A separate default desktop smoke check
+returned the same frame-zero PNG after requests for frames 0/119/0; cached retrieval
+can satisfy those requests, so this is not forced driver-seek conformance.
 
 This adapter currently reads decoded YUV pixels back to CPU memory. Colour conversion, frame
 cache copies, composition and texture uploads still cost time. Its registration can also make
