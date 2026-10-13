@@ -144,3 +144,26 @@ holds were 8.61/8.93/9.16 ms at p50/p95/p99. Uncached p99 remained 51.04 ms, so 
 does not remove every stall. These captures launched a visible window without keyboard
 activation and recorded its native visibility, minimized state and desktop rectangle before
 observation; they do not infer physical scanout from the app's focus flag.
+
+## Normal Windows default acceptance
+
+A clean Thin LTO/codegen-one production build of `a3a0c6ab` repeated the visible
+primary-window check with hardware decoding, presentation and graphics-backend
+overrides all unset. Automatic selection used the RTX 3050 Vulkan compositor and
+Windows hardware decoder. The same ordinary OBS MP4 excerpt retained Full
+2560×1440 resolution, 120 fps, no frame skipping and audio off.
+
+The uncached ten-second run observed 99.91 distinct texture changes/s, with
+8.50/17.53/51.07 ms holds at p50/p95/p99. It still fails uncached 120 fps. The
+cached 49-frame loop observed 119.94 changes/s over 14.39 steady seconds, with
+8.33/9.06/9.20 ms holds and no selected-frame skips. All 6,570 uncached and
+12,372 cached steady draw samples matched their requested frame keys. Cached
+preparation retained the preceding texture; its 100 mismatches occurred before
+steady playback, plus one paused transition.
+
+Seven full-resolution frame samples, including a backward seek, stayed within
+one RGB code value of the external reference with exact alpha. No compositor
+readbacks occurred during either measured playback phase. The real window and
+5rod theme were inspected. This accepts the defaults on this host; it does not
+extend the cached range, prove physical scanout or establish moving-gameplay,
+audio-preview or full Hybrid MP4 acceptance.

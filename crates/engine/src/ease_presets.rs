@@ -7,14 +7,14 @@
 //! the first selected pair, `keys.easePreset.save {name, curve?}`, `keys.easePreset.list`,
 //! `keys.easePreset.rename {name, newName}` and `keys.easePreset.delete {name}`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use effectcraft_keyframe::{EaseCurve, key_at};
 use effectcraft_project::{LayerId, Uid};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::commands::{CommandSpec, always, bad, has_keys, str_p};
+use crate::commands::{CommandSpec, always, bad, has_keys, str_p, unlocked};
 use crate::{EngineError, Result, Session, cmd, query};
 
 /// User presets in the config store.
@@ -168,6 +168,9 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(C, NEED_PAIR));
     }
     let cid = s.active_comp_id().ok_or(EngineError::NoComp)?;
+    // Capture can read locked keys; only applying the curve requires editable layers.
+    let editable: BTreeSet<_> = unlocked(s, cid, pairs.iter().map(|(lid, ..)| *lid).collect(), C)?.into_iter().collect();
+    let pairs: Vec<_> = pairs.into_iter().filter(|(lid, ..)| editable.contains(lid)).collect();
     let n = s.edit("Apply Ease Preset", None, |proj, _| {
         let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
         let mut n = 0;

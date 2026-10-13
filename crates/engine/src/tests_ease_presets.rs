@@ -184,3 +184,49 @@ fn a_corrupt_presets_file_loads_what_it_can() {
     let text: Value = serde_json::from_str(&store.read(EASE_PRESETS_FILE).unwrap()).unwrap();
     assert_eq!(text["presets"].as_array().unwrap().len(), 1);
 }
+
+#[test]
+fn locked_ease_pairs_can_be_captured_but_not_changed() {
+    let (mut s, l) = setup();
+    animate(&mut s, l, "transform/opacity", &[(0.0, json!(0)), (1.0, json!(100))]);
+    s.execute("prop.select", json!({"layer": l, "path": "transform/opacity"})).unwrap();
+    s.execute("layer.setSwitch", json!({"layer": l, "switch": "lock", "value": true})).unwrap();
+    let project = s.project.clone();
+    let history = s.history_tree();
+    let merge_key = s.history.merge_key.clone();
+    let needs_save = s.needs_save();
+    assert!(s.execute("keys.easePreset.capture", json!({})).is_ok(), "reading a locked curve is allowed");
+    let error = s.execute("keys.easePreset.apply", json!({"preset": "Ease In-Out"})).unwrap_err().to_string();
+    assert!(error.contains("locked") && error.contains("Unlock All Layers"), "{error}");
+    assert!(Arc::ptr_eq(&project, &s.project), "a rejected application must retain the document");
+    assert_eq!(s.history_tree(), history, "a rejected application must retain all history");
+    assert_eq!(s.history.merge_key, merge_key);
+    assert_eq!(s.needs_save(), needs_save);
+}
+
+#[test]
+fn mixed_locked_ease_pairs_skip_locked_layers_in_one_undo_step() {
+    let (mut s, editable) = setup();
+    let locked = s.execute("layer.newNull", json!({"name": "Locked curve"})).unwrap()["layer"].as_u64().unwrap();
+    for layer in [editable, locked] {
+        animate(&mut s, layer, "transform/opacity", &[(0.0, json!(0)), (1.0, json!(100)), (2.0, json!(25))]);
+    }
+    s.execute("prop.select", json!({"layer": editable, "path": "transform/opacity"})).unwrap();
+    s.execute("prop.select", json!({"layer": locked, "path": "transform/opacity", "add": true})).unwrap();
+    s.execute("layer.setSwitch", json!({"layer": locked, "switch": "lock", "value": true})).unwrap();
+    let editable_before = prop(&s, editable, "transform/opacity").keys;
+    let locked_before = prop(&s, locked, "transform/opacity").keys;
+    let steps = s.history.undo.len();
+    let result = s.execute("keys.easePreset.apply", json!({"preset": "Ease In-Out"})).unwrap();
+    assert_eq!(result["pairs"], 2);
+    assert_eq!(s.history.undo.len(), steps + 1, "one undo step for all editable pairs");
+    let editable_after = prop(&s, editable, "transform/opacity").keys;
+    assert_ne!(editable_after, editable_before);
+    assert_eq!(prop(&s, locked, "transform/opacity").keys, locked_before);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(prop(&s, editable, "transform/opacity").keys, editable_before);
+    assert_eq!(prop(&s, locked, "transform/opacity").keys, locked_before);
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(prop(&s, editable, "transform/opacity").keys, editable_after);
+    assert_eq!(prop(&s, locked, "transform/opacity").keys, locked_before);
+}

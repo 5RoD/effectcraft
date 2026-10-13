@@ -122,7 +122,9 @@ each so malformed files cannot create unbounded glyph lists per frame.
 ## Remaining requested workflows
 
 Flow-style curve editing and libraries use the existing Ease Presets panel; this work does not
-duplicate it. KeyFast-style Trim Paths macros, dedicated action libraries and modifier shortcuts
+duplicate it. Applying a curve skips locked layers in a mixed selection and creates one undo
+step for the editable pairs. An all-locked selection returns an unlock instruction without
+changing the project or history; read-only curve capture remains available. KeyFast-style Trim Paths macros, dedicated action libraries and modifier shortcuts
 remain. Shake preset sharing uses editable animation presets, not a separate settings library or
 the vendor's preset pack. Deep Glow look/speed parity and Twixtor-quality optical-flow retiming
 need independent rendering implementations and measured validation; existing effect names do

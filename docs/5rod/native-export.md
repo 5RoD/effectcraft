@@ -116,6 +116,23 @@ All decoded frames, timestamps and BT.709 tags passed; decoded audio was identic
 over the first 48,000 samples. See [video effect acceptance](../native-video-effects.md)
 for fidelity, resource measurements and the limited footage scope.
 
+## Normal Windows default acceptance
+
+The clean Thin LTO/codegen-one `a3a0c6ab` production CLI repeated the 120-frame
+2560×1440/120, stereo-audio, 300 Mbit/s job with encoder and graphics-backend
+overrides unset. The job took 5.911 seconds; whole-process time was 7.957 seconds.
+A separate read-only observation of that production CLI's own PID confirmed a
+2560×1440 H.264 NVIDIA encoder session on the RTX 3050 without an override.
+
+External validation counted every frame at 120/1, with timestamp errors below
+one microsecond, limited-range BT.709 tags and stereo AAC at 48 kHz. Decoded video
+scored 49.79 dB PSNR and 0.9928 SSIM against the source; central audio correlation
+exceeded 0.999 on both channels. This is one short default acceptance run, not a
+new paired speed comparison, benchmark median, long export or lossless result.
+The earlier generated cancellation/preservation fixture also passed with the
+encoder override unset. CLI source decoding retains its existing software path;
+the desktop native decoder is a separate registration.
+
 Public API references: [MediaStreamSource](https://learn.microsoft.com/en-us/uwp/api/windows.media.core.mediastreamsource),
 [MediaTranscoder](https://learn.microsoft.com/en-us/uwp/api/windows.media.transcoding.mediatranscoder),
 [AAC encoder](https://learn.microsoft.com/en-us/windows/win32/medfound/aac-encoder).
