@@ -183,7 +183,7 @@ fn native_video_preserves_transforms_opacity_and_linear_blending() {
 #[test]
 fn native_video_defers_fields_colour_management_and_reduced_resolution() {
     let Some(g) = gpu() else { return };
-    for case in 0..3 {
+    for case in 0..6 {
         let mut s = scene(BitDepth::Bpc32);
         let mut opts = RenderOpts::default();
         match case {
@@ -198,7 +198,16 @@ fn native_video_defers_fields_colour_management_and_reduced_resolution() {
                 s.p.settings.working_space = Some(effectcraft_color::ColorSpace::Rec709);
                 s.p.settings.linearize = true;
             }
-            _ => opts.scale = 0.5,
+            2 => opts.scale = 0.5,
+            3 => s.p.comp_mut(s.cid).unwrap().frame_rate = effectcraft_time::FrameRate::FPS_60,
+            4 => s.p.comp_mut(s.cid).unwrap().layers[0].stretch = 200.0,
+            _ => {
+                for item in s.p.items.values_mut() {
+                    if let ItemKind::Footage(f) = &mut item.kind {
+                        f.native_rate = Some(effectcraft_time::FrameRate::FPS_60);
+                    }
+                }
+            }
         }
         let source = Source { raw_calls: AtomicUsize::new(0), image_calls: AtomicUsize::new(0), fail: false };
         let renderer = Renderer::new(&s.p, &source, opts);
