@@ -129,3 +129,23 @@ remain. Shake preset sharing uses editable animation presets, not a separate set
 the vendor's preset pack. Deep Glow look/speed parity and Twixtor-quality optical-flow retiming
 need independent rendering implementations and measured validation; existing effect names do
 not prove those capabilities.
+
+## Small production workflow acceptance
+
+The clean Windows production build of `9e2d1e57` passed38 additional real-app
+checks using original synthetic projects. They cover locked-key read-only
+capture and atomic Apply rejection, exact saved animation keys/values/geometry
+and history, Timewarp Source Frame edits with undo/redo and abandoned branches,
+save/reopen renders, and actual History panel clicks restoring both branches of
+a counter edit. The earlier counter/easing/action/shake run passed18 checks.
+
+All eight easing controls remain legible and reachable in the default short
+dock and a maximized640×480 panel; both graph handles remain editable after
+scrolling. The screenshots were inspected. The small motion roundtrip retained
+exact document/key/history state and alpha; its rendered PNG differs by one
+green code at one of921,600 pixels, within the existing display bound. Counter,
+easing and retime save/reopen PNGs were byte-identical in these cases.
+
+This accepts the scoped editing and persistence workflows. It does not establish
+full commercial plug-in equivalence, optical-flow quality, full-resolution
+retiming speed or that every panel fits simultaneously in a640×480 window.

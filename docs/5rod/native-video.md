@@ -167,3 +167,36 @@ readbacks occurred during either measured playback phase. The real window and
 5rod theme were inspected. This accepts the defaults on this host; it does not
 extend the cached range, prove physical scanout or establish moving-gameplay,
 audio-preview or full Hybrid MP4 acceptance.
+
+## Cached silent-preview scheduling
+
+A ready silent preview schedules its next draw near the next existing frame
+boundary, leaving one millisecond for native event handling and painting. Worker
+completions and user input still wake the UI immediately. Waiting frames, audio
+playback and cache preparation retain their previous behavior. Invalid timing
+values request an immediate draw; valid delayed requests are bounded to100ms.
+This changes neither frame selection nor image/effect quality.
+
+A controlled normal Thin LTO/codegen-one trial based on `9e2d1e57` used the same
+visible Full1440p/120 OBS excerpt, automatic Windows defaults, no frame skipping,
+audio off and disk cache off. The pair measured:
+
+| Measurement | Previous | Paced trial |
+| --- | ---: | ---: |
+| Uncached viewer texture changes/s | 99.71 | 101.21 |
+| Cached49-frame loop texture changes/s | 119.935 | 119.934 |
+| Cached UI draws/s | 863.38 | 196.91 |
+| Cached mean CPU cores used | 1.253 | 0.480 |
+| Cached completed texture hold p95/p99 | 9.04/9.22ms | 9.62/9.91ms |
+| Cached longest completed texture hold | 9.57ms | 10.46ms |
+
+The short cached run reduced repeated UI work by about77% and process CPU use by
+about62%, while retaining its average frame cadence and zero observed selected
+frame skips. Its tail holds increased by less than one millisecond. Every steady
+draw matched its requested key; preparation and paused transitions remain
+separately classified. Seven full-resolution samples in each run retained the
+existing one-code RGB bound and exact alpha against the external reference.
+
+These are one trial pair, not medians or committed production acceptance.
+Uncached120fps remains unachieved. The result does not extend the cached range,
+establish audio timing, prove monitor scanout or cover difficult moving gameplay.

@@ -1315,6 +1315,19 @@ impl EffectcraftApp {
             self.playback.start_wall = now;
             self.playback.start_frame = fr.frame_at(self.session.time());
         }
+        // A cached silent preview needs another draw at its next frame boundary, not
+        // continuously. Worker completions and real input still wake the UI immediately.
+        let period = step as f64 / self.playback.fps;
+        if !self.playback.waiting && period.is_finite() && period > 0.0 && elapsed.is_finite() && elapsed >= 0.0 {
+            // Leave one millisecond for the native event loop and painting. egui subtracts
+            // predicted_dt internally, so add it here to retain this wall-clock deadline.
+            let remaining = (period - elapsed.rem_euclid(period) - 0.001).clamp(0.0, 0.1);
+            let predicted = ctx.input(|i| i.predicted_dt);
+            if let (Ok(delay), Ok(predicted)) = (std::time::Duration::try_from_secs_f64(remaining), std::time::Duration::try_from_secs_f32(predicted)) {
+                ctx.request_repaint_after(delay.saturating_add(predicted));
+                return;
+            }
+        }
         ctx.request_repaint();
     }
 

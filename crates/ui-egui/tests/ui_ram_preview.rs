@@ -145,3 +145,45 @@ fn cached_frames_are_counted_at_one_third_resolution() {
         assert!(!h.state().frames.cached_frames(&series).is_empty(), "{res:?}");
     }
 }
+
+#[test]
+fn cached_preview_sleeps_between_frame_boundaries_and_space_stops_it_immediately() {
+    use effectcraft_ui_egui::dock::PanelKind;
+    use std::time::Duration;
+
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Paced preview", "width": 64, "height": 36, "frameRate": 120, "duration": 0.1})).unwrap();
+    s.execute("layer.newSolid", json!({"color": "#3080ff"})).unwrap();
+    s.execute("playback.settings.set", json!({"shortcut": "spacebar", "cacheBeforePlayback": true, "range": "entireDuration", "playFrom": "rangeStart", "includeAudio": false, "includeOverlays": false, "includeLayerControls": false, "resolution": "full", "skip": 0})).unwrap();
+    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).with_step_dt(0.0005).build_eframe(|_| EffectcraftApp::new(s));
+    h.run_steps(3);
+    let now = h.ctx.input(|i| i.time);
+    h.state_mut().play(now);
+    for _ in 0..600 {
+        h.step();
+        if !h.state().playback.caching && h.state().frames.inflight() == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(h.state().playback.playing && !h.state().playback.caching);
+    h.run_steps(6); // Drain immediate notifications from the final cache completion.
+    let now = h.ctx.input(|i| i.time);
+    let fr = h.state().session.active_comp().unwrap().frame_rate;
+    h.state_mut().session.set_time(fr.tick_of(0));
+    h.state_mut().playback.start_frame = 0;
+    h.state_mut().playback.start_wall = now;
+    h.run_steps(3);
+    assert_eq!(fr.frame_at(h.state().session.time()), 0, "the next frame is not due yet");
+    let delay = h.output().viewport_output.get(&egui::ViewportId::ROOT).unwrap().repaint_delay;
+    assert!(delay > Duration::ZERO && delay < Duration::from_millis(9), "cached playback must yield until the next frame: {delay:?}");
+    h.run_steps(20);
+    assert_eq!(fr.frame_at(h.state().session.time()), 1, "the clock advances at the existing 120 fps rate");
+    h.state_mut().ui.focused = PanelKind::Composition;
+    h.input_mut().events.push(egui::Event::Key { key: egui::Key::Space, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() });
+    h.step();
+    // A Space tap dispatches preview on release; holding it temporarily selects Hand.
+    h.input_mut().events.push(egui::Event::Key { key: egui::Key::Space, physical_key: None, pressed: false, repeat: false, modifiers: Default::default() });
+    h.step();
+    assert!(!h.state().playback.playing, "real input stops playback on the release UI pass");
+}
