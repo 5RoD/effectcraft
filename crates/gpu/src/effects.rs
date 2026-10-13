@@ -201,11 +201,18 @@ pub(crate) struct GpuFx<'e, 'g> {
     e: &'e mut Enc<'g>,
     b: Option<GBuf>,
     levels: Option<f32>,
+    resident_only: bool,
 }
 
 impl<'e, 'g> GpuFx<'e, 'g> {
     pub fn new(e: &'e mut Enc<'g>, img: GpuImage, offset: [f64; 2], scale: f64, levels: Option<f32>) -> Self {
-        GpuFx { e, b: Some(GBuf { img, offset, scale }), levels }
+        GpuFx { e, b: Some(GBuf { img, offset, scale }), levels, resident_only: false }
+    }
+
+    /// Native video attempts must fall back to the reference source pipeline when a
+    /// parameter combination needs CPU processing, without a speculative float readback.
+    pub fn new_resident(e: &'e mut Enc<'g>, img: GpuImage, offset: [f64; 2], scale: f64, levels: Option<f32>) -> Self {
+        Self { resident_only: true, ..Self::new(e, img, offset, scale, levels) }
     }
 
     /// The result: (image, offset, scale); `None` when a step failed.
@@ -238,12 +245,19 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
     }
 
     fn cpu(&mut self, f: &mut dyn FnMut(Buf) -> Buf) {
+        if self.resident_only {
+            self.b = None;
+            return;
+        }
         let Some(b) = self.b.take() else { return };
         let Some(img) = self.e.download(&b.img) else { return };
         let out = f(Buf { img, offset: b.offset, scale: b.scale });
         self.b = self.e.g.upload_image(&out.img).map(|img| GBuf { img, offset: out.offset, scale: out.scale });
     }
     fn gpu_checked(&mut self, step: &FxStep) -> Result<bool, String> {
+        if self.resident_only && self.b.is_none() {
+            return Ok(false);
+        }
         if ![effectcraft_effects::bloom::ID, effectcraft_effects::timewarp::ID].contains(&step.spec.id) {
             return Ok(false);
         }
@@ -268,6 +282,10 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
         Ok(true)
     }
     fn cpu_checked(&mut self, f: &mut dyn FnMut(Buf) -> Result<Buf, String>) -> Result<bool, String> {
+        if self.resident_only {
+            self.b = None;
+            return Ok(false);
+        }
         // An unkeyed CPU stage cannot enqueue a deferred readback. Decline this GPU
         // attempt explicitly: the checked frame boundary retries on CPU with a fresh sink.
         // It must not publish a placeholder or report a pending readback that never started.

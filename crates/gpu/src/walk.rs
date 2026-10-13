@@ -297,13 +297,13 @@ fn draw_precomp(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas:
     Some(place_src(e, r, ctx, layer, &shape, img, canvas, layer.blend_mode, opacity, pipe.levels).map(|c| *canvas = c))
 }
 
-/// Opaque native video without source masks, effects or styles. Conversion and source-depth
-/// quantisation happen on the GPU; placement, mattes and blending use the ordinary kernels.
+/// Opaque native video without source masks or styles. Conversion, source-depth quantisation
+/// and supported effects stay on the GPU; placement, mattes and blending use ordinary kernels.
 fn draw_video(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage, opacity: f32) -> Option<Option<()>> {
     if !e.g.has_kernel("video_yuv420")
         || layer.masks().is_some_and(|m| !m.children.is_empty())
         || styles::active(ctx, layer)
-        || (layer.switches.effects && layer.effects().is_some_and(|f| !f.children.is_empty()))
+        || !crate::video::supports_effects(layer, |id| r.active_accel().is_some_and(|accel| accel.supports_effect(id)))
     {
         return None;
     }
@@ -313,7 +313,7 @@ fn draw_video(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
         Err(_) => return Some(None),
     };
     let pipe = r.pipe();
-    let mut img = match crate::video::upload(e, &frame, pipe.levels) {
+    let img = match crate::video::upload(e, &frame, pipe.levels) {
         Ok(Some(img)) => img,
         Ok(None) => return None,
         Err(error) => {
@@ -321,10 +321,26 @@ fn draw_video(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
             return Some(None);
         }
     };
+    // The native conversion matches masked_source's quantized, untransformed source.
+    // Run the ordinary evaluated stack in effect space, then rebase before placement.
+    let origin = ctx.effect_bounds(layer).1;
+    let mut effects = crate::effects::GpuFx::new_resident(e, img, origin, 1.0, pipe.levels);
+    r.run_layer_effects_on(ctx, layer, &mut effects);
+    let processed = effects.finish();
+    if !r.cache_allowed() {
+        return Some(None);
+    }
+    let Some((mut img, offset, scale)) = processed else {
+        return if e.g.check_health().is_ok() { None } else { Some(None) };
+    };
+    if img.width == 0 || img.height == 0 {
+        return Some(Some(()));
+    }
+    let offset = [offset[0] - origin[0] * scale, offset[1] - origin[1] * scale];
     if let Some(c) = pipe.to_blend() {
         img = ops::convert(e, &img, &c);
     }
-    let shape = Buf { img: Image { width: img.width, height: img.height, data: Vec::new() }, offset: [0.0; 2], scale: 1.0 };
+    let shape = Buf { img: Image { width: img.width, height: img.height, data: Vec::new() }, offset, scale };
     if r.track_matte(ctx, layer).is_some() || layer.preserve_transparency {
         let iso = place_src(e, r, ctx, layer, &shape, img, &e.zeros(canvas.width, canvas.height), BlendMode::Normal, 1.0, None)?;
         return Some(composite_iso(e, r, ctx, layer, iso, canvas, opacity));

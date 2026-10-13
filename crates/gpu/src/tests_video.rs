@@ -10,8 +10,16 @@ use crate::{
 };
 use effectcraft_project::{BitDepth, Footage, FootageKind, ItemId, ItemKind};
 use effectcraft_raster::Image;
-use effectcraft_render::{FootageSource, RenderOpts, Renderer, video::Yuv420Frame};
+use effectcraft_render::{Accelerator, FootageSource, RenderOpts, Renderer, video::Yuv420Frame};
 use effectcraft_time::Tick;
+
+fn native_gpu() -> Option<&'static crate::Gpu> {
+    let gpu = gpu();
+    if std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|value| value == "1") {
+        assert!(gpu.is_some(), "native video effect acceptance requires a working GPU");
+    }
+    gpu
+}
 
 fn frame(w: u32, h: u32, kr: f32, kb: f32, full: bool) -> Arc<Yuv420Frame> {
     let cw = w.div_ceil(2);
@@ -235,4 +243,201 @@ fn native_video_supports_differing_composition_and_interpreted_rates() {
         }
         assert_eq!(source.raw_calls.load(Ordering::Relaxed), 3);
     }
+}
+
+#[test]
+fn native_video_effect_preflight_respects_disabled_audio_cpu_and_original_source_steps() {
+    let mut s = scene(BitDepth::Bpc32);
+    let mut layer = s.p.comp(s.cid).unwrap().layers[0].clone();
+    s.effect(&mut layer, effectcraft_effects::bloom::ID, &[]);
+    assert!(crate::video::supports_effects(&layer, crate::effects::supports));
+    assert!(!crate::video::supports_effects(&layer, |_| false), "an inactive/unsupported accelerator keeps the reference path");
+    layer.props.group_mut("effects/#1").unwrap().enabled = false;
+    assert!(crate::video::supports_effects(&layer, |_| panic!("disabled steps must not query GPU support")));
+    s.effect(&mut layer, "ec.audio.reverb", &[]);
+    assert!(crate::video::supports_effects(&layer, |_| panic!("audio does not process source video")));
+    s.effect(&mut layer, effectcraft_effects::paint::ID, &[]);
+    assert!(!crate::video::supports_effects(&layer, crate::effects::supports));
+    layer.switches.effects = false;
+    assert!(crate::video::supports_effects(&layer, |_| panic!("the Effects switch disables the entire stack")));
+    layer.switches.effects = true;
+    layer.props.group_mut("effects/#3").unwrap().enabled = false;
+    s.effect(&mut layer, "ec.channel.cccomposite", &[]);
+    assert!(!crate::video::supports_effects(&layer, |_| true), "CPU original capture must not cause a native readback");
+    layer.props.group_mut("effects/#4").unwrap().kind = effectcraft_project::GroupKind::Effect { effect: "org.test.unknown".into() };
+    assert!(!crate::video::supports_effects(&layer, |_| true));
+}
+
+#[test]
+fn native_video_effect_chains_match_cpu_without_float_source_uploads_or_internal_readbacks() {
+    use effectcraft_keyframe::Value;
+    use effectcraft_render::Backend;
+    let Some(g) = native_gpu() else { return };
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc16, BitDepth::Bpc32] {
+        for (quality, view, operation, mixed) in [(0, 0, 0, false), (0, 1, 0, false), (1, 2, 0, false), (2, 2, 1, false), (2, 2, 0, true)] {
+            let mut s = scene(depth);
+            s.p.settings.blend_linear = mixed;
+            s.p.comp_mut(s.cid).unwrap().frame_rate = effectcraft_time::FrameRate::FPS_120;
+            let mut layer = s.p.comp(s.cid).unwrap().layers[0].clone();
+            if mixed {
+                s.effect(&mut layer, "ec.channel.invert", &[("blend", Value::Scalar(40.0))]);
+                s.effect(&mut layer, "ec.stylize.glow", &[("radius", Value::Scalar(4.0)), ("threshold", Value::Scalar(20.0))]);
+                crate::tests::set(&mut layer, "transform/position", Value::Vec3([42.0, 28.0, 0.0]));
+                crate::tests::set(&mut layer, "transform/rotation", Value::Scalar(7.0));
+                crate::tests::set(&mut layer, "transform/opacity", Value::Scalar(63.0));
+            }
+            s.effect(
+                &mut layer,
+                effectcraft_effects::bloom::ID,
+                &[
+                    ("radius", Value::Scalar(8.0)),
+                    ("threshold", Value::Scalar(0.2)),
+                    ("quality", Value::Enum(quality)),
+                    ("view", Value::Enum(view)),
+                    ("operation", Value::Enum(operation)),
+                ],
+            );
+            s.p.comp_mut(s.cid).unwrap().layers[0] = layer;
+            let source = Source { raw_calls: AtomicUsize::new(0), image_calls: AtomicUsize::new(0), fail: false };
+            for t in [Tick::ZERO, effectcraft_time::FrameRate::FPS_120.frame_duration(), Tick::ZERO] {
+                let expected =
+                    Renderer::new(&s.p, &source, RenderOpts { backend: Backend::Cpu, ..Default::default() }).comp_frame_cpu_checked(s.cid, t).unwrap();
+                let before_images = source.image_calls.load(Ordering::Relaxed);
+                let before = g.context().transfer_stats();
+                let renderer = Renderer::new(&s.p, &source, RenderOpts { backend: Backend::Gpu, ..Default::default() }).with_accel(Some(g));
+                let actual = g.render(&renderer, s.cid, t).unwrap();
+                let after = g.context().transfer_stats();
+                assert_eq!(source.image_calls.load(Ordering::Relaxed), before_images, "native input must bypass float source conversion");
+                assert_eq!(after.uploads - before.uploads, 1, "only the compact YUV source uploads");
+                let native = frame(97, 61, 0.2126, 0.0722, t != Tick::ZERO);
+                let bytes: usize = native.plane_lengths().iter().map(|n| n.div_ceil(4) * 4).sum();
+                assert_eq!(after.upload_bytes - before.upload_bytes, bytes as u64);
+                assert_eq!(after.readbacks - before.readbacks, 1, "only the completed frame reads back");
+                let difference = diff(&expected, &actual, crate::tests::tolerance(depth));
+                assert_eq!(difference.over, 0, "{depth:?} quality={quality} view={view} operation={operation} mixed={mixed}: {difference:?}");
+            }
+            assert_eq!(source.raw_calls.load(Ordering::Relaxed), 3);
+        }
+    }
+}
+
+#[test]
+fn native_video_resident_only_target_declines_cpu_without_callbacks_or_transfers() {
+    use effectcraft_render::FxTarget;
+    let Some(g) = native_gpu() else { return };
+    for checked in [false, true] {
+        let mut e = Enc::new(&g.ctx);
+        let input = crate::video::upload(&mut e, &frame(9, 5, 0.2126, 0.0722, false), None).unwrap().unwrap();
+        let before = g.context().transfer_stats();
+        let mut target = crate::effects::GpuFx::new_resident(&mut e, input, [0.0; 2], 1.0, None);
+        if checked {
+            assert!(!target.cpu_checked(&mut |_| panic!("declined native stage must not call CPU renderer")).unwrap());
+        } else {
+            target.cpu(&mut |_| panic!("declined native stage must not call CPU renderer"));
+        }
+        assert!(target.finish().is_none(), "a partial source cannot be a successful resident result");
+        assert_eq!(g.context().transfer_stats(), before);
+    }
+}
+
+#[test]
+fn native_video_effect_fallbacks_keep_masks_styles_cpu_controls_and_original_source_semantics() {
+    use effectcraft_keyframe::{ShapePath, Value};
+    use effectcraft_project::{MaskMode, build};
+    use effectcraft_render::Backend;
+    let Some(g) = native_gpu() else { return };
+    for case in 0..6 {
+        let mut s = scene(BitDepth::Bpc32);
+        let mut layer = s.p.comp(s.cid).unwrap().layers[0].clone();
+        match case {
+            0 => s.effect(&mut layer, effectcraft_effects::paint::ID, &[]),
+            1 => s.effect(&mut layer, "ec.channel.cccomposite", &[]),
+            2 => {
+                let mask =
+                    build::mask(&mut build::Ids(&mut s.p.next_id), "Original mask", ShapePath::ellipse([48.0, 30.0], 65.0, 43.0), MaskMode::Add, [255; 3]);
+                layer.props.sub_mut("masks").unwrap().children.push(mask.into());
+            }
+            3 => {
+                effectcraft_project::styles::add_style(&mut layer, &mut build::Ids(&mut s.p.next_id), "colorOverlay", &s.comp.global_light, true).unwrap();
+            }
+            4 => s.effect(&mut layer, "ec.generate.cellpattern", &[("cellPattern", Value::Enum(6))]),
+            _ => {}
+        }
+        s.effect(&mut layer, effectcraft_effects::bloom::ID, &[("radius", Value::Scalar(4.0)), ("threshold", Value::Scalar(0.2))]);
+        s.p.comp_mut(s.cid).unwrap().layers[0] = layer;
+        let source = Source { raw_calls: AtomicUsize::new(0), image_calls: AtomicUsize::new(0), fail: false };
+        let expected =
+            Renderer::new(&s.p, &source, RenderOpts { backend: Backend::Cpu, ..Default::default() }).comp_frame_cpu_checked(s.cid, Tick::ZERO).unwrap();
+        let before_images = source.image_calls.load(Ordering::Relaxed);
+        let before = g.context().transfer_stats();
+        let mut renderer = Renderer::new(&s.p, &source, RenderOpts { backend: Backend::Gpu, ..Default::default() });
+        if case != 5 {
+            renderer.accel = Some(g);
+        }
+        let actual = g.render(&renderer, s.cid, Tick::ZERO).unwrap();
+        assert!(source.image_calls.load(Ordering::Relaxed) > before_images, "case {case} keeps reference source semantics");
+        assert_eq!(source.raw_calls.load(Ordering::Relaxed), usize::from(case == 4), "only dynamic control decline speculates a native upload");
+        if case == 4 {
+            assert_eq!(
+                g.context().transfer_stats().readbacks - before.readbacks,
+                2,
+                "reference Bloom uses its ordinary completed source readback plus final frame"
+            );
+        }
+        assert_eq!(diff(&expected, &actual, 1e-3).over, 0, "fallback case {case}");
+    }
+}
+
+#[test]
+fn native_video_bloom_display_deferred_completion_and_failed_controls_keep_checked_contract() {
+    use effectcraft_keyframe::Value;
+    use effectcraft_render::{Backend, FrameDiagnostics, LayerCache};
+    let Some(g) = native_gpu() else { return };
+    let mut s = scene(BitDepth::Bpc32);
+    let mut layer = s.p.comp(s.cid).unwrap().layers[0].clone();
+    s.effect(&mut layer, effectcraft_effects::bloom::ID, &[("radius", Value::Scalar(8.0)), ("threshold", Value::Scalar(0.2))]);
+    let layer_id = layer.id;
+    let uid = layer.effects().unwrap().groups().next().unwrap().uid;
+    s.p.comp_mut(s.cid).unwrap().layers[0] = layer;
+    let source = Source { raw_calls: AtomicUsize::new(0), image_calls: AtomicUsize::new(0), fail: false };
+    let cache = LayerCache::default();
+    let opts = RenderOpts { backend: Backend::Gpu, ..Default::default() };
+    let before = g.context().transfer_stats();
+    let renderer = Renderer::new(&s.p, &source, opts).with_accel(Some(g));
+    assert!(g.render_display(&renderer, s.cid, Tick::ZERO).is_some());
+    assert_eq!(g.context().transfer_stats().readbacks, before.readbacks, "native display effects need no float readback");
+    assert_eq!(source.image_calls.load(Ordering::Relaxed), 0);
+
+    let deferred = crate::tests_deferred::deferred_gpu();
+    if std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|value| value == "1") {
+        assert!(deferred.is_some(), "native checked export passes require a deferred device");
+    }
+    let Some((deferred, _guard)) = deferred else { return };
+    let expected = Renderer::new(&s.p, &source, RenderOpts { backend: Backend::Cpu, ..Default::default() }).comp_frame_cpu_checked(s.cid, Tick::ZERO).unwrap();
+    let before_images = source.image_calls.load(Ordering::Relaxed);
+    let before = deferred.context().transfer_stats();
+    cache.set_gate(deferred.miss_gate());
+    let mut renderer = Renderer::new(&s.p, &source, opts).with_accel(Some(deferred));
+    renderer.cache = Some(&cache);
+    let actual = effectcraft_render::passes::block_on(effectcraft_render::passes::comp_frame_checked(&renderer, s.cid, Tick::ZERO)).unwrap();
+    assert_eq!(source.image_calls.load(Ordering::Relaxed), before_images);
+    assert_eq!(deferred.context().transfer_stats().readbacks - before.readbacks, 1, "only final frame completion is deferred");
+    assert_eq!(diff(&expected, &actual, 1e-3).over, 0);
+
+    s.p.comp_mut(s.cid).unwrap().layer_mut(layer_id).unwrap().props.prop_mut("effects/#1/radius").unwrap().value = Value::Scalar(f64::NAN);
+    let before_project = s.p.clone();
+    cache.clear();
+    let diagnostics = FrameDiagnostics::default();
+    let renderer = Renderer::new(&s.p, &source, opts).with_accel(Some(g));
+    let mut renderer = renderer.with_diagnostics(&diagnostics);
+    renderer.cache = Some(&cache);
+    let before_images = source.image_calls.load(Ordering::Relaxed);
+    let error = diagnostics.result(g.render(&renderer, s.cid, Tick::ZERO)).unwrap_err();
+    assert_eq!((error.comp, error.layer, error.effect_uid, error.effect_id.as_str()), (s.cid, layer_id, uid, effectcraft_effects::bloom::ID));
+    assert!(error.message.contains("radius"));
+    assert_eq!(source.image_calls.load(Ordering::Relaxed), before_images, "a checked native failure cannot silently substitute CPU pixels");
+    assert_eq!(cache.stats().entries, 0);
+    assert_eq!(s.p, before_project);
+    s.p.comp_mut(s.cid).unwrap().layer_mut(layer_id).unwrap().props.prop_mut("effects/#1/radius").unwrap().value = Value::Scalar(8.0);
+    assert!(g.render(&Renderer::new(&s.p, &source, opts).with_accel(Some(g)), s.cid, Tick::ZERO).is_some());
 }

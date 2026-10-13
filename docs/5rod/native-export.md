@@ -69,7 +69,41 @@ ordinary unit tests; native publication has synthetic file-safety tests.
 A separate generated 1440p/120 audio/video probe delivered 120 frames and 48,000 stereo
 samples, decoded correctly and returned cleanly on deliberate cancellation. These are
 correctness checks, not real-project export speed or maximum-quality acceptance. No export
-speed improvement is claimed yet.
+speed improvement is claimed by those generated checks.
+
+## First production footage comparison
+
+A clean Windows x64 Thin LTO/codegen-one build of `21680b74` rendered the same
+private OBS H.264 2560×1440/120 source with GPU rendering and stereo audio. Each
+run exported the first 120 frames at its original resolution/rate, without effects.
+The encoder was selected explicitly; the default is still software pending broader
+acceptance. The CLI binary SHA256 was
+`0fee76b7a8381bc52705db1acb1a7df3aa1067f6abd8005b0c392bb4d4817eeb`.
+
+| Target bitrate | Windows job / whole process | Software job / whole process | Windows / software PSNR | Windows / software SSIM |
+|---|---|---|---|---|
+| 80 Mbit/s | 5.873 / 7.377 s | 15.325 / 16.797 s | 42.57 / 41.41 dB | 0.9602 / 0.9506 |
+| 300 Mbit/s | 5.521 / 6.992 s | 18.198 / 19.649 s | 49.79 / 46.37 dB | 0.9928 / 0.9838 |
+
+The render-job comparison improved by 2.61× and 3.30× in these single paired runs;
+whole-process improvement was 2.28× and 2.81×. This is a short clip with startup
+costs, not a repeated median, long-export throughput, lossless quality or difficult
+effect/3D acceptance. PSNR/SSIM compare every decoded frame with the source through
+external FFmpeg; the private footage remains outside the repository.
+
+External ffprobe counted exactly 120 frames at 120/1 with a maximum timestamp
+error below one microsecond, plus stereo AAC at 48 kHz. The central decoded audio
+correlated above 0.999 with the first source track on the Windows path, and above
+0.998 on software. Existing mixing remains responsible for the selected tracks.
+Read-only NVML observations of the production CLI's own PID confirmed a 2560×1440
+H.264 encode session on the RTX 3050; the software control had none. That separate
+identity check is not timing evidence.
+
+Observed peak process commitment was about 3.57/3.64 GiB on Windows versus
+5.21/5.38 GiB on software at the two bitrates. These sampled process totals include
+rendering, decoded media, audio and codec buffers, not just the request queue. The
+backend still transfers final rendered frames into the operating system encoder;
+it does not establish a GPU-texture-to-encoder path or instantaneous export.
 
 Public API references: [MediaStreamSource](https://learn.microsoft.com/en-us/uwp/api/windows.media.core.mediastreamsource),
 [MediaTranscoder](https://learn.microsoft.com/en-us/uwp/api/windows.media.transcoding.mediatranscoder),

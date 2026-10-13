@@ -4,6 +4,23 @@ use effectcraft_render::video::Yuv420Frame;
 
 use crate::context::{Enc, GpuImage, Params};
 
+/// Preflight the enabled video stack before requesting compact source pixels. CPU-only
+/// effects keep the reference source path; CC Composite also needs a CPU original snapshot.
+/// Dynamic GPU-only controls are checked by the resident target, which can decline without
+/// reading back or publishing a partially processed native source.
+pub(crate) fn supports_effects(layer: &effectcraft_project::Layer, supports: impl Fn(&str) -> bool) -> bool {
+    if !layer.switches.effects {
+        return true;
+    }
+    layer.effects().is_none_or(|effects| {
+        effects.groups().filter(|group| group.enabled).all(|group| {
+            let effectcraft_project::GroupKind::Effect { effect } = &group.kind else { return true };
+            let Some(spec) = effectcraft_effects::find(effect) else { return false };
+            effectcraft_effects::audio_fx::is_audio_effect(spec.id) || (spec.gpu && spec.id != "ec.channel.cccomposite" && supports(spec.id))
+        })
+    })
+}
+
 /// Upload only the used plane bytes; padding keeps storage-buffer loads aligned.
 /// `None` leaves unsupported device limits to the existing CPU source path.
 pub(crate) fn upload(e: &mut Enc, frame: &Yuv420Frame, levels: Option<f32>) -> Result<Option<GpuImage>, String> {
