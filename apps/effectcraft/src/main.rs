@@ -292,6 +292,13 @@ fn main() -> eframe::Result {
 fn wgpu_options(backends: Option<eframe::wgpu::Backends>) -> eframe::WgpuConfiguration {
     use eframe::egui_wgpu::WgpuSetup;
     let mut config = eframe::WgpuConfiguration::default();
+    // Optional local presentation diagnostic; unsupported modes retain wgpu's fallback.
+    match std::env::var_os("EFFECTCRAFT_VSYNC") {
+        None => {}
+        Some(value) if value == "auto" => {}
+        Some(value) if value == "off" => config.surface.present_mode = eframe::wgpu::PresentMode::AutoNoVsync,
+        Some(value) => log::warn!("invalid EFFECTCRAFT_VSYNC value {value:?}; using automatic synchronization"),
+    }
     if let WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup {
         if let Some(b) = backends {
             setup.instance_descriptor.backends = b;

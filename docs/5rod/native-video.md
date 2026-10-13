@@ -101,3 +101,44 @@ an explicit rate/stretch/remap fallback guard in `23317297`. The shared raw-fram
 addresses repeated native reads within the existing budget, and the rate restrictions have
 been removed for validation. Stretch/remap still fall back. The new cached path requires
 separate production measurements before its mixed-rate performance can be accepted.
+
+## Shared-cache production results and presentation diagnostic
+
+The normal Thin LTO build of `2bc11354` repaired the mixed-rate regression: the same
+120 fps source in a 60 fps composition observed 55.74 viewer frames/s, compared with
+6.11 on the initial native path and 20.97 on the older cached float path. Source calls
+averaged 6.67 ms, with 3,442 hardware frames for 1,723 calls. The capture still included
+stalls up to 206 ms and does not pass perfectly smooth 60 fps playback.
+
+A fresh matched 120 fps pair observed 24.24 versus 59.48 viewer frames/s. This establishes
+about 2.45 times the older float-path cadence, but no further 120 fps gain over the earlier
+62.38 fps native capture. The shared-cache capture skipped at least 1,362 selected frames;
+it still fails full 120 fps. Seven checked renders retained the one-code RGB bound,
+exact alpha and 73.55–74.10 dB comparison with the external reference.
+
+Cached playback isolated an additional presentation limit: a 49-frame full-resolution loop
+observed 63.58 fps after nearly all decode/render work was finished. A separate visible-window
+check on the primary display observed 63.53 fps; increasing the presentation queue to two
+frames observed 63.57 fps and did not help. These results do not establish a hardware ceiling.
+
+Desktop launches accept `EFFECTCRAFT_VSYNC=auto|off`. Unset/`auto` retains synchronized
+presentation. `off` requests wgpu's `AutoNoVsync` mode, with its device-supported fallback;
+invalid or non-Unicode values warn and retain automatic synchronization. This optional
+setting can increase presentation work and permit tearing; it does not change rendered pixels
+or guarantee that the physical display presents every frame. There is no global driver,
+power-plan or monitor-setting change.
+
+In the initial production-flags experiment, `off` observed 120.00 fps without selected-frame
+skips on the cached 49-frame loop. Completed holds were 8.51 ms median, 8.87 ms at p95 and
+9.04 ms at p99. A separate 30-second uncached run observed 103.13 fps, no selected-frame
+skips, and holds of 8.45/17.13/44.84 ms at p50/p95/p99. It still slowed the playback clock
+and does not pass uncached 120 fps. This experiment used an explicitly recorded uncommitted
+presentation change; it is not an installed or release-accepted artifact. Audio, heavy effects,
+long cached ranges and physical monitor scanout remain separate acceptance work.
+
+The visible primary-window follow-up retained this result: 102.73 fps over 30 uncached
+seconds and 119.94 fps on the cached loop, with no observed selected-frame skips. Cached
+holds were 8.61/8.93/9.16 ms at p50/p95/p99. Uncached p99 remained 51.04 ms, so this
+does not remove every stall. These captures launched a visible window without keyboard
+activation and recorded its native visibility, minimized state and desktop rectangle before
+observation; they do not infer physical scanout from the app's focus flag.
