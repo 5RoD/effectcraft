@@ -3,6 +3,7 @@
 
 use std::io::{BufWriter, Cursor, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{ExportError, Result, io};
@@ -13,7 +14,7 @@ pub type Sink = dyn Fn(&str, Vec<u8>) + Send + Sync;
 
 /// One output file being written.
 pub(crate) enum Out<'a> {
-    File(FileOut),
+    File { file: FileOut, cleanup: Option<&'a Mutex<Vec<String>>> },
     Mem { path: String, cur: Cursor<Vec<u8>>, sink: &'a Sink },
 }
 
@@ -21,7 +22,7 @@ pub(crate) enum Out<'a> {
 pub(crate) fn create<'a>(sink: Option<&'a Sink>, path: &str) -> Result<Out<'a>> {
     match sink {
         Some(sink) => Ok(Out::Mem { path: path.to_string(), cur: Cursor::new(Vec::new()), sink }),
-        None => FileOut::create(Path::new(path)).map(Out::File),
+        None => FileOut::create(Path::new(path)).map(|file| Out::File { file, cleanup: None }),
     }
 }
 
@@ -30,11 +31,26 @@ pub(crate) fn exists(sink: Option<&Sink>, path: &str) -> bool {
     sink.is_none() && std::path::Path::new(path).exists()
 }
 
-impl Out<'_> {
+impl<'a> Out<'a> {
+    /// Cancellation owns only successfully published, newly created destinations. Failed
+    /// encoders own their provisional file, whose guard removes it without touching the target.
+    pub(crate) fn track_cleanup(&mut self, destinations: &'a Mutex<Vec<String>>) {
+        if let Out::File { cleanup, .. } = self {
+            *cleanup = Some(destinations);
+        }
+    }
+
     /// Flush and close; a sink receives the contents now. Returns the file size.
     pub(crate) fn finish(self) -> Result<u64> {
         match self {
-            Out::File(file) => file.finish(),
+            Out::File { file, cleanup } => {
+                let destination = (!file.target_existed).then(|| file.target.to_string_lossy().into_owned());
+                let bytes = file.finish()?;
+                if let (Some(cleanup), Some(destination)) = (cleanup, destination) {
+                    cleanup.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(destination);
+                }
+                Ok(bytes)
+            }
             Out::Mem { path, cur, sink } => {
                 let data = cur.into_inner();
                 let n = data.len() as u64;
@@ -48,13 +64,13 @@ impl Out<'_> {
 impl Write for Out<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
-            Out::File(file) => file.writer()?.write(buf),
+            Out::File { file, .. } => file.writer()?.write(buf),
             Out::Mem { cur, .. } => cur.write(buf),
         }
     }
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
-            Out::File(file) => file.writer()?.flush(),
+            Out::File { file, .. } => file.writer()?.flush(),
             Out::Mem { .. } => Ok(()),
         }
     }
@@ -63,7 +79,7 @@ impl Write for Out<'_> {
 impl Seek for Out<'_> {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         match self {
-            Out::File(file) => file.writer()?.seek(pos),
+            Out::File { file, .. } => file.writer()?.seek(pos),
             Out::Mem { cur, .. } => cur.seek(pos),
         }
     }
@@ -75,11 +91,13 @@ pub(crate) struct FileOut {
     writer: Option<BufWriter<std::fs::File>>,
     temp: PathBuf,
     target: PathBuf,
+    target_existed: bool,
     committed: bool,
 }
 
 impl FileOut {
     fn create(target: &Path) -> Result<Self> {
+        let target_existed = target.try_exists().map_err(io)?;
         let parent = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
         std::fs::create_dir_all(parent).map_err(io)?;
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -87,7 +105,7 @@ impl FileOut {
             let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
             let temp = parent.join(format!(".effectcraft-export-{}-{nonce}.tmp", std::process::id()));
             match std::fs::OpenOptions::new().write(true).read(true).create_new(true).open(&temp) {
-                Ok(file) => return Ok(Self { writer: Some(BufWriter::new(file)), temp, target: target.to_path_buf(), committed: false }),
+                Ok(file) => return Ok(Self { writer: Some(BufWriter::new(file)), temp, target: target.to_path_buf(), target_existed, committed: false }),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(io(error)),
             }
@@ -135,6 +153,32 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ec-export-atomic-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn cancellation_tracks_only_new_destinations_after_successful_publication() {
+        let dir = dir();
+        let cleanup = Mutex::new(Vec::new());
+        let existing = dir.join("previous.mov");
+        std::fs::write(&existing, b"previous completed output").unwrap();
+        let new = dir.join("new.mov");
+        for target in [&existing, &new] {
+            let mut output = create(None, target.to_str().unwrap()).unwrap();
+            output.track_cleanup(&cleanup);
+            output.write_all(b"unfinished movie").unwrap();
+            drop(output);
+            assert!(cleanup.lock().unwrap().is_empty());
+        }
+        assert_eq!(std::fs::read(&existing).unwrap(), b"previous completed output");
+        assert!(!new.exists());
+        for target in [&existing, &new] {
+            let mut output = create(None, target.to_str().unwrap()).unwrap();
+            output.track_cleanup(&cleanup);
+            output.write_all(b"completed movie").unwrap();
+            output.finish().unwrap();
+        }
+        assert_eq!(*cleanup.lock().unwrap(), vec![new.to_string_lossy().into_owned()]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -208,12 +208,10 @@ impl<'a> Cx<'a> {
         crate::fit(px, img.width, img.height, w, h)
     }
 
-    /// Open a file and remember ownership for cancellation cleanup (including overflow paths).
+    /// Track completed new files for cancellation cleanup (including overflow paths).
     pub fn create(&self, path: &str) -> crate::Result<out::Out<'_>> {
-        let file = out::create(self.sink, path)?;
-        if self.sink.is_none() {
-            self.written.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(path.to_owned());
-        }
+        let mut file = out::create(self.sink, path)?;
+        file.track_cleanup(&self.written);
         Ok(file)
     }
 

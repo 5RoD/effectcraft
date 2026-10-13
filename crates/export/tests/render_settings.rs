@@ -385,6 +385,38 @@ fn wav_and_aiff_channels_and_formats() {
 }
 
 #[test]
+fn cancelling_an_unfinished_movie_preserves_the_existing_destination() {
+    let (p, cid) = project(FrameRate::FPS_25, |_, _| {});
+    let dir = std::env::temp_dir().join(format!("ec-cancel-existing-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("finished.gif");
+    let original = b"previous completed movie";
+    std::fs::write(&target, original).unwrap();
+    let settings = custom(0.0, 0.12);
+    let output = OutputModule::for_format(OutputFormat::Gif);
+    let result = export(
+        &Job {
+            project: &p,
+            footage: &NoFootage,
+            expr: None,
+            accel: None,
+            comp: cid,
+            settings: &settings,
+            output: &output,
+            path: target.to_str().unwrap(),
+            sink: None,
+            nested_switches: true,
+            options: JobOptions::default(),
+        },
+        &mut |progress| progress.done == 0,
+    );
+    assert!(matches!(result, Err(effectcraft_export::ExportError::Cancelled)), "{result:?}");
+    assert_eq!(std::fs::read(&target).unwrap(), original);
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "unfinished provisional file remains");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn cancelled_export_removes_only_files_it_opened() {
     use effectcraft_export::ExportError;
     let dir = std::env::temp_dir().join(format!("ec-cancel-owned-{}", std::process::id()));
