@@ -29,6 +29,9 @@ overlays and layer controls were disabled. Renderer selection remained Auto. Def
 budgets were 3 GiB RAM and 1 GiB GPU memory. Twelve seconds of observation followed Purge;
 thirty-five seconds then used Cache Before Playback in the same process. Purge allows
 paused prefetch; the second phase retains earlier work. Neither empties the OS file cache.
+Disk caching used its enabled default and 100 GiB limit in the shared platform cache folder;
+the isolated configuration directory does not isolate disk caching. Purge All clears that
+cache too. Disk hit/write counters were not recorded.
 
 The bounded viewer observer records actual texture changes at application drawing,
 including playing draws that wait for pixels. It was read only after each observation

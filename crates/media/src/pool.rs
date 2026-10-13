@@ -171,8 +171,8 @@ struct CacheState {
 }
 
 /// A movie/audio source by path, opened by the first caller while the others wait for it
-/// (`None`: failed to open; not retried until `forget`).
-type SourceSlot = Arc<OnceLock<Option<SharedSource>>>;
+/// (an error is retained with its context; not retried until `forget`).
+type SourceSlot = Arc<OnceLock<Result<SharedSource>>>;
 
 /// An animated GIF by path, as [`SourceSlot`] (the error message when it failed to load).
 type GifSlot = Arc<OnceLock<std::result::Result<Arc<Anim>, String>>>;
@@ -511,7 +511,7 @@ impl MediaPool {
     /// [`MediaPool::decode_audio`], failing when the source can't be opened or read.
     fn try_decode_audio(&self, footage: &Footage, start: Tick, frames: usize, rate: u32) -> std::result::Result<Vec<f32>, String> {
         let path: Arc<str> = footage.path.as_str().into();
-        let src = self.inner.source(&path).ok_or("the file can't be opened")?;
+        let src = self.inner.source(&path).map_err(|e| e.to_string())?;
         let s0 = start.to_units_floor(rate as i64);
         let native = src.info().audio.as_ref().map_or(rate, |a| a.sample_rate);
         if native == 0 || rate == 0 || native == rate {
@@ -582,7 +582,7 @@ impl Inner {
         if let Some(b) = lock(&self.files).get(path) {
             return Ok(b.clone());
         }
-        std::fs::read(path).map(Into::into).map_err(|e| MediaError::Io(format!("{path}: {e}")))
+        crate::reader::read_bounded(std::path::Path::new(path)).map(Into::into)
     }
 
     /// The opened movie/audio source for `path`. The first caller opens it, outside the map's
@@ -590,21 +590,28 @@ impl Inner {
     /// decoded whole); callers asking for the same file meanwhile wait for that instead of opening
     /// it again: a preview's frame workers, audio feeder, conform and waveform threads each
     /// decoded a long FLAC in full at once (#408).
-    fn source(&self, path: &Arc<str>) -> Option<SharedSource> {
+    fn source(&self, path: &Arc<str>) -> Result<SharedSource> {
         let slot = lock(&self.sources).entry(path.clone()).or_default().clone();
         slot.get_or_init(|| {
             self.opened.fetch_add(1, Ordering::Relaxed);
-            let opened = self.read(path).and_then(|bytes| {
+            let opened = (|| {
+                let in_memory = lock(&self.files).get(&**path).cloned();
+                if in_memory.is_none()
+                    && let Some(source) = crate::reader::open_container(std::path::Path::new(&**path))?
+                {
+                    return Ok(source);
+                }
+                let bytes = match in_memory {
+                    Some(bytes) => bytes,
+                    None => self.read(path)?,
+                };
                 let name = std::path::Path::new(&**path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                 filmcraft_codecs::open_bytes(&name, bytes).map_err(MediaError::from)
-            });
-            match opened {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    log::warn!("media: cannot open {path}: {e}");
-                    None
-                }
+            })();
+            if let Err(e) = &opened {
+                log::warn!("media: cannot open {path}: {e}");
             }
+            opened
         })
         .clone()
     }
@@ -797,7 +804,7 @@ impl Inner {
                 Ok(dynamic_to_image(frame, op))
             }
             Some(mt) => {
-                let src = self.source(path).ok_or_else(|| MediaError::Io(format!("{path}: cannot open")))?;
+                let src = self.source(path)?;
                 let vf = src.video_frame(FrameRequest::full(filmcraft_time::Tick(mt.0))).map_err(MediaError::from)?;
                 // A reduced-resolution render's frame, made at its size (a frame of the footage's
                 // own size only, as the renderer resamples only those).

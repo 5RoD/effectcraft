@@ -15,10 +15,13 @@ pub const DEFAULT_SEQUENCE_RATE: FrameRate = FrameRate::FPS_30;
 /// (`effectcraft_engine::sequence`) and probes their first frame here.
 pub fn probe(path: impl AsRef<Path>) -> Result<Footage> {
     let path = path.as_ref();
-    let bytes = std::fs::read(path).map_err(|e| MediaError::Io(format!("{}: {e}", path.display())))?;
+    if let Some(source) = crate::reader::open_container(path)? {
+        return Ok(footage_from_info(&path.to_string_lossy(), source.info()));
+    }
+    let bytes = crate::reader::read_bounded(path)?;
     if crate::MODEL_EXTENSIONS.contains(&ext_of(path).as_str()) {
         let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-        return probe_model(&path.to_string_lossy(), &bytes, &|uri| std::fs::read(dir.join(uri)).ok());
+        return probe_model(&path.to_string_lossy(), &bytes, &|uri| crate::reader::read_bounded(&dir.join(uri)).ok());
     }
     probe_bytes(&path.to_string_lossy(), bytes.into())
 }

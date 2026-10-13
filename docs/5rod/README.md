@@ -6,6 +6,13 @@ application and Desktop shortcut have not been removed or replaced.
 
 ## Changes in this milestone
 
+- Native containers use FilmCraft's streaming reader openers for metadata and sample reads,
+  retaining an index and file handle instead of the entire compressed recording. Formats without
+  a streaming opener have a checked 512 MiB per-file input budget. Source-opening errors retain
+  their context, and malformed accepted containers never retry through whole-file loading.
+  A local 114 GiB OBS Hybrid MP4 opened and decoded four full-resolution frames with observed
+  peak commitment below 440 MiB in a standalone check. This establishes large-file input
+  viability, not 120 fps timeline playback. See [streaming media](streaming-media.md).
 - The upstream 0.8.0 integration retains this fork's journal, branching history, native tools and
   theme alongside the newer camera/3D, color, docking, relinking and bounded frame-queue work.
   Those features still need representative footage and workflow acceptance before installation.
@@ -18,7 +25,8 @@ application and Desktop shortcut have not been removed or replaced.
   thread refusal falls back to foreground decoding. Checked disk cache geometry, lengths and
   decompression discard malformed entries before allocating. Preparation and persistence
   safety boundaries release failed jobs while keeping already published RAM frames.
-  These bounds need a new production playback comparison; they do not establish 120 fps.
+  The [production comparison](viewer-playback-admission.md) observes about twice the
+  uncached viewer texture cadence and lower process commitment, but still fails 120 fps.
 - A bounded viewer observer records the texture actually drawn and its requested frame key,
   separating repeated or stale textures from new frames, planned skips and discontinuities.
   Hidden viewers and discarded layout passes add no samples. Observing native textures adds
@@ -196,8 +204,11 @@ counter project, rendered its animated digits through the control API, and exite
 an isolated configuration folder. The integrated 0.8 production build now launches and plays
 generated 1440p/120 and 1440p/60 ordinary MP4 footage through the actual viewer. Uncached
 playback fails the target; cached playback approaches the requested rate only over a shortened
-49-frame loop. Full moving-footage acceptance remains open. See the
-[production viewer baseline](viewer-playback-baseline.md); [earlier performance results](performance.md)
+49-frame loop. Bounded admission subsequently improved uncached cadence to about 21–22
+texture changes/s and reduced memory, while remaining below the requested rates. Full
+moving-footage acceptance remains open. See the
+[production viewer comparison](viewer-playback-admission.md),
+[baseline](viewer-playback-baseline.md); [earlier performance results](performance.md)
 retain their original measured scope.
 
 The new journal also passed a separate Windows desktop test: simultaneous instances, forced

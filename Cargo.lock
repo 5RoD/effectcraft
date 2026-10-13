@@ -1433,6 +1433,8 @@ dependencies = [
  "filmcraft-codecs",
  "filmcraft-color",
  "filmcraft-frame",
+ "filmcraft-h264enc",
+ "filmcraft-isobmff",
  "filmcraft-media",
  "filmcraft-time",
  "gif",

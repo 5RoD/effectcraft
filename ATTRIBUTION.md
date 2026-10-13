@@ -61,6 +61,7 @@ Screenshots of EffectCraft itself, rendered headlessly, showing only procedurall
 - UI icons drawn in code: `crates/ui-egui/src/icons.rs`.
 - Procedural demo content (solids, shapes, gradients, text animations): `crates/engine/src/demo.rs`.
 - Procedural retiming benchmark shapes, texture and mattes: `crates/gpu/examples/timewarp_bench.rs`, original work for 5RoD under MIT OR Apache-2.0.
+- Procedural three-frame movie in `crates/media/src/reader.rs` tests: original flat-color YUV frames for streaming input regressions, created for 5RoD under MIT OR Apache-2.0; generated media stays local.
 - Built-in project templates (Lower Third, Title Card, Logo Reveal, Kinetic Type, Social Square, Vertical Story,
   Slideshow, 3D Text Orbit) built from engine commands, and their thumbnails rendered by our own renderer:
   `crates/engine/src/templates.rs`.

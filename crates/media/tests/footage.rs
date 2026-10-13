@@ -31,6 +31,10 @@ fn ffmpeg_fixture(name: &str, args: &[&str]) -> Option<PathBuf> {
         eprintln!("ffmpeg not found: skipping");
         return None;
     }
+    // Parallel tests share fixtures. Do not replace a file another test has already opened:
+    // streaming sources retain their handles, and Windows correctly refuses that rename.
+    static GENERATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _generate = GENERATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let out = fixtures().join(name);
     if out.exists() {
         return Some(out);
