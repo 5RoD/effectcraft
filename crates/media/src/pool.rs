@@ -193,6 +193,8 @@ struct Inner {
     done: Condvar,
     budget: AtomicU64,
     read_ahead: AtomicBool,
+    #[cfg(not(target_arch = "wasm32"))]
+    read_ahead_running: AtomicBool,
     hits: AtomicU64,
     misses: AtomicU64,
     prefetched: AtomicU64,
@@ -248,6 +250,17 @@ impl Drop for Inflight<'_> {
     }
 }
 
+/// Releases the single optional read-ahead worker, including on a decode unwind.
+#[cfg(not(target_arch = "wasm32"))]
+struct ReadAhead<'a>(&'a Inner);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for ReadAhead<'_> {
+    fn drop(&mut self) {
+        self.0.read_ahead_running.store(false, Ordering::Release);
+    }
+}
+
 impl MediaPool {
     /// A pool with the [`DEFAULT_BUDGET`] frame cache.
     pub fn new() -> Self {
@@ -266,6 +279,8 @@ impl MediaPool {
                 done: Condvar::new(),
                 budget: AtomicU64::new(bytes as u64),
                 read_ahead: AtomicBool::new(cfg!(not(target_arch = "wasm32"))),
+                #[cfg(not(target_arch = "wasm32"))]
+                read_ahead_running: AtomicBool::new(false),
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
                 prefetched: AtomicU64::new(0),
@@ -714,12 +729,39 @@ impl Inner {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn prefetch(self: &Arc<Self>, footage: &Footage, t: Tick, size: Option<(u32, u32)>) {
-        let (me, f) = (self.clone(), footage.clone());
-        self.prefetched.fetch_add(1, Ordering::Relaxed);
         // A plain thread, not a rayon job: the decode below parallelises with rayon itself.
-        std::thread::spawn(move || {
-            let _ = me.frame_at(&f, t, false, size);
-        });
+        // Optional read-ahead must not pile up threads or panic when the OS refuses one.
+        if let Err(error) = self.launch_read_ahead(|| {
+            let (me, f) = (self.clone(), footage.clone());
+            std::thread::Builder::new()
+                .name("ec-media-ahead".into())
+                .spawn(move || {
+                    let _guard = ReadAhead(&me);
+                    if let Err(error) = me.frame_at(&f, t, false, size) {
+                        log::warn!("media read-ahead failed: {error}; the frame will be retried on request");
+                    }
+                })
+                .map(|_| ())
+        }) {
+            log::warn!("media read-ahead worker unavailable: {error}; decoding on request");
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn launch_read_ahead(&self, spawn: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<bool> {
+        if self.read_ahead_running.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return Ok(false);
+        }
+        match spawn() {
+            Ok(()) => {
+                self.prefetched.fetch_add(1, Ordering::Relaxed);
+                Ok(true)
+            }
+            Err(error) => {
+                self.read_ahead_running.store(false, Ordering::Release);
+                Err(error)
+            }
+        }
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -864,6 +906,40 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn read_ahead_is_bounded_and_thread_refusal_keeps_foreground_frames_valid() {
+        let pool = MediaPool::new();
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([80, 120, 200, 255])).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        let bytes: Arc<[u8]> = bytes.into_inner().into();
+        let footage = crate::probe_bytes("ahead.png", bytes.clone()).unwrap();
+        pool.add_bytes("ahead.png", bytes);
+        let before = pool.frame_at(&footage, Tick::ZERO).unwrap();
+
+        // Inject the OS thread-creation failure without exhausting the machine's threads.
+        let refusal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.inner.launch_read_ahead(|| Err(std::io::Error::other("synthetic OS thread refusal")))
+        }));
+        assert!(refusal.unwrap().is_err());
+        assert!(!pool.inner.read_ahead_running.load(Ordering::Acquire));
+        assert_eq!(pool.stats().prefetched, 0, "failed launch is not counted as accepted work");
+        assert_eq!(pool.frame_at(&footage, Tick::ZERO).unwrap().data, before.data);
+
+        assert!(pool.inner.launch_read_ahead(|| Ok(())).unwrap());
+        assert!(!pool.inner.launch_read_ahead(|| panic!("another worker must not start")).unwrap());
+        assert_eq!(pool.stats().prefetched, 1);
+        drop(ReadAhead(&pool.inner));
+        assert!(pool.inner.launch_read_ahead(|| Ok(())).unwrap(), "completion releases the slot");
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ReadAhead(&pool.inner);
+            panic!("synthetic decode unwind");
+        }));
+        assert!(unwind.is_err());
+        assert!(!pool.inner.read_ahead_running.load(Ordering::Acquire), "unwind releases the slot");
+        assert_eq!(pool.frame_at(&footage, Tick::ZERO).unwrap().data, before.data);
+    }
 
     #[test]
     fn checked_media_distinguishes_missing_footage_from_a_failed_decode() {

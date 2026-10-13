@@ -13,6 +13,12 @@ application and Desktop shortcut have not been removed or replaced.
   Channel, exposure, region and nonidentity display-color conversions retain their existing
   processing. Cache planning includes every display mip and both RAM and GPU budgets, so
   Cache Before Playback cannot wait for a range larger than its GPU cache can retain.
+- Local previews admit one whole frame at a time, retaining parallel decode/conversion/effects
+  and viewer-first queue priority. Optional media read-ahead is limited to one worker per pool;
+  thread refusal falls back to foreground decoding. Checked disk cache geometry, lengths and
+  decompression discard malformed entries before allocating. Preparation and persistence
+  safety boundaries release failed jobs while keeping already published RAM frames.
+  These bounds need a new production playback comparison; they do not establish 120 fps.
 - A bounded viewer observer records the texture actually drawn and its requested frame key,
   separating repeated or stale textures from new frames, planned skips and discontinuities.
   Hidden viewers and discarded layout passes add no samples. Observing native textures adds
@@ -137,11 +143,21 @@ and the inherited [gap assessment](../gaps.md).
 ## Validation
 
 The complete repository gate is `cargo xtask ci`: formatting, clippy, workspace tests, dependency
-layering, licensed assets and WebAssembly checks. The Pixel Motion correctness increment passed
-on 2026-10-12 (local date): 3,017 tests passed, 27 explicitly optional tests were ignored, all 31 assets were attributed,
+layering, licensed assets and WebAssembly checks. The local preview/cache increment passed
+on 2026-10-12 (local date): 3,022 tests passed, 27 explicitly optional tests were ignored, all 31 assets were attributed,
 dependency layering passed, and 32 crates passed the WebAssembly check. Formatting and native
 clippy with warnings denied also passed. The WebAssembly check reports an inherited dead-code
 warning for the native shortcut-suspension state.
+
+The queue regression reproduced 16 simultaneous whole-frame renders before the admission bound;
+the revised queue completes all 60 requests with one active frame. A decoder panic while requests
+are waiting releases its slot, preserves the project, and lets the newest urgent frame run before
+background requests. A checksummed 53-byte layer-cache entry previously panicked with capacity
+overflow; its regression now returns a cache miss. Forged geometry/size prefixes, nonfinite layer
+metadata/channels and malformed compressed blocks are rejected, while finite HDR and signed-zero
+channels round-trip exactly. Invalid desktop entries are removed and rebuilt on a later render.
+The read-ahead regression injects thread refusal without exhausting operating-system resources,
+then checks foreground pixels, the single-worker limit, retry and unwind cleanup.
 
 Earlier integration checks corrected a duplicate shortcut, missing Japanese menu entries, an
 assumption about variable-font advances, and timing-dependent test expectations. The viewer GPU
@@ -177,8 +193,12 @@ the real UI with the original procedural demo and inspected after rendering. The
 was also inspected at 1680×1020 and 640×480; its action buttons remain visible while the fields scroll.
 The earlier 0.6-based production desktop executable launched on the RTX 3050 Vulkan device, reopened the
 counter project, rendered its animated digits through the control API, and exited cleanly using
-an isolated configuration folder. The integrated 0.8 build still needs a production build and
-moving-footage acceptance. [Performance results](performance.md) report the earlier measured scope.
+an isolated configuration folder. The integrated 0.8 production build now launches and plays
+generated 1440p/120 and 1440p/60 ordinary MP4 footage through the actual viewer. Uncached
+playback fails the target; cached playback approaches the requested rate only over a shortened
+49-frame loop. Full moving-footage acceptance remains open. See the
+[production viewer baseline](viewer-playback-baseline.md); [earlier performance results](performance.md)
+retain their original measured scope.
 
 The new journal also passed a separate Windows desktop test: simultaneous instances, forced
 termination, a real filesystem write failure and retry, Unicode content, exact project/history

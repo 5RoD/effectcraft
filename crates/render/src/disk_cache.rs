@@ -19,6 +19,7 @@
 //!   bounded queue (a full queue drops the write rather than stalling rendering).
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -29,6 +30,9 @@ use effectcraft_raster::Image;
 /// File format version (part of the folder layout).
 const VERSION: &str = "v1";
 const MAGIC: &[u8; 4] = b"ECDC";
+/// The largest supported f32 raster plus LZ4 overhead and the entry headers. Check disk
+/// lengths before reading and decoded geometry before allocating; cache bytes are untrusted.
+const MAX_ENTRY_BYTES: u64 = crate::raster_bounds::MAX_PIXELS * 16 * 101 / 100 + 64;
 /// Pending writes before new ones are dropped.
 #[cfg(not(target_arch = "wasm32"))]
 const QUEUE_LIMIT: usize = 64;
@@ -424,17 +428,16 @@ impl DiskCache {
         }
     }
 
-    fn read(&self, kind: Kind, key: u128) -> Option<Vec<u8>> {
+    fn read<T>(&self, kind: Kind, key: u128, decode: impl FnOnce(&[u8]) -> Option<T>) -> Option<T> {
         if !self.contains(kind, key) {
             self.misses.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         let path = self.path(kind, key);
-        let data = std::fs::read(&path).ok();
-        let ok = data.as_deref().and_then(|d| verify(d, kind));
+        let data = read_entry_file(&path);
+        let ok = data.as_ref().ok().and_then(|d| verify(d, kind)).and_then(decode);
         match ok {
-            Some(payload) => {
-                let payload = payload.to_vec();
+            Some(value) => {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 if let Ok(mut g) = self.index.lock() {
                     g.touch(kind, key);
@@ -443,12 +446,13 @@ impl DiskCache {
                 if let Ok(f) = std::fs::File::options().append(true).open(&path) {
                     let _ = f.set_modified(std::time::SystemTime::now());
                 }
-                Some(payload)
+                Some(value)
             }
             None => {
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 // Gone (another process evicted it) or damaged: forget it.
-                if data.is_some() {
+                if data.is_ok() || data.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::InvalidData) {
+                    log::warn!("discarding damaged {} cache entry {key:032x}; it will be rendered again", kind.dir());
                     let _ = std::fs::remove_file(&path);
                 }
                 self.forget(kind, key);
@@ -525,21 +529,19 @@ impl DiskCache {
     // ------------------------------------------------------------ typed entries
 
     pub fn get_frame(&self, key: u128) -> Option<Frame8> {
-        let p = self.read(Kind::Frame, key)?;
-        decode_frame(&p)
+        self.read(Kind::Frame, key, decode_frame)
     }
 
     /// Queue a frame for writing (8-bit premultiplied RGBA, `width * height * 4` bytes).
     pub fn put_frame(&self, key: u128, width: u32, height: u32, rgba: &[u8]) {
-        if self.contains(Kind::Frame, key) || rgba.len() != width as usize * height as usize * 4 {
+        if self.contains(Kind::Frame, key) || cache_pixels(width, height).and_then(|n| n.checked_mul(4)) != Some(rgba.len()) {
             return;
         }
         self.enqueue(Kind::Frame, key, encode_frame(width, height, rgba));
     }
 
     pub fn get_layer(&self, key: u128) -> Option<Buf> {
-        let p = self.read(Kind::Layer, key)?;
-        decode_layer(&p)
+        self.read(Kind::Layer, key, decode_layer)
     }
 
     /// Queue a layer buffer for writing.
@@ -652,13 +654,50 @@ pub fn parse_entry_name(name: &str) -> Option<u128> {
 
 /// Check magic, kind and checksum; returns the payload.
 fn verify(d: &[u8], kind: Kind) -> Option<&[u8]> {
-    if d.len() < 16 || &d[..4] != MAGIC || d[4] != kind.tag() {
+    if d.len() < 16 || d.len() as u64 > MAX_ENTRY_BYTES || d.get(..4)? != MAGIC || *d.get(4)? != kind.tag() {
         return None;
     }
-    let (body, sum) = d.split_at(d.len() - 8);
+    let end = d.len().checked_sub(8)?;
+    let body = d.get(..end)?;
+    let sum = d.get(end..)?;
     let mut s = [0u8; 8];
     s.copy_from_slice(sum);
-    (checksum(body) == u64::from_le_bytes(s)).then_some(&body[8..])
+    (checksum(body) == u64::from_le_bytes(s)).then_some(body.get(8..)?)
+}
+
+fn read_entry_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if !(16..=MAX_ENTRY_BYTES).contains(&len) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "disk cache entry exceeds the supported raster size"));
+    }
+    let len = usize::try_from(len).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "disk cache length exceeds the address space"))?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).map_err(|e| std::io::Error::other(format!("cannot allocate disk cache entry: {e}")))?;
+    bytes.resize(len, 0);
+    file.read_exact(&mut bytes)?;
+    if file.read(&mut [0; 1])? != 0 {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "disk cache entry changed size while reading"));
+    }
+    Ok(bytes)
+}
+
+fn cache_pixels(width: u32, height: u32) -> Option<usize> {
+    crate::raster_bounds::solid(width, height, 1.0).ok()?;
+    usize::try_from(width).ok()?.checked_mul(usize::try_from(height).ok()?)
+}
+
+/// A matching size prefix is required before reserving any decoded bytes. Decompress into
+/// that checked buffer so a forged prefix cannot ask the LZ4 reader to allocate gigabytes.
+fn decompress_exact(bytes: &[u8], expected: usize) -> Option<Vec<u8>> {
+    let size = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?);
+    if usize::try_from(size).ok()? != expected {
+        return None;
+    }
+    let mut decoded = Vec::new();
+    decoded.try_reserve_exact(expected).ok()?;
+    decoded.resize(expected, 0);
+    (lz4_flex::block::decompress_into(bytes.get(4..)?, &mut decoded).ok()? == expected).then_some(decoded)
 }
 
 fn encode_frame(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
@@ -670,13 +709,11 @@ fn encode_frame(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
 }
 
 fn decode_frame(p: &[u8]) -> Option<Frame8> {
-    if p.len() < 8 {
-        return None;
-    }
-    let w = u32::from_le_bytes(p[0..4].try_into().ok()?);
-    let h = u32::from_le_bytes(p[4..8].try_into().ok()?);
-    let rgba = lz4_flex::decompress_size_prepended(&p[8..]).ok()?;
-    (rgba.len() == w as usize * h as usize * 4).then_some(Frame8 { width: w, height: h, rgba })
+    let w = u32::from_le_bytes(p.get(..4)?.try_into().ok()?);
+    let h = u32::from_le_bytes(p.get(4..8)?.try_into().ok()?);
+    let bytes = cache_pixels(w, h)?.checked_mul(4)?;
+    let rgba = decompress_exact(p.get(8..)?, bytes)?;
+    Some(Frame8 { width: w, height: h, rgba })
 }
 
 fn encode_layer(b: &Buf) -> Vec<u8> {
@@ -703,27 +740,35 @@ fn encode_layer(b: &Buf) -> Vec<u8> {
 }
 
 fn decode_layer(p: &[u8]) -> Option<Buf> {
-    if p.len() < 32 {
-        return None;
-    }
-    let w = u32::from_le_bytes(p[0..4].try_into().ok()?);
-    let h = u32::from_le_bytes(p[4..8].try_into().ok()?);
-    let f = |i: usize| -> Option<f64> { Some(f64::from_le_bytes(p[i..i + 8].try_into().ok()?)) };
+    let w = u32::from_le_bytes(p.get(..4)?.try_into().ok()?);
+    let h = u32::from_le_bytes(p.get(4..8)?.try_into().ok()?);
+    let n = cache_pixels(w, h)?;
+    let f = |i: usize| -> Option<f64> { Some(f64::from_le_bytes(p.get(i..i.checked_add(8)?)?.try_into().ok()?)) };
     let offset = [f(8)?, f(16)?];
     let scale = f(24)?;
-    let planes = lz4_flex::decompress_size_prepended(&p[32..]).ok()?;
-    let n = w as usize * h as usize;
-    if planes.len() != n * 16 {
+    if offset.iter().any(|v| !v.is_finite() || v.abs() > crate::raster_bounds::MAX_ROI_OFFSET)
+        || !scale.is_finite()
+        || scale <= 0.0
+        || !(f64::from(w) / scale).is_finite()
+        || !(f64::from(h) / scale).is_finite()
+    {
         return None;
     }
-    let mut img = Image::new(w, h);
+    let planes = decompress_exact(p.get(32..)?, n.checked_mul(16)?)?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(n).ok()?;
+    data.resize(n, [0.0; 4]);
+    let mut img = Image { width: w, height: h, data };
     for (i, px) in img.data.iter_mut().enumerate() {
-        for c in 0..4 {
+        for (c, value) in px.iter_mut().enumerate() {
             let mut bytes = [0u8; 4];
             for (k, byte) in bytes.iter_mut().enumerate() {
-                *byte = planes[(k * 4 + c) * n + i];
+                *byte = *planes.get((k * 4 + c).checked_mul(n)?.checked_add(i)?)?;
             }
-            px[c] = f32::from_le_bytes(bytes);
+            *value = f32::from_le_bytes(bytes);
+            if !value.is_finite() {
+                return None;
+            }
         }
     }
     Some(Buf { img, offset, scale })
@@ -897,6 +942,123 @@ mod tests {
         assert_eq!(parse_entry_name(&entry_name(key)), Some(key));
         assert_eq!(parse_entry_name("abc.ecc"), None);
         assert_eq!(parse_entry_name(&format!("{key:032x}.tmp.1")), None);
+    }
+
+    #[test]
+    fn a_53_byte_layer_entry_cannot_overflow_image_capacity() {
+        let mut payload = Vec::new();
+        for dimension in [1u32 << 30; 2] {
+            payload.extend_from_slice(&dimension.to_le_bytes());
+        }
+        for value in [0.0f64, 0.0, 1.0] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        payload.extend_from_slice(&lz4_flex::compress_prepend_size(&[]));
+        let entry = seal(Kind::Layer, &payload);
+        assert_eq!(entry.len(), 53);
+        // Previously n * 16 wrapped to zero in release, then Image::new panicked trying
+        // to allocate 2^60 pixels. Debug builds panicked on the multiplication instead.
+        assert!(read_layer_entry(&entry).is_none());
+
+        let mut frame = Vec::new();
+        for dimension in [1u32 << 31; 2] {
+            frame.extend_from_slice(&dimension.to_le_bytes());
+        }
+        frame.extend_from_slice(&lz4_flex::compress_prepend_size(&[]));
+        assert!(read_frame_entry(&seal(Kind::Frame, &frame)).is_none());
+    }
+
+    #[test]
+    fn cache_readers_bound_geometry_prefixes_and_reject_nonfinite_layers() {
+        let original = buf(17, 3, 2);
+        let layer = encode_layer(&original);
+        let frame = encode_frame(3, 2, &[7; 24]);
+        for size in [[0, 1], [1, 0], [u32::MAX, 1], [1, u32::MAX], [8192, 8192]] {
+            for (kind, valid) in [(Kind::Layer, &layer), (Kind::Frame, &frame)] {
+                let mut payload = valid.clone();
+                payload[..4].copy_from_slice(&size[0].to_le_bytes());
+                payload[4..8].copy_from_slice(&size[1].to_le_bytes());
+                let entry = seal(kind, &payload);
+                assert!(match kind {
+                    Kind::Layer => read_layer_entry(&entry).is_none(),
+                    Kind::Frame => read_frame_entry(&entry).is_none(),
+                });
+            }
+        }
+        for (kind, valid, prefix) in [(Kind::Layer, &layer, 32), (Kind::Frame, &frame, 8)] {
+            for size in [0u32, 1, u32::MAX] {
+                let mut payload = valid.clone();
+                payload[prefix..prefix + 4].copy_from_slice(&size.to_le_bytes());
+                let entry = seal(kind, &payload);
+                assert!(match kind {
+                    Kind::Layer => read_layer_entry(&entry).is_none(),
+                    Kind::Frame => read_frame_entry(&entry).is_none(),
+                });
+            }
+            for end in 0..prefix + 4 {
+                let entry = seal(kind, &valid[..end]);
+                assert!(
+                    match kind {
+                        Kind::Layer => read_layer_entry(&entry).is_none(),
+                        Kind::Frame => read_frame_entry(&entry).is_none(),
+                    },
+                    "truncation at {end}"
+                );
+            }
+            let mut malformed = valid[..prefix + 4].to_vec();
+            malformed.push(0xff);
+            let entry = seal(kind, &malformed);
+            assert!(match kind {
+                Kind::Layer => read_layer_entry(&entry).is_none(),
+                Kind::Frame => read_frame_entry(&entry).is_none(),
+            });
+        }
+        for (at, value) in [(8, f64::NAN), (16, f64::INFINITY), (8, f64::MAX), (24, 0.0), (24, -1.0), (24, f64::NAN), (24, f64::from_bits(1))] {
+            let mut payload = layer.clone();
+            payload[at..at + 8].copy_from_slice(&value.to_le_bytes());
+            assert!(read_layer_entry(&seal(Kind::Layer, &payload)).is_none());
+        }
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut invalid = original.clone();
+            invalid.img.data[0][0] = bad;
+            assert!(read_layer_entry(&layer_entry(&invalid)).is_none());
+        }
+        let mut hdr = original;
+        hdr.img.data[0] = [f32::MAX, -37.25, -0.0, 1.0];
+        let back = read_layer_entry(&layer_entry(&hdr)).unwrap();
+        for (expected, actual) in hdr.img.data.iter().flatten().zip(back.img.data.iter().flatten()) {
+            assert_eq!(expected.to_bits(), actual.to_bits());
+        }
+    }
+
+    #[test]
+    fn a_checksummed_but_invalid_entry_is_a_miss_and_can_be_rebuilt() {
+        let dir = tmpdir("typed-damage");
+        let dc = DiskCache::open(&dir, 1 << 30).unwrap();
+        let b = buf(5, 2, 2);
+        dc.put_frame_now(1, 2, 2, &[9; 16]);
+        dc.put_layer_now(2, &b);
+        for (kind, key, mut payload) in [(Kind::Frame, 1, encode_frame(2, 2, &[9; 16])), (Kind::Layer, 2, encode_layer(&b))] {
+            payload[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+            let path = dc.path(kind, key);
+            std::fs::write(&path, seal(kind, &payload)).unwrap();
+            match kind {
+                Kind::Frame => assert!(dc.get_frame(key).is_none()),
+                Kind::Layer => assert!(dc.get_layer(key).is_none()),
+            }
+            assert!(!dc.contains(kind, key));
+            assert!(!path.exists());
+        }
+        assert_eq!((dc.stats().hits, dc.stats().misses), (0, 2));
+        dc.put_frame(1, 2, 2, &[9; 16]);
+        dc.put_layer(2, &b);
+        dc.flush();
+        assert_eq!(dc.get_frame(1).unwrap().rgba, vec![9; 16]);
+        assert_eq!(dc.get_layer(2).unwrap().img, b.img);
+        assert_eq!((dc.stats().hits, dc.stats().misses), (2, 2));
+        dc.clear();
+        drop(dc);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

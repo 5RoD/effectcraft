@@ -190,6 +190,10 @@ Frames at other times or with other render options are never substituted. Obsole
 are dropped; running jobs finish into the cache. When the budget (Settings ▸ Memory & CPU) is
 full the least recently shown frames go first. The timeline's green bar counts cached frames
 of the current content and viewer settings.
+On the desktop one whole frame is admitted at a time; its decode, pixel conversion and effects
+still use the Rayon pool in parallel. Waiting requests retain viewer-first priority. A scoped
+admission guard releases even on unwind, and preparation/render failures release the queued
+key with a visible error. Optional disk persistence keeps a published RAM frame on failure.
 Resolution Auto renders the pixels the magnification needs, as in After Effects (Full above
 50 %, Half down to 33.3 %, Third down to 25 %, then Quarter). Below 100 % the viewer averages
 instead of skipping pixels (Viewer Zoom Quality More Accurate): GPU frames carry a mip chain
@@ -205,6 +209,11 @@ survive restarts and never go stale. LRU eviction keeps it under the size limit;
 empties it, `cache.diskStats` reports it, and the timeline draws disk-only frames in blue. In the
 browser the frames live in the Origin Private File System: frame workers write them, the page
 keeps the index (`DiskIndex`) and reads hits ([web.md](web.md#disk-cache)).
+Entry file lengths and raster dimensions are bounded before allocating. The compressed size
+prefix must match the checked pixel byte count, and decompression writes into that exact,
+fallibly allocated buffer. Invalid layer coordinates, scale or nonfinite channels are misses.
+Damaged desktop entries are removed from the index and disk so later renders can rebuild them;
+checksummed but invalid payloads count as misses too.
 
 **Deferred readbacks** (`effectcraft-gpu` `deferred`): where a readback can't be waited for (WebGPU
 in a browser worker) a frame renders in passes. `Accelerator::frame_begin` / `pass_begin` /

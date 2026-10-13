@@ -378,6 +378,8 @@ pub struct Frames {
     inflight: Arc<Mutex<HashSet<FrameKey>>>,
     /// Pending jobs, picked by priority when a pool thread frees up (the viewer's frame first).
     queue: Arc<Mutex<Queue>>,
+    /// One local whole-frame render; its decode/conversion/effects still use every pool worker.
+    active_frame: Arc<AtomicBool>,
     #[cfg(not(target_arch = "wasm32"))]
     /// None if the OS refused the threads: jobs then go to rayon's global pool.
     pool: Option<rayon::ThreadPool>,
@@ -408,6 +410,7 @@ impl Default for Frames {
             cache: Arc::new(Mutex::new(Cache { map: HashMap::new(), order: VecDeque::new(), bytes: 0, gpu_bytes: 0, budget: 3 << 30, gpu_budget: GPU_BUDGET })),
             inflight: Arc::new(Mutex::new(HashSet::new())),
             queue: Arc::new(Mutex::new(Queue::default())),
+            active_frame: Arc::default(),
             #[cfg(not(target_arch = "wasm32"))]
             // A panicking job would abort the whole process (rayon's default for `spawn`): log it
             // and lose only that frame (the panic hook has logged the message).
@@ -534,7 +537,8 @@ impl Frames {
         }
     }
 
-    /// Actual native frame-worker capacity, including the OS fallback pool.
+    /// Native parallel-loop workers, including the OS fallback pool. A whole frame uses
+    /// these workers together; their count is not a simultaneous-frame limit.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn parallelism(&self) -> usize {
         self.pool.as_ref().map_or_else(rayon::current_num_threads, rayon::ThreadPool::current_num_threads)
@@ -833,6 +837,7 @@ impl Frames {
     fn worker(&self) -> Worker {
         Worker {
             queue: self.queue.clone(),
+            active_frame: self.active_frame.clone(),
             cache: self.cache.clone(),
             inflight: self.inflight.clone(),
             ctx: self.ctx.clone(),
@@ -965,6 +970,7 @@ impl Frames {
 /// Renders queued jobs (on a pool thread, or the UI thread on wasm32).
 struct Worker {
     queue: Arc<Mutex<Queue>>,
+    active_frame: Arc<AtomicBool>,
     cache: Arc<Mutex<Cache>>,
     inflight: Arc<Mutex<HashSet<FrameKey>>>,
     ctx: Option<egui::Context>,
@@ -972,6 +978,15 @@ struct Worker {
     content_keys: ContentKeys,
     gpu_retired: Arc<AtomicBool>,
     failures: Arc<Mutex<VecDeque<(FrameKey, String)>>>,
+}
+
+/// Release the admission slot even if an unexpected panic escapes a frame's safety boundary.
+struct ActiveFrame<'a>(&'a AtomicBool);
+
+impl Drop for ActiveFrame<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -999,7 +1014,8 @@ impl Worker {
     /// on top of the one waiting, with all of its buffers. Dragging a layer asks for a new frame
     /// every UI frame, so renders piled up on every thread until memory ran out (#647). A spawn
     /// that lands inside a render returns at once instead; the render below it takes the queued
-    /// jobs when it is done, so each thread renders one frame at a time.
+    /// jobs when it is done. A shared admission slot also prevents other threads from starting
+    /// whole frames while the active frame's decode/conversion/effects use those workers.
     #[cfg(not(target_arch = "wasm32"))]
     fn drain(&self) {
         if DRAINING.get() {
@@ -1010,39 +1026,68 @@ impl Worker {
         while self.run_next() {}
     }
 
-    /// Render the queued job that matters most right now. `false` when the queue was empty.
+    /// Render the queued job that matters most right now. `false` when empty or already busy.
     fn run_next(&self) -> bool {
         let Worker { queue, content_keys, .. } = self;
-        let job = {
+        let (job, _active) = {
             let Ok(mut q) = queue.lock() else { return false };
             let Some(i) = Queue::best(&q.jobs) else { return false };
+            // Acquire while the queue is locked and nonempty: otherwise a request could
+            // arrive after an empty check, see a busy slot, and be left without a drain.
+            if self.active_frame.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                return false;
+            }
+            let active = ActiveFrame(&self.active_frame);
             let job = q.jobs.swap_remove(i);
             q.running.insert(job.key);
             if job.urgent {
                 q.urgent_running += 1;
             }
-            job
+            (job, active)
         };
         let t0 = web_time::Instant::now();
-        let disk = job.src.disk.as_ref().map(|dc| (dc.clone(), frame_disk_key(content_keys, &job.src.project, &job.key, opts_hash(&job.opts))));
-        let from_disk = disk.as_ref().and_then(|(dc, k)| dc.get_frame(*k));
-        let disk_hit = from_disk.is_some();
-        let ci = match from_disk {
-            Some(f) => FrameImage::Cpu(Arc::new(egui::ColorImage::from_rgba_premultiplied([f.width as usize, f.height as usize], &f.rgba))),
-            None => match self.render_guarded(&job) {
-                Ok(ci) => ci,
-                Err(error) => {
-                    self.fail(job.key, job.urgent, error);
-                    return true;
-                }
-            },
+        // Cache reads, key preparation and conversion need the same last-resort boundary as
+        // rendering. A bad cache cannot strand this job or block every later viewer request.
+        let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, String> {
+            let disk = job.src.disk.as_ref().map(|dc| (dc.clone(), frame_disk_key(content_keys, &job.src.project, &job.key, opts_hash(&job.opts))));
+            let from_disk = disk.as_ref().and_then(|(dc, k)| dc.get_frame(*k));
+            let disk_hit = from_disk.is_some();
+            let ci = match from_disk {
+                Some(f) => FrameImage::Cpu(Arc::new(egui::ColorImage::from_rgba_premultiplied([f.width as usize, f.height as usize], &f.rgba))),
+                None => self.render_guarded(&job)?,
+            };
+            // Wake the viewer before optional cache conversion/compression. The admission
+            // slot stays held until that work ends, bounding whole-frame live storage too.
+            self.finish(&job, ci.clone(), t0);
+            Ok((ci, disk.filter(|_| !disk_hit)))
+        }));
+        let (ci, disk) = match prepared {
+            Ok(Ok(prepared)) => prepared,
+            Ok(Err(error)) => {
+                self.fail(job.key, job.urgent, error);
+                return true;
+            }
+            Err(_) => {
+                self.fail(job.key, job.urgent, "Preparing the preview failed unexpectedly; purge the disk cache or retry this frame".into());
+                return true;
+            }
         };
-        // Publish the shared frame and wake the viewer before optional RGBA conversion
-        // and compression. Persistence still runs on this worker, using the same snapshot.
-        self.finish(&job, ci.clone(), t0);
-        if !disk_hit && let (Some((dc, k)), FrameImage::Cpu(img)) = (&disk, &ci) {
-            let rgba: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
-            dc.put_frame(*k, img.size[0] as u32, img.size[1] as u32, &rgba);
+        if let (Some((dc, k)), FrameImage::Cpu(img)) = (&disk, &ci) {
+            let persisted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), String> {
+                let bytes = img.pixels.len().checked_mul(4).ok_or("disk frame byte count overflow")?;
+                let mut rgba = Vec::new();
+                rgba.try_reserve_exact(bytes).map_err(|e| format!("cannot allocate disk frame: {e}"))?;
+                for pixel in &img.pixels {
+                    rgba.extend_from_slice(&pixel.to_array());
+                }
+                dc.put_frame(*k, img.size[0] as u32, img.size[1] as u32, &rgba);
+                Ok(())
+            }));
+            match persisted {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => log::warn!("preview frame {} remains in RAM; disk cache write skipped: {e}", job.key.frame),
+                Err(_) => log::warn!("preview frame {} remains in RAM; disk cache write failed unexpectedly", job.key.frame),
+            }
             if let Some(ctx) = &self.ctx {
                 ctx.request_repaint();
             }
@@ -1083,11 +1128,11 @@ impl Worker {
         if let Ok(mut inf) = self.inflight.lock() {
             inf.remove(&key);
         }
-        if let Ok(mut q) = self.queue.lock() {
-            q.running.remove(&key);
-            if urgent {
-                q.urgent_running = q.urgent_running.saturating_sub(1);
-            }
+        if let Ok(mut q) = self.queue.lock()
+            && q.running.remove(&key)
+            && urgent
+        {
+            q.urgent_running = q.urgent_running.saturating_sub(1);
         }
         if let Some(ctx) = &self.ctx {
             ctx.request_repaint();
@@ -1747,7 +1792,7 @@ mod tests {
     }
 
     #[test]
-    fn a_waiting_render_never_starts_another_on_its_thread() {
+    fn a_waiting_render_never_piles_up_another_frame() {
         use effectcraft_engine::Session;
         use effectcraft_engine::project::{Footage, FootageKind};
         use effectcraft_engine::render::Image;
@@ -1764,6 +1809,8 @@ mod tests {
         struct Parallel {
             calls: AtomicUsize,
             deepest: AtomicUsize,
+            active: AtomicUsize,
+            peak_active: AtomicUsize,
         }
         impl FootageSource for Parallel {
             fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<Image>> {
@@ -1771,7 +1818,10 @@ mod tests {
                 DEPTH.set(d);
                 self.deepest.fetch_max(d, Ordering::SeqCst);
                 self.calls.fetch_add(1, Ordering::SeqCst);
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak_active.fetch_max(active, Ordering::SeqCst);
                 (0..64).into_par_iter().for_each(|_| std::thread::sleep(std::time::Duration::from_millis(1)));
+                self.active.fetch_sub(1, Ordering::SeqCst);
                 DEPTH.set(d - 1);
                 Some(Arc::new(Image::new(4, 4)))
             }
@@ -1815,6 +1865,104 @@ mod tests {
         assert_eq!(f.inflight(), 0, "every queued frame rendered");
         assert!(footage.calls.load(Ordering::SeqCst) >= frames as usize);
         assert_eq!(footage.deepest.load(Ordering::SeqCst), 1, "renders nested on a waiting thread");
+        assert_eq!(footage.peak_active.load(Ordering::SeqCst), 1, "whole frames competed for the same workers and decoder");
+    }
+
+    #[test]
+    fn a_failed_active_frame_releases_the_slot_and_the_newest_viewer_request_wins() {
+        use effectcraft_engine::Session;
+        use effectcraft_engine::project::{Footage, FootageKind};
+        use effectcraft_engine::render::Image;
+        use effectcraft_engine::time::FrameRate;
+        use serde_json::json;
+        use std::sync::mpsc;
+
+        struct PausedFirst {
+            first: AtomicBool,
+            started: mpsc::Sender<()>,
+            resume: Mutex<mpsc::Receiver<()>>,
+            calls: Mutex<Vec<Tick>>,
+        }
+        impl FootageSource for PausedFirst {
+            fn frame(&self, _: ItemId, _: &Footage, t: Tick) -> Option<Arc<Image>> {
+                self.calls.lock().unwrap().push(t);
+                if self.first.swap(false, Ordering::AcqRel) {
+                    self.started.send(()).unwrap();
+                    self.resume.lock().unwrap().recv().unwrap();
+                    panic!("synthetic decoder panic after other requests were queued");
+                }
+                Some(Arc::new(Image::new(4, 4)))
+            }
+        }
+        let mut session = Session::default();
+        let cid = ItemId(session.execute("comp.new", json!({"width": 8, "height": 8, "duration": 10})).unwrap()["comp"].as_u64().unwrap());
+        let footage = Footage {
+            kind: FootageKind::Video,
+            width: 4,
+            height: 4,
+            has_video: true,
+            frame_rate: FrameRate::FPS_30,
+            duration: Tick::from_seconds_f64(10.0),
+            ..Default::default()
+        };
+        let item = Arc::make_mut(&mut session.project).add_item("synthetic clip", Default::default(), None, ItemKind::Footage(footage));
+        session.execute("layer.addItem", json!({"item": item.0})).unwrap();
+        let original = serde_json::to_vec(&session.project).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let footage = Arc::new(PausedFirst { first: AtomicBool::new(true), started: started_tx, resume: Mutex::new(resume_rx), calls: Mutex::default() });
+        let source = RenderSource {
+            project: session.project.clone(),
+            footage: footage.clone(),
+            expr: None,
+            layer_cache: Arc::default(),
+            gpu: None,
+            gpu_display: false,
+            disk: None,
+        };
+        // Requests stay queued so the active render and priority handoff are deterministic.
+        let frames = Frames { remote: Some(Arc::new(ParkedRemote)), ..Default::default() };
+        let frame_key = |frame| FrameKey { comp: cid.0, ..key(1, frame, 0) };
+        let request = |frame, urgent| frames.request_with(&source, frame_key(frame), cid, FrameRate::FPS_30.tick_of(frame), RenderOpts::default(), urgent);
+        request(0, true);
+        let worker = frames.worker();
+        std::thread::scope(|scope| {
+            let active = scope.spawn(|| worker.run_next());
+            let started = started_rx.recv_timeout(std::time::Duration::from_secs(10));
+            request(1, false);
+            request(2, false);
+            request(10, true);
+            request(11, true);
+            let second_started = started.is_ok() && frames.worker().run_next();
+            let calls = footage.calls.lock().unwrap().clone();
+            resume_tx.send(()).unwrap();
+            let completed = active.join();
+            started.unwrap();
+            assert!(!second_started, "no second whole frame while the decoder is active");
+            assert_eq!(calls.as_slice(), &[Tick::ZERO]);
+            assert!(completed.unwrap());
+        });
+        assert!(frames.failure(&frame_key(0)).is_some());
+        assert!(!frames.is_cached(&frame_key(0)));
+        assert!(!frames.active_frame.load(Ordering::Acquire));
+        assert!(frames.queue.lock().unwrap().running.is_empty());
+        for expected in [11, 1, 2] {
+            assert!(worker.run_next());
+            assert!(frames.is_cached(&frame_key(expected)));
+            assert_eq!(*footage.calls.lock().unwrap().last().unwrap(), FrameRate::FPS_30.tick_of(expected));
+        }
+        assert!(!worker.run_next());
+        assert_eq!(frames.inflight(), 0);
+        assert!(!frames.urgent_pending());
+        assert!(!frames.is_cached(&frame_key(10)), "superseded urgent frame was dropped");
+        assert_eq!(serde_json::to_vec(&session.project).unwrap(), original);
+        let escaped = std::panic::catch_unwind(|| {
+            frames.active_frame.store(true, Ordering::Release);
+            let _active = ActiveFrame(&frames.active_frame);
+            panic!("synthetic escaped worker panic");
+        });
+        assert!(escaped.is_err());
+        assert!(!frames.active_frame.load(Ordering::Acquire));
     }
 
     #[test]
