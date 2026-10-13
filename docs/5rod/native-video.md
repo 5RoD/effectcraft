@@ -26,15 +26,25 @@ This is a payload calculation, not a measured playback speed gain.
 The initial path deliberately declines masks, enabled effects, active layer styles, source
 motion-blur sampling, frame blending, fields, proxies, reduced-source resampling, inverted
 alpha, linear-light interpretation, non-identity source color management and other decoded
-formats. Source, interpreted and composition rates must match, with normal time stretch and
-no time-remap property. Those other cases retain the existing cached source path. Unsupported shader/device limits
+formats. Normal time stretch and no time-remap property are required. Those other cases retain
+the existing cached source path. Unsupported shader/device limits
 also retain that path. Failed source decoding records a media diagnostic; it does not publish
 a substitute as a successfully decoded frame. The optional shader can fail to compile without
 disabling the ordinary GPU compositor.
 
-Native planes are transient shared references; this change adds no retained frame cache or
-read-ahead worker. The decoder still owns its normal source/session caching. Purge, Reload
-Footage and cache budgets retain their existing meanings.
+Decoded raw frames and interpreted float images share MediaPool's existing byte-budgeted LRU
+and inflight-request policy. Raw identity uses the file path and exact native request Tick,
+independently of alpha interpretation or reduced output size. CPU conversion and compact GPU
+reads use the same raw-frame helper; unsupported native formats can fall back without decoding
+the frame twice. Raw geometry, planes and float values are validated before caching, and raw
+buffer sizes use checked arithmetic and the per-image byte limit. Errors do not enter the cache.
+
+This adds no cache budget or read-ahead worker. As before, the newest cached entry can remain
+when it exceeds the selected budget; other entries are evicted in access order. Purge clears
+both representations, and Reload Footage removes both for the changed path. Decoder-owned
+buffers and outstanding shared references remain outside the LRU's retention control.
+Reads already in flight during Purge or Reload cannot repopulate the invalidated cache; a
+retained identity token also protects converted image entries against that race.
 
 ## Validation and diagnostics
 
@@ -50,7 +60,9 @@ Its CPU upload timer includes packing, resource allocation and enqueueing, but e
 DMA completion and conversion/compositing execution. Parameter/uniform uploads remain outside
 these frame-payload counters. `ui.decoder.stats` source-call timers still include decoder
 work; native GPU conversion does not increment the CPU conversion timer. Take snapshots
-outside the observation window.
+outside the observation window. Source-call timers count actual decoder API calls, excluding
+EffectCraft's raw-cache hits. The cache also resets its ephemeral contents safely if its
+eviction stamp counter reaches its limit; a synthetic rollover regression verifies this.
 
 Production playback and real-source pixel acceptance must be measured separately. Synthetic
 comparisons alone do not establish sustained 120 fps, monitor presentation, heavy edit
@@ -85,5 +97,7 @@ A separate 120 fps source in a 60 fps composition exposed a regression before in
 the initial native path observed 6.11 fps versus 20.97 fps on the previous build. Native
 source calls averaged 85.96 ms, with 6,693 hardware-frame decodes for 323 calls, versus
 7.39 ms and 1,266 hardware frames for 634 calls on the cached reference path. This motivated
-the explicit rate/stretch/remap fallback guard above. Native-frame caching and request
-ordering need implementation and measurement before relaxing that guard.
+an explicit rate/stretch/remap fallback guard in `23317297`. The shared raw-frame cache now
+addresses repeated native reads within the existing budget, and the rate restrictions have
+been removed for validation. Stretch/remap still fall back. The new cached path requires
+separate production measurements before its mixed-rate performance can be accepted.

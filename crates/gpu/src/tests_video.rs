@@ -183,7 +183,7 @@ fn native_video_preserves_transforms_opacity_and_linear_blending() {
 #[test]
 fn native_video_defers_fields_colour_management_and_reduced_resolution() {
     let Some(g) = gpu() else { return };
-    for case in 0..6 {
+    for case in 0..4 {
         let mut s = scene(BitDepth::Bpc32);
         let mut opts = RenderOpts::default();
         match case {
@@ -199,15 +199,7 @@ fn native_video_defers_fields_colour_management_and_reduced_resolution() {
                 s.p.settings.linearize = true;
             }
             2 => opts.scale = 0.5,
-            3 => s.p.comp_mut(s.cid).unwrap().frame_rate = effectcraft_time::FrameRate::FPS_60,
-            4 => s.p.comp_mut(s.cid).unwrap().layers[0].stretch = 200.0,
-            _ => {
-                for item in s.p.items.values_mut() {
-                    if let ItemKind::Footage(f) = &mut item.kind {
-                        f.native_rate = Some(effectcraft_time::FrameRate::FPS_60);
-                    }
-                }
-            }
+            _ => s.p.comp_mut(s.cid).unwrap().layers[0].stretch = 200.0,
         }
         let source = Source { raw_calls: AtomicUsize::new(0), image_calls: AtomicUsize::new(0), fail: false };
         let renderer = Renderer::new(&s.p, &source, opts);
@@ -215,5 +207,32 @@ fn native_video_defers_fields_colour_management_and_reduced_resolution() {
         let actual = g.render(&renderer, s.cid, Tick::ZERO).unwrap();
         assert_eq!(source.raw_calls.load(Ordering::Relaxed), 0, "case {case} must retain ordinary source semantics");
         assert_eq!(diff(&cpu, &actual, 1e-3).over, 0, "fallback case {case}");
+    }
+}
+
+#[test]
+fn native_video_supports_differing_composition_and_interpreted_rates() {
+    let Some(g) = gpu() else { return };
+    for case in 0..2 {
+        let mut s = scene(BitDepth::Bpc32);
+        if case == 0 {
+            s.p.comp_mut(s.cid).unwrap().frame_rate = effectcraft_time::FrameRate::FPS_60;
+        } else {
+            for item in s.p.items.values_mut() {
+                if let ItemKind::Footage(f) = &mut item.kind {
+                    f.native_rate = Some(effectcraft_time::FrameRate::FPS_60);
+                }
+            }
+        }
+        let source = Source { raw_calls: AtomicUsize::new(0), image_calls: AtomicUsize::new(0), fail: false };
+        let renderer = Renderer::new(&s.p, &source, RenderOpts::default());
+        for t in [Tick::ZERO, Tick::from_seconds_f64(0.5), Tick::ZERO] {
+            let cpu = renderer.comp_frame_cpu(s.cid, t);
+            let before = source.image_calls.load(Ordering::Relaxed);
+            let actual = g.render(&renderer, s.cid, t).unwrap();
+            assert_eq!(source.image_calls.load(Ordering::Relaxed), before);
+            assert_eq!(diff(&cpu, &actual, 2e-6).over, 0);
+        }
+        assert_eq!(source.raw_calls.load(Ordering::Relaxed), 3);
     }
 }

@@ -481,12 +481,15 @@ fn cache_budget_evicts() {
     let Some(p) = vp9_webm() else { return };
     let f = probe(&p).expect("probe");
     let frame_bytes = 640 * 360 * 16;
-    let pool = MediaPool::with_budget(3 * frame_bytes + 1024);
+    let budget = 3 * frame_bytes + 1024;
+    let pool = MediaPool::with_budget(budget);
     for n in 0..10 {
         pool.frame_at(&f, t_of(f.frame_rate, n)).expect("frame");
     }
     let st = pool.stats();
-    assert!(st.frames <= 3 && st.bytes <= 3 * frame_bytes + 1024, "{st:?}");
+    // Compact raw planes share this budget with float images; the entry count can exceed
+    // three without retaining more memory. The byte limit remains the eviction contract.
+    assert!(st.frames > 0 && st.bytes <= budget, "{st:?}");
     pool.set_budget(0);
     assert_eq!(pool.stats().frames, 1);
 }

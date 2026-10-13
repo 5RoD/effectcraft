@@ -33,7 +33,7 @@ fn plane_row<T>(plane: &[T], row: usize, width: usize) -> Result<&[T]> {
     plane.get(start..end).ok_or_else(|| MediaError::Decode("truncated frame plane".into()))
 }
 
-fn validate_frame(f: &VideoFrame) -> Result<usize> {
+pub(crate) fn validate_frame(f: &VideoFrame) -> Result<usize> {
     let len = frame_pixel_count(f.width, f.height)?;
     let channels = len.checked_mul(4).ok_or_else(|| MediaError::Decode("frame channel count overflow".into()))?;
     let short = || MediaError::Decode("truncated decoded frame buffer".into());

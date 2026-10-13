@@ -8,6 +8,7 @@ use effectcraft_project::{AlphaMode, Footage, FootageKind, ItemId};
 use effectcraft_raster::{Image, Px};
 use effectcraft_render::FootageSource;
 use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
+use filmcraft_frame::{PixelData, VideoFrame};
 use filmcraft_media::{FrameRequest, SharedSource};
 
 use crate::convert::{AlphaOp, dynamic_to_image, frame_pixel_count, frame_to_image_in, frame_to_image_scaled};
@@ -44,12 +45,20 @@ struct Key {
     matte: [u32; 3],
     /// A movie frame made at this size for a reduced-resolution render ((0, 0): as decoded).
     size: (u32, u32),
+    /// Raw decoder frames are keyed by native request Tick and shared across interpretations.
+    native: bool,
 }
 
 struct Entry {
-    img: Arc<Image>,
+    data: CachedFrame,
     stamp: u64,
     bytes: usize,
+}
+
+#[derive(Clone)]
+enum CachedFrame {
+    Image(Arc<Image>),
+    Video(Arc<VideoFrame>),
 }
 
 /// Conformed audio files written by builds before this version are ignored (and written again):
@@ -97,29 +106,55 @@ struct Lru {
 }
 
 impl Lru {
-    fn get(&mut self, k: &Key) -> Option<Arc<Image>> {
+    fn next_stamp(&mut self) -> u64 {
+        if self.clock == u64::MAX {
+            // Cache eviction is harmless; wrapping stamps would alias the eviction order.
+            self.map.clear();
+            self.order.clear();
+            self.bytes = 0;
+            self.clock = 0;
+        }
+        self.clock = self.clock.saturating_add(1);
+        self.clock
+    }
+    fn cached(&mut self, k: &Key) -> Option<CachedFrame> {
+        let stamp = self.next_stamp();
         let e = self.map.get_mut(k)?;
         self.order.remove(&e.stamp);
-        self.clock += 1;
-        e.stamp = self.clock;
+        e.stamp = stamp;
         self.order.insert(e.stamp, k.clone());
-        Some(e.img.clone())
+        Some(e.data.clone())
+    }
+    fn get(&mut self, k: &Key) -> Option<Arc<Image>> {
+        match self.cached(k)? {
+            CachedFrame::Image(img) => Some(img),
+            CachedFrame::Video(_) => None,
+        }
+    }
+    fn video(&mut self, k: &Key) -> Option<Arc<VideoFrame>> {
+        match self.cached(k)? {
+            CachedFrame::Video(frame) => Some(frame),
+            CachedFrame::Image(_) => None,
+        }
     }
     fn insert(&mut self, k: Key, img: Arc<Image>, budget: usize) {
-        let bytes = img.data.len() * std::mem::size_of::<Px>() + 64;
-        self.clock += 1;
-        if let Some(old) = self.map.insert(k.clone(), Entry { img, stamp: self.clock, bytes }) {
+        let bytes = img.data.len().saturating_mul(std::mem::size_of::<Px>()).saturating_add(64);
+        self.store(k, CachedFrame::Image(img), bytes, budget);
+    }
+    fn store(&mut self, k: Key, data: CachedFrame, bytes: usize, budget: usize) {
+        let stamp = self.next_stamp();
+        if let Some(old) = self.map.insert(k.clone(), Entry { data, stamp, bytes }) {
             self.order.remove(&old.stamp);
-            self.bytes -= old.bytes;
+            self.bytes = self.bytes.saturating_sub(old.bytes);
         }
         self.order.insert(self.clock, k);
-        self.bytes += bytes;
+        self.bytes = self.bytes.saturating_add(bytes);
         self.evict(budget);
     }
     fn remove(&mut self, k: &Key) {
         if let Some(e) = self.map.remove(k) {
             self.order.remove(&e.stamp);
-            self.bytes -= e.bytes;
+            self.bytes = self.bytes.saturating_sub(e.bytes);
         }
     }
     /// Evict least-recently-used frames until within `budget` (the newest frame always stays).
@@ -127,9 +162,10 @@ impl Lru {
         while self.bytes > budget && self.map.len() > 1 {
             let Some((_, k)) = self.order.pop_first() else { break };
             if let Some(e) = self.map.remove(&k) {
-                self.bytes -= e.bytes;
+                self.bytes = self.bytes.saturating_sub(e.bytes);
                 if self.spare.len() < MAX_SPARE
-                    && let Ok(img) = Arc::try_unwrap(e.img)
+                    && let CachedFrame::Image(img) = e.data
+                    && let Ok(img) = Arc::try_unwrap(img)
                 {
                     self.spare.push(img.data);
                 }
@@ -148,14 +184,15 @@ impl Lru {
 /// Cache counters (see [`MediaPool::stats`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PoolStats {
-    /// Requests answered from the frame cache.
+    /// Interpreted frame requests answered from the image cache.
     pub hits: u64,
-    /// Requests that had to decode (or wait for a read-ahead decode).
+    /// Interpreted frame requests that had to read/convert (or wait for read-ahead).
     pub misses: u64,
     /// Frames decoded ahead of sequential playback.
     pub prefetched: u64,
-    /// Frames currently cached and their total size in bytes.
+    /// Raw and interpreted frame entries currently cached (one time can have both).
     pub frames: usize,
+    /// Total retained entry size, including raw planes and interpreted pixels.
     pub bytes: usize,
     /// Movie and audio files opened (each path once, however many callers ask for it at once).
     pub opened: u64,
@@ -164,6 +201,9 @@ pub struct PoolStats {
 #[derive(Default)]
 struct CacheState {
     lru: Lru,
+    /// A retained token prevents an old import/reload/purge read from repopulating the cache.
+    /// Identity cannot wrap or alias while a reader retains the old token.
+    epoch: Arc<()>,
     /// Frames being decoded right now (requests for them wait instead of decoding again).
     inflight: HashSet<Key>,
     /// Last frame index requested per movie (sequential-playback detection).
@@ -325,6 +365,7 @@ impl MediaPool {
     pub fn clear_frames(&self) {
         let mut c = lock(&self.inner.cache);
         c.lru = Lru::default();
+        c.epoch = Arc::new(());
         c.last.clear();
         drop(c);
         // Decoded GIFs sit outside the frame budget; Purge frees them too.
@@ -343,6 +384,7 @@ impl MediaPool {
         lock(&self.inner.models).remove(path);
         lock(&self.inner.gifs).remove(path);
         let mut c = lock(&self.inner.cache);
+        c.epoch = Arc::new(());
         let keys: Vec<Key> = c.lru.map.keys().filter(|k| &*k.path == path).cloned().collect();
         for k in keys {
             c.lru.remove(&k);
@@ -652,7 +694,7 @@ impl Inner {
         };
         let interp = alpha | (u8::from(footage.preserve_rgb) << 2);
         let matte = if footage.alpha == AlphaMode::Premultiplied { footage.premul_color.map(f32::to_bits) } else { [0; 3] };
-        let key = |path: &str, frame| Key { path: path.into(), frame, interp, matte, size: (0, 0) };
+        let key = |path: &str, frame| Key { path: path.into(), frame, interp, matte, size: (0, 0), native: false };
         match footage.kind {
             FootageKind::Sequence if !footage.sequence.is_empty() => {
                 let i = Self::frame_index(footage.frame_rate, t, footage.sequence_frames(), footage.loop_count);
@@ -729,10 +771,15 @@ impl Inner {
         }
         self.misses.fetch_add(1, Ordering::Relaxed);
         c.inflight.insert(loc.key.clone());
+        let epoch = c.epoch.clone();
         drop(c);
         let _guard = Inflight { inner: self, key: loc.key.clone() };
         let img = Arc::new(self.decode(&loc, footage)?);
-        lock(&self.cache).lru.insert(loc.key, img.clone(), self.budget());
+        let mut c = lock(&self.cache);
+        if Arc::ptr_eq(&epoch, &c.epoch) {
+            c.lru.insert(loc.key, img.clone(), self.budget());
+        }
+        drop(c);
         Ok(img)
     }
 
@@ -806,11 +853,7 @@ impl Inner {
                 Ok(dynamic_to_image(frame, op))
             }
             Some(mt) => {
-                let src = self.source(path)?;
-                let vf = {
-                    let _timing = crate::hardware::decode_timer();
-                    src.video_frame(FrameRequest::full(filmcraft_time::Tick(mt.0))).map_err(MediaError::from)?
-                };
+                let vf = self.video_frame(path, mt)?;
                 let _timing = crate::hardware::conversion_timer();
                 // A reduced-resolution render's frame, made at its size (a frame of the footage's
                 // own size only, as the renderer resamples only those).
@@ -826,6 +869,68 @@ impl Inner {
             }
         }
     }
+
+    /// CPU and GPU readers share the same raw-frame cache and inflight requests. In particular,
+    /// prefetch revisiting a frame must not seek a hardware decoder back through its GOP.
+    fn video_frame(&self, path: &Arc<str>, t: Tick) -> Result<Arc<VideoFrame>> {
+        let key = Key { path: path.clone(), frame: t.0, interp: 0, matte: [0; 3], size: (0, 0), native: true };
+        self.cached_video_frame(key, || {
+            let src = self.source(path)?;
+            let _timing = crate::hardware::decode_timer();
+            src.video_frame(FrameRequest::full(filmcraft_time::Tick(t.0))).map_err(MediaError::from)
+        })
+    }
+
+    fn cached_video_frame(&self, key: Key, read: impl FnOnce() -> Result<Arc<VideoFrame>>) -> Result<Arc<VideoFrame>> {
+        let mut c = lock(&self.cache);
+        loop {
+            if let Some(frame) = c.lru.video(&key) {
+                return Ok(frame);
+            }
+            if !c.inflight.contains(&key) {
+                break;
+            }
+            // As for converted frames: a rayon worker must not wait on a decode whose join
+            // could steal this waiting job. Its private read still validates before returning.
+            if rayon::current_thread_index().is_some() {
+                drop(c);
+                let frame = read()?;
+                crate::convert::validate_frame(&frame)?;
+                video_cache_bytes(&frame)?;
+                return Ok(frame);
+            }
+            c = self.done.wait(c).unwrap_or_else(|e| e.into_inner());
+        }
+        c.inflight.insert(key.clone());
+        let epoch = c.epoch.clone();
+        drop(c);
+        let _guard = Inflight { inner: self, key: key.clone() };
+        let frame = read()?;
+        crate::convert::validate_frame(&frame)?;
+        let bytes = video_cache_bytes(&frame)?;
+        let mut c = lock(&self.cache);
+        if Arc::ptr_eq(&epoch, &c.epoch) {
+            c.lru.store(key, CachedFrame::Video(frame.clone()), bytes, self.budget());
+        }
+        drop(c);
+        Ok(frame)
+    }
+}
+
+fn video_cache_bytes(frame: &VideoFrame) -> Result<usize> {
+    let bytes = match &frame.data {
+        PixelData::Rgba8(data) => Some(data.len()),
+        PixelData::RgbaF32(data) => data.len().checked_mul(4),
+        PixelData::Yuv8 { planes, alpha, .. } => planes.iter().map(|p| p.len()).chain(alpha.iter().map(|a| a.len())).try_fold(0usize, usize::checked_add),
+        PixelData::Yuv16 { planes, alpha, .. } => {
+            planes.iter().map(|p| p.len()).chain(alpha.iter().map(|a| a.len())).try_fold(0usize, usize::checked_add).and_then(|n| n.checked_mul(2))
+        }
+    }
+    .ok_or_else(|| MediaError::Decode("decoded video cache size overflow".into()))?;
+    if bytes as u64 > effectcraft_render::raster_bounds::MAX_PIXELS.saturating_mul(16) {
+        return Err(MediaError::Decode("decoded video buffers exceed the per-image byte limit".into()));
+    }
+    bytes.checked_add(64).ok_or_else(|| MediaError::Decode("decoded video cache entry size overflow".into()))
 }
 
 impl FootageSource for MediaPool {
@@ -841,11 +946,7 @@ impl FootageSource for MediaPool {
             }
             let loc = Inner::locate(footage, t);
             let Some(mt) = loc.media_t else { return Ok(None) };
-            let src = self.inner.source(&loc.key.path)?;
-            let frame = {
-                let _timing = crate::hardware::decode_timer();
-                src.video_frame(FrameRequest::full(filmcraft_time::Tick(mt.0))).map_err(MediaError::from)?
-            };
+            let frame = self.inner.video_frame(&loc.key.path, mt)?;
             crate::convert::frame_to_yuv420(&frame, footage).map(|f| f.map(Arc::new))
         };
         read().map_err(|e| e.to_string())
@@ -940,6 +1041,157 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn raw_key(frame: i64) -> Key {
+        Key { path: "raw-test.mp4".into(), frame: FrameRate::new(120, 1).tick_of(frame).0, interp: 0, matte: [0; 3], size: (0, 0), native: true }
+    }
+
+    fn raw_frame(value: u8) -> Arc<VideoFrame> {
+        Arc::new(VideoFrame {
+            width: 4,
+            height: 2,
+            data: PixelData::Yuv8 {
+                planes: [Arc::new(vec![value; 8]), Arc::new(vec![128; 2]), Arc::new(vec![128; 2])],
+                chroma: filmcraft_frame::Chroma::C420,
+                alpha: None,
+            },
+            color: filmcraft_color::ColorInfo::REC709,
+            par: (1, 1),
+            pts: filmcraft_time::Tick::ZERO,
+        })
+    }
+
+    #[test]
+    fn native_cache_reuses_skipped_backward_and_cpu_reads() {
+        let pool = MediaPool::new();
+        let calls = AtomicU64::new(0);
+        for i in [0, 2, 4, 2, 0, 4] {
+            let frame = pool
+                .inner
+                .cached_video_frame(raw_key(i), || {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(raw_frame(120 + i as u8))
+                })
+                .unwrap();
+            let PixelData::Yuv8 { planes, .. } = &frame.data else { panic!("YUV") };
+            assert_eq!(planes[0][0], 120 + i as u8);
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        let footage = Footage {
+            path: "raw-test.mp4".into(),
+            kind: FootageKind::Video,
+            has_video: true,
+            width: 4,
+            height: 2,
+            duration: Tick::from_seconds_f64(1.0),
+            frame_rate: FrameRate::new(120, 1),
+            alpha: AlphaMode::Ignore,
+            ..Default::default()
+        };
+        let image = pool.frame_at(&footage, Tick::ZERO).unwrap();
+        assert_eq!((image.width, image.height), (4, 2));
+        assert!(image.data.iter().all(|p| p[3] == 1.0));
+        assert_eq!(pool.stats().opened, 0, "CPU conversion must reuse the raw frame without opening the synthetic file");
+        assert_eq!(lock(&pool.inner.cache).lru.map.len(), 4, "raw and interpreted images have separate identities");
+        pool.forget(&footage.path);
+        assert_eq!(pool.stats().frames, 0, "Reload removes both representations");
+    }
+
+    #[test]
+    fn native_cache_coalesces_concurrent_requests() {
+        let pool = MediaPool::new();
+        let calls = AtomicU64::new(0);
+        let start = std::sync::Barrier::new(6);
+        std::thread::scope(|scope| {
+            let mut jobs = Vec::new();
+            for _ in 0..6 {
+                jobs.push(scope.spawn(|| {
+                    start.wait();
+                    pool.inner
+                        .cached_video_frame(raw_key(0), || {
+                            calls.fetch_add(1, Ordering::Relaxed);
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            Ok(raw_frame(126))
+                        })
+                        .unwrap()
+                }));
+            }
+            let frames: Vec<_> = jobs.into_iter().map(|job| job.join().unwrap()).collect();
+            assert!(frames.iter().all(|f| Arc::ptr_eq(f, &frames[0])));
+        });
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(lock(&pool.inner.cache).inflight.is_empty());
+    }
+
+    #[test]
+    fn native_cache_budget_purge_and_failed_reads_recover() {
+        let pool = MediaPool::new();
+        let bytes = video_cache_bytes(&raw_frame(126)).unwrap();
+        pool.set_budget(bytes * 2);
+        for i in 0..3 {
+            pool.inner.cached_video_frame(raw_key(i), || Ok(raw_frame(126))).unwrap();
+        }
+        assert_eq!(pool.stats().frames, 2);
+        assert_eq!(pool.stats().bytes, bytes * 2);
+        assert!(lock(&pool.inner.cache).lru.video(&raw_key(0)).is_none());
+        pool.clear_frames();
+        assert_eq!(pool.stats().bytes, 0);
+        assert!(pool.inner.cached_video_frame(raw_key(0), || Err(MediaError::Decode("synthetic source error".into()))).is_err());
+        let mut bad = (*raw_frame(126)).clone();
+        bad.data = PixelData::Rgba8(Arc::new(vec![255; 31]));
+        assert!(pool.inner.cached_video_frame(raw_key(0), || Ok(Arc::new(bad))).is_err());
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = pool.inner.cached_video_frame(raw_key(0), || panic!("synthetic decoder unwind"));
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(pool.stats().frames, 0);
+        assert!(lock(&pool.inner.cache).inflight.is_empty());
+        assert!(pool.inner.cached_video_frame(raw_key(0), || Ok(raw_frame(126))).is_ok());
+    }
+
+    #[test]
+    fn cache_clock_rollover_never_panics_or_aliases_eviction_stamps() {
+        let mut lru = Lru { clock: u64::MAX, ..Default::default() };
+        lru.store(raw_key(0), CachedFrame::Video(raw_frame(126)), 76, 1024);
+        assert_eq!(lru.clock, 1);
+        lru.clock = u64::MAX;
+        assert!(lru.video(&raw_key(0)).is_none());
+        assert_eq!(lru.bytes, 0);
+        assert!(lru.order.is_empty());
+    }
+
+    #[test]
+    fn native_cache_reload_and_purge_do_not_retain_old_inflight_reads() {
+        for reload in [false, true] {
+            let pool = MediaPool::new();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let inner = pool.inner.clone();
+                let pending = scope.spawn(move || {
+                    inner
+                        .cached_video_frame(raw_key(0), || {
+                            started_tx.send(()).unwrap();
+                            release_rx.recv().unwrap();
+                            Ok(raw_frame(120))
+                        })
+                        .unwrap()
+                });
+                started_rx.recv().unwrap();
+                if reload {
+                    pool.forget("raw-test.mp4");
+                } else {
+                    pool.clear_frames();
+                }
+                release_tx.send(()).unwrap();
+                pending.join().unwrap();
+            });
+            assert_eq!(pool.stats().frames, 0, "an invalidated read must not refill the cache");
+            let fresh = pool.inner.cached_video_frame(raw_key(0), || Ok(raw_frame(235))).unwrap();
+            let PixelData::Yuv8 { planes, .. } = &fresh.data else { panic!("YUV") };
+            assert_eq!(planes[0][0], 235);
+        }
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
@@ -1089,7 +1341,7 @@ mod tests {
     fn lru_respects_budget_and_recycles() {
         let mut c = Lru::default();
         let img = || Arc::new(Image::new(16, 16)); // 4 KiB + overhead
-        let k = |i| Key { path: "a".into(), frame: i, interp: 0, matte: [0; 3], size: (0, 0) };
+        let k = |i| Key { path: "a".into(), frame: i, interp: 0, matte: [0; 3], size: (0, 0), native: false };
         let budget = 3 * (4096 + 64);
         for i in 0..10 {
             c.insert(k(i), img(), budget);

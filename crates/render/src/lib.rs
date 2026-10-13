@@ -737,10 +737,6 @@ impl<'a> Renderer<'a> {
             || self.content_times(ctx, layer).is_some()
             || frame_blend_mode(ctx, layer) != FrameBlend::Off
             || self.pipe.media_in(f).is_some()
-            // Without native-frame caching, prefetch at a different source cadence can
-            // repeatedly seek the decoder. Keep that work on the existing cached path.
-            || f.frame_rate != ctx.comp.frame_rate
-            || f.native_rate.unwrap_or(f.frame_rate) != ctx.comp.frame_rate
             || layer.stretch != 100.0
             || layer.props.get("timeRemap").is_some()
         {
