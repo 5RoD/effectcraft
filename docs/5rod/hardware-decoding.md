@@ -1,7 +1,9 @@
 # Windows hardware decoding
 
-The Windows desktop registers FilmCraft's native decoder adapter before any footage source
-opens. Supported streams can use Windows Media Foundation/D3D11 hardware decoding;
+The Windows desktop and local CLI sessions register FilmCraft's native decoder adapter before
+any footage source opens. Both native hosts compile the same guarded registration module.
+CLI bridge sessions use the running desktop's existing decoder configuration. Supported
+streams can use Windows Media Foundation/D3D11 hardware decoding;
 unsupported streams and recoverable decoder failures retain the software path. The adapter
 is a safe external Rust API; EffectCraft introduces no unsafe code and does not link or ship
 FFmpeg. Registration is guarded against escaped Rust panics, with software decoding retained
@@ -10,7 +12,7 @@ when registration fails. This guard does not catch operating-system or driver pr
 The shared FilmCraft crates are pinned together at
 `cee1feb185e675a108f78067f71ad86a640ace3d`. Integration follows public API documentation and
 manifests; decoder implementations were not inspected or copied. Platform registration is
-Windows-only in the native executable. Codec interfaces remain behind media, export and
+Windows-only in the native executable hosts. Codec interfaces remain behind media, export and
 interchange; the public media wrapper exposes only EffectCraft types.
 
 Movie reads now request exact native frame timestamps. The updated container readers round
@@ -32,6 +34,14 @@ mode, registered backend and process-wide monotonic hardware-frame, session, dec
 and fallback counters. Backend registration is not evidence that a particular stream used
 hardware. Compare frame counters before and after the playback interval; perform queries outside
 the viewer observation window. Counter deltas can include decoder read-ahead.
+
+The CLI's `render --json` response retains `rendered` and adds a read-only `decoder`
+object with the selected mode/backend, hardware-frame/session/decline/fallback counts
+and source-decode/conversion work counters. These are process-wide totals, including
+project loading and read-ahead. A positive hardware-frame count establishes decoder
+use in that process; registration alone does not. Diagnostics and registration warnings
+go to stderr so stdout remains one JSON document. CLI export speed, frame/audio quality,
+backward seeks and software overrides require separate production comparisons.
 
 This adapter currently reads decoded YUV pixels back to CPU memory. Colour conversion, frame
 cache copies, composition and texture uploads still cost time. Its registration can also make

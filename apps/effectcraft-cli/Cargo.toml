@@ -23,3 +23,7 @@ effectcraft-time = { workspace = true }
 serde_json = { workspace = true }
 image = { workspace = true }
 cpu-time = "1"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# The native CLI shares the desktop's guarded adapter registration.
+filmcraft-platform = { workspace = true }

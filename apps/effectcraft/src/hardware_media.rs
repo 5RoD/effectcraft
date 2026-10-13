@@ -1,26 +1,21 @@
 //! Register the native decoder before sources open. Failure leaves software decoding available.
 
-pub fn initialize() {
+/// `None` means explicitly disabled. Errors leave software decoding available.
+pub fn initialize() -> Result<Option<&'static str>, String> {
     effectcraft_host::set_hardware_decoding(false);
     match std::env::var("EFFECTCRAFT_HARDWARE_DECODING") {
         Ok(mode) if mode.eq_ignore_ascii_case("off") => {
-            log::info!("hardware decoding disabled for this launch");
-            return;
+            return Ok(None);
         }
         Ok(mode) if mode.eq_ignore_ascii_case("auto") => {}
         Err(std::env::VarError::NotPresent) => {}
         mode => {
-            log::warn!("invalid EFFECTCRAFT_HARDWARE_DECODING value {mode:?}; use auto or off; continuing with software decoding");
-            return;
+            return Err(format!("invalid EFFECTCRAFT_HARDWARE_DECODING value {mode:?}; use auto or off"));
         }
     }
-    match register_safely(filmcraft_platform::register) {
-        Ok(backend) => {
-            effectcraft_host::set_hardware_decoding(true);
-            log::info!("hardware decoder registered: {backend}; unsupported streams use software decoding");
-        }
-        Err(reason) => log::warn!("hardware decoder unavailable: {reason}; continuing with software decoding"),
-    }
+    let backend = register_safely(filmcraft_platform::register)?;
+    effectcraft_host::set_hardware_decoding(true);
+    Ok(Some(backend))
 }
 
 fn register_safely(register: impl FnOnce() -> filmcraft_platform::Availability + std::panic::UnwindSafe) -> Result<&'static str, String> {

@@ -43,6 +43,11 @@ use std::io::Write;
 
 mod template;
 
+// Share the native host adapter without bringing OS registration into the WASM media layer.
+#[cfg(target_os = "windows")]
+#[path = "../../effectcraft/src/hardware_media.rs"]
+mod hardware_media;
+
 use effectcraft_automation::tools::{self, Reply};
 use effectcraft_automation::{Backend, McpServer};
 use serde_json::{Value, json};
@@ -340,6 +345,12 @@ fn backend(args: &Args, default_demo: bool) -> Result<Backend, Failure> {
 /// A wired session; `--gpu` attaches the GPU compositor (renders then follow the project's
 /// renderer setting, Mercury GPU Acceleration by default).
 fn session(args: &Args) -> Result<effectcraft_engine::Session, Failure> {
+    #[cfg(target_os = "windows")]
+    match hardware_media::initialize() {
+        Ok(Some(backend)) => note!("hardware decoder registered: {backend}; unsupported streams use software decoding"),
+        Ok(None) => note!("hardware decoding disabled for this launch"),
+        Err(reason) => note!("hardware decoder unavailable: {reason}; continuing with software decoding"),
+    }
     let mut s = effectcraft_host::session();
     if args.flag("--autosave") {
         let dir = effectcraft_host::config_dir().ok_or_else(|| Failure::Error("--autosave: no config directory; set EFFECTCRAFT_CONFIG_DIR".into()))?;
@@ -780,7 +791,18 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
         return Err(Failure::Error(failed.join("; ")));
     }
     if json_out {
-        emit(&json!({"rendered": results}), true);
+        let decoder = effectcraft_host::hardware_decoder_stats();
+        let work = effectcraft_host::media_work_stats();
+        emit(
+            &json!({"rendered": results, "decoder": {
+                "enabled": decoder.enabled, "backend": decoder.backend,
+                "hardwareFrames": decoder.frames, "sessions": decoder.sessions,
+                "declined": decoder.declined, "fallbacks": decoder.fallbacks,
+                "decodeCalls": work.decode_calls, "decodeNanoseconds": work.decode_nanoseconds,
+                "conversionCalls": work.conversion_calls, "conversionNanoseconds": work.conversion_nanoseconds,
+            }}),
+            true,
+        );
     }
     Ok(())
 }

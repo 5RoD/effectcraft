@@ -71,7 +71,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 
 # media codecs + containers: FilmCraft's pure-Rust crates, pinned to a revision (plan/adr/0001).
 # Codec/container APIs stay behind `crates/media`, `crates/export` and `crates/interchange`.
-# OS decoder registration belongs to the native desktop layer only.
+# OS decoder registration belongs to the native executable hosts only.
 filmcraft-platform = { git = "https://github.com/storytold/filmcraft", rev = "cee1feb185e675a108f78067f71ad86a640ace3d" }
 filmcraft-codecs = { git = "https://github.com/storytold/filmcraft", rev = "cee1feb185e675a108f78067f71ad86a640ace3d" }
 filmcraft-media = { git = "https://github.com/storytold/filmcraft", rev = "cee1feb185e675a108f78067f71ad86a640ace3d" }

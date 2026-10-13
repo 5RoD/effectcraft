@@ -4,6 +4,12 @@ The Windows H.264 render-queue backend uses the operating system's `MediaTransco
 hardware acceleration requested. It does not link, bundle or run FFmpeg. Software H.264,
 other output formats and browser exports retain their existing encoders.
 
+The Windows local CLI now shares the desktop's native source-decoder registration.
+`EFFECTCRAFT_HARDWARE_DECODING=auto|off` selects source decoding independently of
+`EFFECTCRAFT_H264_ENCODER`; `--gpu` selects compositing independently of both. The
+earlier export comparisons below used software source decoding. New native-decoder
+export speed and quality require a controlled production comparison before acceptance.
+
 Windows H.264 file exports request this backend by default after the production
 footage checks below. Unsupported profiles fall back before rendering starts:
 

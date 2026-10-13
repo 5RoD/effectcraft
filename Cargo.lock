@@ -1197,6 +1197,7 @@ dependencies = [
  "effectcraft-render",
  "effectcraft-time",
  "effectcraft-ui-egui",
+ "filmcraft-platform",
  "image",
  "serde_json",
 ]

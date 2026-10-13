@@ -98,7 +98,11 @@ fn main() -> eframe::Result {
         return Ok(());
     };
     #[cfg(target_os = "windows")]
-    hardware_media::initialize();
+    match hardware_media::initialize() {
+        Ok(Some(backend)) => log::info!("hardware decoder registered: {backend}; unsupported streams use software decoding"),
+        Ok(None) => log::info!("hardware decoding disabled for this launch"),
+        Err(reason) => log::warn!("hardware decoder unavailable: {reason}; continuing with software decoding"),
+    }
     // The font menus list the installed fonts: read their names while the window opens.
     effectcraft_engine::text::fonts::scan_system_in_background();
     // Wayland shows the window's icon from its desktop entry: an AppImage brings its own.

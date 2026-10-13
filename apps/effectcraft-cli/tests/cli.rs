@@ -46,6 +46,54 @@ fn info_and_commands() {
     assert!(ids.iter().all(|i| i.contains("layer.new") || !i.is_empty()));
 }
 
+#[cfg(target_os = "windows")]
+#[test]
+fn decoder_off_and_invalid_modes_keep_json_exports_and_software_fallback() {
+    let project = tmp("decoder-modes.ecproj");
+    ok_json(&[
+        "run",
+        "comp.new",
+        r#"{"name":"Decoder modes","width":64,"height":36,"duration":1}"#,
+        "layer.newSolid",
+        r##"{"color":"#3080ff"}"##,
+        "--empty",
+        "--save-as",
+        project.to_str().unwrap(),
+    ]);
+    let mut outputs = Vec::new();
+    for (mode, warning) in [("off", "hardware decoding disabled"), ("invalid-mode", "continuing with software decoding")] {
+        let path = tmp(&format!("decoder-{mode}.gif"));
+        let out = bin()
+            .env("EFFECTCRAFT_HARDWARE_DECODING", mode)
+            .args([
+                "render",
+                "--project",
+                project.to_str().unwrap(),
+                "--comp",
+                "Decoder modes",
+                "--out",
+                path.to_str().unwrap(),
+                "--format",
+                "gif",
+                "--end",
+                "0.1",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(result["decoder"]["enabled"], false);
+        assert_eq!(result["decoder"]["hardwareFrames"], 0);
+        assert_eq!(result["rendered"][0]["output"], path.to_str().unwrap());
+        assert!(String::from_utf8_lossy(&out.stderr).contains(warning));
+        outputs.push(std::fs::read(&path).unwrap());
+        std::fs::remove_file(path).unwrap();
+    }
+    assert_eq!(outputs[0], outputs[1], "an invalid mode must keep the same software-rendered output");
+    std::fs::remove_file(project).unwrap();
+}
+
 /// The agent-interface audit (CLI side): `exec --list` lists every registered engine command
 /// with its label, params doc and (with `--schemas`) params JSON Schema, and `exec` routes every
 /// id to its command (an unknown parameter is rejected by that command).
