@@ -49,13 +49,9 @@ fn win_failure() -> WinError {
     WinError::from_hresult(HRESULT(0x80004005_u32 as i32))
 }
 
-/// Opt-in while real-media speed/quality acceptance is incomplete. Software stays available.
-pub(crate) async fn try_movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut State<'_>) -> Result<Option<Report>> {
-    if job.output.format != OutputFormat::H264 {
-        return Ok(None);
-    }
-    let (enabled, fallback) = match std::env::var_os("EFFECTCRAFT_H264_ENCODER") {
-        None => (false, false),
+fn encoder_mode(mode: Option<&std::ffi::OsStr>) -> (bool, bool) {
+    match mode {
+        None => (true, true),
         Some(mode) if mode == "software" || mode == "off" => (false, false),
         Some(mode) if mode == "hardware" => (true, false),
         Some(mode) if mode == "auto" => (true, true),
@@ -63,7 +59,15 @@ pub(crate) async fn try_movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mu
             log::warn!("invalid EFFECTCRAFT_H264_ENCODER={mode:?}; retaining software export");
             (false, false)
         }
-    };
+    }
+}
+
+/// Windows file exports try the measured native encoder, retaining pre-render software fallback.
+pub(crate) async fn try_movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut State<'_>) -> Result<Option<Report>> {
+    if job.output.format != OutputFormat::H264 {
+        return Ok(None);
+    }
+    let (enabled, fallback) = encoder_mode(std::env::var_os("EFFECTCRAFT_H264_ENCODER").as_deref());
     if !enabled {
         return Ok(None);
     }
@@ -466,6 +470,17 @@ mod tests {
     use std::process::Command;
 
     #[test]
+    fn windows_h264_defaults_to_native_with_pre_render_fallback_and_software_overrides() {
+        use std::ffi::OsStr;
+        assert_eq!(encoder_mode(None), (true, true));
+        assert_eq!(encoder_mode(Some(OsStr::new("auto"))), (true, true));
+        assert_eq!(encoder_mode(Some(OsStr::new("hardware"))), (true, false));
+        for mode in ["software", "off", "invalid"] {
+            assert_eq!(encoder_mode(Some(OsStr::new(mode))), (false, false));
+        }
+    }
+
+    #[test]
     fn rational_video_and_audio_timestamps_do_not_accumulate_rounding() {
         let mut duration = 0;
         for frame in 0..120 {
@@ -553,7 +568,8 @@ mod tests {
         let mut state = State { t0: web_time::Instant::now(), total: 120, done: 0, progress: &mut progress };
         let comp = cx.comp().unwrap();
         supported(&cx, comp, 640, 360)?;
-        let result = effectcraft_render::passes::block_on(movie(&cx, comp, 640, 360, &mut state));
+        let result = effectcraft_render::passes::block_on(try_movie(&cx, comp, 640, 360, &mut state))?
+            .ok_or_else(|| invalid("native acceptance fixture selected software; run with default, auto or hardware encoding"));
         if result.is_ok() {
             assert_eq!(state.done, 120);
         }

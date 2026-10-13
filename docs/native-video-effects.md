@@ -87,9 +87,61 @@ parity tolerances apply to all adapters. The fixtures verify:
 - Rerun the prior native YUV range/matrix/odd-edge/project-depth, interpretation,
   rate and media-failure regressions. Run the repository full gate before a commit.
 
-After correctness, build identical normal-profile baseline/candidate applications
-and use private OBS 1440p120 footage with representative local effect chains
-in a separate idle-machine window. Capture completed output fidelity, upload bytes,
-internal/final readbacks, cold and cached native painted-frame cadence and process
-memory with honest labels. Measure whole maximum-quality export separately; never
-infer it from GPU dispatch timing. No performance gain is claimed for this candidate.
+## Production footage acceptance
+
+Normal Windows x64 Thin LTO/codegen-one builds of `21680b74` and `f358d26f` used
+one identical private 2560×1440/120 OBS H.264 project with Native Bloom applied to
+the video layer. Quality/View were Final, radius 32, amount 100%, threshold 0.6,
+soft knee/spread 0.5 and operation Add, with 32 bpc and the same working/blending
+space. The two-second recording segment shows a mostly static shader settings
+menu; it does not represent fast gameplay, difficult motion, 3D or the original
+Hybrid MP4 container. No footage or reference pixels are shipped.
+
+Full-resolution PNG comparisons at frames 0, 1, 61, 119, 120, 239 and backward
+return to zero passed with a maximum one-code RGB difference and exact alpha.
+Three unclipped EXR samples had a maximum recovered working-channel difference
+of 3.58e-7, within the existing 32-bpc tolerance of 1e-3, with exact alpha.
+Separate desktop renders retained the same one-code/exact-alpha bounds.
+
+| Case | Before | Compact effect input |
+|---|---:|---:|
+| Headless Full GPU frame, cold | 202.07 ms | 56.14 ms |
+| Headless Full GPU frame, warm sampled time | 221.93 ms | 58.58 ms |
+| Headless Full GPU display pass | 177.26 ms | 26.32 ms |
+| Warm headless upload/readback payload | 125.9 / 125.9 MiB | 5.3 / 56.2 MiB |
+| Desktop viewer changes/s including waits, 12 s | 8.32 | 41.77 |
+| Desktop completed holds, p50/p95/p99 | 116.93 / 134.70 / 160.90 ms | 23.74 / 26.29 / 122.68 ms |
+| Desktop sampled peak process commitment | 6.96 GB | 4.82 GB |
+| 120-frame native H.264 export job / whole process | 23.47 / 25.09 s | 7.63 / 9.11 s |
+| Export sampled peak process commitment | 10.46 GB | 6.87 GB |
+
+Headless numbers are medians of three repeated-time samples, not timeline fps.
+The desktop and export comparisons are single sequential pairs on the RTX 3050;
+they are not repeated medians or general hardware limits. Half-resolution retains
+the source fallback: its GPU frame comparison was 44.34 versus 37.44 ms. The CLI
+uses its existing source decoder; desktop counters separately confirmed native
+hardware decoding. RAM measurements are process totals, not VRAM or queue budgets.
+
+The visible, unminimized desktop window used explicit fast presentation, full
+resolution, audio off and skip zero. All 3,631 candidate steady requested/shown
+keys matched, with no stale or missing texture draws. Its slowed playback clock
+still recorded two skipped selected frames and failed uncached 120 fps. Cached
+playback shortened the range to 49 frames (0.408 seconds), then observed 119.95 fps
+for 11.76 seconds with no skips, stale or missing frames. This is a short cached
+loop, not an entire project. Different cold-phase cache residency makes the two
+cache preparation times unsuitable for a startup-speed comparison.
+
+The export retained 1440p/120, Final Bloom, 300 Mbit/s H.264 and stereo audio with
+the same Windows encoder. Both outputs decoded all 120 frames with timing error
+below one microsecond, limited-range BT.709 tags and 48 kHz stereo AAC. Decoded
+audio matched over the first 48,000 samples. Compressed video A/B agreement was
+54.29 dB PSNR / 0.99805 SSIM; lossless selected PNG/float comparisons above verify
+the algorithm separately from compression. This establishes neither lossless
+H.264 nor instantaneous export.
+
+The same final build also rechecked ordinary video without effects: 100.59 fps
+uncached over ten seconds versus the previous 100.30, and 119.95 fps on the short
+cached loop, with no observed selected-frame skips or steady key mismatches.
+Seven frames matched the external reference within one RGB code and exact alpha.
+These results used explicit presentation/encoder overrides; automatic Windows
+defaults use the same paths and require their own normal-launch acceptance.

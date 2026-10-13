@@ -6,6 +6,18 @@ application and Desktop shortcut have not been removed or replaced.
 
 ## Changes in this milestone
 
+- Windows launches request the tested fast presentation mode by default, with a
+  synchronized override. H.264 file export defaults to the system's hardware encoder
+  with software fallback for unsupported profiles before rendering. These defaults
+  retain the output resolution, rate and effect quality. See
+  [native playback](native-video.md) and [native export](native-export.md) for the
+  production comparisons, override settings and acceptance limits.
+- Supported video-layer GPU effect chains start with compact native YUV planes,
+  avoiding CPU float conversion and upload. A production Final-quality Bloom case
+  at 1440p/120 improved uncached viewer cadence from 8.32 to 41.77 fps and export job
+  time from 23.47 to 7.63 seconds. A short cached loop reached 119.95 fps; uncached
+  120 fps remains unachieved. Pixel, floating-point, audio and timing checks passed.
+  See [video effect acceptance](../native-video-effects.md) for the measured scope.
 - Windows startup registers the native hardware decoder with software fallback. A launch-time
   `auto`/`off` setting and read-only frame counters support comparisons using the same executable.
   This does not yet establish full-resolution 120 fps acceptance. See

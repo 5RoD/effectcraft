@@ -121,8 +121,10 @@ observed 63.58 fps after nearly all decode/render work was finished. A separate 
 check on the primary display observed 63.53 fps; increasing the presentation queue to two
 frames observed 63.57 fps and did not help. These results do not establish a hardware ceiling.
 
-Desktop launches accept `EFFECTCRAFT_VSYNC=auto|off`. Unset/`auto` retains synchronized
-presentation. `off` requests wgpu's `AutoNoVsync` mode, with its device-supported fallback;
+Desktop launches accept `EFFECTCRAFT_VSYNC=auto|off`. Windows launches request
+`AutoNoVsync` by default after the production checks below; other platforms retain
+their existing synchronized default. `auto` explicitly retains synchronization.
+`off` requests wgpu's `AutoNoVsync` mode, with its device-supported fallback;
 invalid or non-Unicode values warn and retain automatic synchronization. This optional
 setting can increase presentation work and permit tearing; it does not change rendered pixels
 or guarantee that the physical display presents every frame. There is no global driver,

@@ -4,13 +4,14 @@ The Windows H.264 render-queue backend uses the operating system's `MediaTransco
 hardware acceleration requested. It does not link, bundle or run FFmpeg. Software H.264,
 other output formats and browser exports retain their existing encoders.
 
-This backend is opt-in while real-project performance and quality acceptance is underway:
+Windows H.264 file exports request this backend by default after the production
+footage checks below. Unsupported profiles fall back before rendering starts:
 
 | `EFFECTCRAFT_H264_ENCODER` | Behavior |
 |---|---|
-| unset, `software`, `off` | Existing software encoder |
+| unset, `auto` | Request Windows encoding; fall back to software if the profile is unsupported before rendering starts |
+| `software`, `off` | Existing software encoder |
 | `hardware` | Request Windows encoding; report an unsupported profile or encoder error |
-| `auto` | Request Windows encoding; fall back to software if the profile is unsupported before rendering starts |
 
 An invalid value warns and retains software export. The variable applies to H.264 only.
 Requesting acceleration alone does not prove a particular GPU encoded the file. Device
@@ -76,8 +77,8 @@ speed improvement is claimed by those generated checks.
 A clean Windows x64 Thin LTO/codegen-one build of `21680b74` rendered the same
 private OBS H.264 2560×1440/120 source with GPU rendering and stereo audio. Each
 run exported the first 120 frames at its original resolution/rate, without effects.
-The encoder was selected explicitly; the default is still software pending broader
-acceptance. The CLI binary SHA256 was
+The encoder was selected explicitly in this comparison, before the Windows default
+changed to automatic native selection. The CLI binary SHA256 was
 `0fee76b7a8381bc52705db1acb1a7df3aa1067f6abd8005b0c392bb4d4817eeb`.
 
 | Target bitrate | Windows job / whole process | Software job / whole process | Windows / software PSNR | Windows / software SSIM |
@@ -104,6 +105,16 @@ Observed peak process commitment was about 3.57/3.64 GiB on Windows versus
 rendering, decoded media, audio and codec buffers, not just the request queue. The
 backend still transfers final rendered frames into the operating system encoder;
 it does not establish a GPU-texture-to-encoder path or instantaneous export.
+
+The subsequent `f358d26f` build also checked a real video-layer Native Bloom export
+at Final effect quality and 32 bpc. The source remained 2560×1440/120 with stereo
+audio, and the 120-frame H.264 target remained 300 Mbit/s. Compact GPU effect input
+reduced the render job from 23.473 to 7.626 seconds and whole-process time from
+25.089 to 9.106 seconds. This measures a renderer improvement with the same native
+encoder, separately from the software-versus-native encoder comparison above.
+All decoded frames, timestamps and BT.709 tags passed; decoded audio was identical
+over the first 48,000 samples. See [video effect acceptance](../native-video-effects.md)
+for fidelity, resource measurements and the limited footage scope.
 
 Public API references: [MediaStreamSource](https://learn.microsoft.com/en-us/uwp/api/windows.media.core.mediastreamsource),
 [MediaTranscoder](https://learn.microsoft.com/en-us/uwp/api/windows.media.transcoding.mediatranscoder),

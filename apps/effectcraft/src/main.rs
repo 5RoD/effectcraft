@@ -292,13 +292,8 @@ fn main() -> eframe::Result {
 fn wgpu_options(backends: Option<eframe::wgpu::Backends>) -> eframe::WgpuConfiguration {
     use eframe::egui_wgpu::WgpuSetup;
     let mut config = eframe::WgpuConfiguration::default();
-    // Optional local presentation diagnostic; unsupported modes retain wgpu's fallback.
-    match std::env::var_os("EFFECTCRAFT_VSYNC") {
-        None => {}
-        Some(value) if value == "auto" => {}
-        Some(value) if value == "off" => config.surface.present_mode = eframe::wgpu::PresentMode::AutoNoVsync,
-        Some(value) => log::warn!("invalid EFFECTCRAFT_VSYNC value {value:?}; using automatic synchronization"),
-    }
+    // Windows high-rate previews use the measured fast path; wgpu retains device fallback.
+    config.surface.present_mode = presentation_mode(std::env::var_os("EFFECTCRAFT_VSYNC").as_deref(), config.surface.present_mode);
     if let WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup {
         if let Some(b) = backends {
             setup.instance_descriptor.backends = b;
@@ -310,6 +305,19 @@ fn wgpu_options(backends: Option<eframe::wgpu::Backends>) -> eframe::WgpuConfigu
         });
     }
     config
+}
+
+fn presentation_mode(value: Option<&std::ffi::OsStr>, synchronized: eframe::wgpu::PresentMode) -> eframe::wgpu::PresentMode {
+    match value {
+        None if cfg!(target_os = "windows") => eframe::wgpu::PresentMode::AutoNoVsync,
+        None => synchronized,
+        Some(value) if value == "auto" => synchronized,
+        Some(value) if value == "off" => eframe::wgpu::PresentMode::AutoNoVsync,
+        Some(value) => {
+            log::warn!("invalid EFFECTCRAFT_VSYNC value {value:?}; using automatic synchronization");
+            synchronized
+        }
+    }
 }
 
 /// The limits to request from an adapter that offers `adapter`: all of them, with textures
@@ -412,6 +420,16 @@ fn disable_app_nap() {
 #[cfg(test)]
 mod tests {
     use super::{Args, parse_args};
+
+    #[test]
+    fn presentation_defaults_preserve_synchronized_and_fast_overrides() {
+        use eframe::wgpu::PresentMode::{AutoNoVsync, AutoVsync};
+        use std::ffi::OsStr;
+        assert_eq!(super::presentation_mode(None, AutoVsync), if cfg!(target_os = "windows") { AutoNoVsync } else { AutoVsync });
+        assert_eq!(super::presentation_mode(Some(OsStr::new("auto")), AutoVsync), AutoVsync);
+        assert_eq!(super::presentation_mode(Some(OsStr::new("off")), AutoVsync), AutoNoVsync);
+        assert_eq!(super::presentation_mode(Some(OsStr::new("invalid")), AutoVsync), AutoVsync);
+    }
 
     fn parse(args: &[&str]) -> Option<Args> {
         parse_args(args.iter().map(|a| a.to_string()), None)
