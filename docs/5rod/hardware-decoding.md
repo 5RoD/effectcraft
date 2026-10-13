@@ -90,3 +90,6 @@ texture-upload enqueueing. They are diagnostic evidence for choosing the next op
 the counters themselves are not a performance improvement. Source timers include read-ahead,
 decoder/cache work and allocation, and concurrent calls overlap. Upload timing excludes GPU
 DMA completion and shader execution. Use before/after snapshots outside viewer observations.
+
+The next transfer optimization is documented in [native-video.md](native-video.md): supported
+opaque 8-bit video can transfer its compact native planes and convert them on the GPU.

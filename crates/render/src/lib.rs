@@ -24,6 +24,7 @@ pub mod shapes;
 pub mod styles;
 pub mod text;
 pub mod three_d;
+pub mod video;
 
 use std::sync::Arc;
 
@@ -41,6 +42,11 @@ use rayon::prelude::*;
 
 /// Supplies decoded footage frames (implemented by the media layer).
 pub trait FootageSource: Send + Sync {
+    /// Optional compact opaque video source. `Ok(None)` uses the ordinary image path;
+    /// malformed media returns an error, never a successful substitute image.
+    fn yuv420_frame_checked(&self, _item: ItemId, _footage: &Footage, _t: Tick) -> Result<Option<Arc<video::Yuv420Frame>>, String> {
+        Ok(None)
+    }
     /// The frame of `item` at source time `t`, straight from the file (any size).
     fn frame(&self, item: ItemId, footage: &Footage, t: Tick) -> Option<Arc<Image>>;
     /// Checked media boundary: unavailable footage is `Ok(None)`, a failed decode is `Err`.
@@ -712,6 +718,40 @@ impl<'a> Renderer<'a> {
         let bs = if s < 1.0 && nc.preserve_resolution { 1.0 } else { s };
         let base = self.nested_through(layer);
         Some((Renderer { opts: RenderOpts { scale: bs, ..base.opts }, ..base }, item, lt, bs))
+    }
+
+    /// Compact source for the native GPU video path. Interpretation, reduced-resolution
+    /// resampling, fields, proxies, source motion blur and frame blending keep the reference
+    /// path. Placement still uses the ordinary transform, matte and blend operations.
+    pub fn yuv420_source(&self, ctx: &EvalCtx, layer: &Layer) -> Result<Option<Arc<video::Yuv420Frame>>, String> {
+        let LayerSource::Footage { item } = layer.source else { return Ok(None) };
+        let Some(ItemKind::Footage(f)) = self.project.item(item).map(|i| &i.kind) else { return Ok(None) };
+        if f.kind != FootageKind::Video
+            || f.missing
+            || !f.has_video
+            || f.invert_alpha
+            || f.linear_light_applies()
+            || f.fields != effectcraft_project::FieldOrder::Off
+            || self.proxy_for(item).is_some()
+            || self.reduced_size(f.width, f.height).is_some()
+            || self.content_times(ctx, layer).is_some()
+            || frame_blend_mode(ctx, layer) != FrameBlend::Off
+            || self.pipe.media_in(f).is_some()
+        {
+            return Ok(None);
+        }
+        if self.layer_raster_valid(ctx, layer).is_none() {
+            return Ok(None);
+        }
+        let t = ctx.source_time(layer);
+        match self.footage.yuv420_frame_checked(item, f, t) {
+            Ok(Some(frame)) if (frame.width(), frame.height()) != (f.width, f.height) => Ok(None),
+            Ok(frame) => Ok(frame),
+            Err(message) => {
+                self.record_media_failure(ctx, layer, f, t, &message);
+                Err(message)
+            }
+        }
     }
 
     /// The nested comp of a precomp layer whose transformations collapse into this comp: the
@@ -1521,21 +1561,25 @@ impl<'a> Renderer<'a> {
         match result {
             Ok(image) => image,
             Err(message) => {
-                let failure = FrameFailure {
-                    comp: ctx.comp_id,
-                    layer: layer.id,
-                    time: ctx.time,
-                    effect_uid: 0,
-                    effect_id: "render.media".into(),
-                    message: format!("{} at source {:.6}s: {message}", f.path, t.seconds()),
-                };
-                if let Some(diagnostics) = self.diagnostics {
-                    diagnostics.record(failure);
-                } else {
-                    log::error!("{failure}");
-                }
+                self.record_media_failure(ctx, layer, f, t, &message);
                 None
             }
+        }
+    }
+
+    fn record_media_failure(&self, ctx: &EvalCtx, layer: &Layer, f: &Footage, t: Tick, message: &str) {
+        let failure = FrameFailure {
+            comp: ctx.comp_id,
+            layer: layer.id,
+            time: ctx.time,
+            effect_uid: 0,
+            effect_id: "render.media".into(),
+            message: format!("{} at source {:.6}s: {message}", f.path, t.seconds()),
+        };
+        if let Some(diagnostics) = self.diagnostics {
+            diagnostics.record(failure);
+        } else {
+            log::error!("{failure}");
         }
     }
 

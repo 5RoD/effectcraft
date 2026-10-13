@@ -83,6 +83,7 @@ mod fx_warp;
 mod ops;
 mod particles;
 mod readback;
+mod video;
 mod walk;
 
 use std::sync::Arc;
@@ -486,3 +487,5 @@ mod tests_particles;
 
 #[cfg(test)]
 mod tests_checked;
+#[cfg(test)]
+mod tests_video;

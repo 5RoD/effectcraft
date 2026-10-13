@@ -829,6 +829,27 @@ impl Inner {
 }
 
 impl FootageSource for MediaPool {
+    fn yuv420_frame_checked(
+        &self,
+        _item: ItemId,
+        footage: &Footage,
+        t: Tick,
+    ) -> std::result::Result<Option<Arc<effectcraft_render::video::Yuv420Frame>>, String> {
+        let read = || -> Result<_> {
+            if footage.missing || !footage.has_video || footage.kind != FootageKind::Video || gif_anim::is_gif(footage) {
+                return Ok(None);
+            }
+            let loc = Inner::locate(footage, t);
+            let Some(mt) = loc.media_t else { return Ok(None) };
+            let src = self.inner.source(&loc.key.path)?;
+            let frame = {
+                let _timing = crate::hardware::decode_timer();
+                src.video_frame(FrameRequest::full(filmcraft_time::Tick(mt.0))).map_err(MediaError::from)?
+            };
+            crate::convert::frame_to_yuv420(&frame, footage).map(|f| f.map(Arc::new))
+        };
+        read().map_err(|e| e.to_string())
+    }
     fn set_conform_folder(&self, folder: Option<std::path::PathBuf>) {
         MediaPool::set_conform_folder(self, folder);
     }

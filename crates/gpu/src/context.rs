@@ -502,6 +502,34 @@ impl GpuContext {
             .map(|(e, layout)| Ok((*e, build(e, layout)?)))
             .collect::<Result<HashMap<_, _>, String>>()?;
         let mut unavailable = vec![];
+        // Compact video is optional: a driver rejecting it keeps the float-image path.
+        let video = init_resource(&device, "video shader module", || {
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("effectcraft native video"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("shaders/video.wgsl").into()),
+            })
+        })
+        .and_then(|module| {
+            init_resource(&device, "video_yuv420", || {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("video_yuv420"),
+                    layout: Some(&layout),
+                    module: &module,
+                    entry_point: Some("video_yuv420"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+            })
+        });
+        match video {
+            Ok(pipeline) => {
+                pipelines.insert("video_yuv420", pipeline);
+            }
+            Err(why) => {
+                log::warn!("gpu: compact video unavailable: {why}");
+                unavailable.push(("video_yuv420", why));
+            }
+        }
         for e in EFFECT_ENTRIES
             .iter()
             .chain(crate::fx_color::KERNELS)
@@ -851,7 +879,6 @@ impl GpuContext {
             return None;
         }
         let started = web_time::Instant::now();
-        self.transfers.count(true, img.data.len() * 16);
         let g = self.image(img.width, img.height);
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo { texture: &g.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
@@ -859,6 +886,16 @@ impl GpuContext {
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(img.width * 16), rows_per_image: Some(img.height) },
             wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
         );
+        self.count_upload(img.data.len() * 16, started);
+        Some(g)
+    }
+
+    pub(crate) fn dummy_texture(&self) -> wgpu::Texture {
+        self.dummy.clone()
+    }
+
+    pub(crate) fn count_upload(&self, bytes: usize, started: web_time::Instant) {
+        self.transfers.count(true, bytes);
         let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         // Keep the atomic update API available on the workspace's Rust 1.95 minimum.
         #[allow(deprecated)]
@@ -866,7 +903,6 @@ impl GpuContext {
             .transfers
             .upload_cpu_ns
             .fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |n| Some(n.saturating_add(elapsed)));
-        Some(g)
     }
 
     /// Upload a (layer cache) buffer, reusing the texture while the same `Arc` is alive: static

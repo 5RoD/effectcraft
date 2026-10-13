@@ -216,6 +216,9 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
     if let Some(done) = draw_precomp(e, r, ctx, layer, canvas, opacity) {
         return done;
     }
+    if let Some(done) = draw_video(e, r, ctx, layer, canvas, opacity) {
+        return done;
+    }
     let Some(st) = r.styled_layer(ctx, layer) else { return Some(()) };
     if st.plain {
         return composite_layer(e, r, ctx, layer, &st.body, canvas, opacity);
@@ -289,6 +292,41 @@ fn draw_precomp(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas:
         let Some(iso) = place_src(e, r, ctx, layer, &shape, img, &e.zeros(canvas.width, canvas.height), BlendMode::Normal, 1.0, None) else {
             return Some(None);
         };
+        return Some(composite_iso(e, r, ctx, layer, iso, canvas, opacity));
+    }
+    Some(place_src(e, r, ctx, layer, &shape, img, canvas, layer.blend_mode, opacity, pipe.levels).map(|c| *canvas = c))
+}
+
+/// Opaque native video without source masks, effects or styles. Conversion and source-depth
+/// quantisation happen on the GPU; placement, mattes and blending use the ordinary kernels.
+fn draw_video(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage, opacity: f32) -> Option<Option<()>> {
+    if !e.g.has_kernel("video_yuv420")
+        || layer.masks().is_some_and(|m| !m.children.is_empty())
+        || styles::active(ctx, layer)
+        || (layer.switches.effects && layer.effects().is_some_and(|f| !f.children.is_empty()))
+    {
+        return None;
+    }
+    let frame = match r.yuv420_source(ctx, layer) {
+        Ok(Some(frame)) => frame,
+        Ok(None) => return None,
+        Err(_) => return Some(None),
+    };
+    let pipe = r.pipe();
+    let mut img = match crate::video::upload(e, &frame, pipe.levels) {
+        Ok(Some(img)) => img,
+        Ok(None) => return None,
+        Err(error) => {
+            log::error!("gpu video upload: {error}");
+            return Some(None);
+        }
+    };
+    if let Some(c) = pipe.to_blend() {
+        img = ops::convert(e, &img, &c);
+    }
+    let shape = Buf { img: Image { width: img.width, height: img.height, data: Vec::new() }, offset: [0.0; 2], scale: 1.0 };
+    if r.track_matte(ctx, layer).is_some() || layer.preserve_transparency {
+        let iso = place_src(e, r, ctx, layer, &shape, img, &e.zeros(canvas.width, canvas.height), BlendMode::Normal, 1.0, None)?;
         return Some(composite_iso(e, r, ctx, layer, iso, canvas, opacity));
     }
     Some(place_src(e, r, ctx, layer, &shape, img, canvas, layer.blend_mode, opacity, pipe.levels).map(|c| *canvas = c))

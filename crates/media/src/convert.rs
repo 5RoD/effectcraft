@@ -278,6 +278,19 @@ impl Yuv {
     }
 }
 
+/// Share validated native planes without expanding them into an RGBA float image.
+pub(crate) fn frame_to_yuv420(f: &VideoFrame, footage: &Footage) -> Result<Option<effectcraft_render::video::Yuv420Frame>> {
+    validate_frame(f)?;
+    if footage.premul_color.iter().any(|v| !v.is_finite()) {
+        return Err(MediaError::Decode("non-finite footage alpha matte".into()));
+    }
+    let PixelData::Yuv8 { planes, chroma: Chroma::C420, alpha: None } = &f.data else { return Ok(None) };
+    let k = Yuv::new(f.color.matrix, f.color.range, 8);
+    effectcraft_render::video::Yuv420Frame::new(f.width, f.height, planes.clone(), [k.y_scale, k.y_off, k.c_scale, k.c_off], [k.cr_r, k.cr_g, k.cb_g, k.cb_b])
+        .map(Some)
+        .map_err(MediaError::Decode)
+}
+
 trait Sample: Copy + Send + Sync {
     fn f(self) -> f32;
 }
@@ -456,6 +469,25 @@ mod tests {
 
     fn frame_to_image(f: &VideoFrame, op: AlphaOp) -> Image {
         frame_to_image_in(f, op, Vec::new()).expect("valid decoded test frame")
+    }
+
+    #[test]
+    fn native_video_shares_planes_and_declines_other_valid_formats() {
+        let footage = Footage::default();
+        let mut f = yuv_frame(126, 91, 173, filmcraft_color::ColorInfo::REC709);
+        let native = frame_to_yuv420(&f, &footage).unwrap().unwrap();
+        let PixelData::Yuv8 { planes, alpha, .. } = &mut f.data else { panic!("test YUV") };
+        for (a, b) in planes.iter().zip(native.planes()) {
+            assert!(Arc::ptr_eq(a, b), "native transport must retain decoder allocations");
+        }
+        *alpha = Some(Arc::new(vec![255; 8]));
+        assert!(frame_to_yuv420(&f, &footage).unwrap().is_none());
+        f.data = PixelData::Rgba8(Arc::new(vec![255; 32]));
+        assert!(frame_to_yuv420(&f, &footage).unwrap().is_none());
+        f.data = PixelData::Rgba8(Arc::new(vec![255; 31]));
+        assert!(frame_to_yuv420(&f, &footage).is_err(), "invalid data cannot be a successful fallback");
+        let bad_matte = Footage { premul_color: [f32::NAN; 3], ..Default::default() };
+        assert!(frame_to_yuv420(&yuv_frame(126, 91, 173, filmcraft_color::ColorInfo::REC709), &bad_matte).is_err());
     }
 
     #[test]
