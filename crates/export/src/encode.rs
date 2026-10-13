@@ -250,6 +250,10 @@ pub(crate) fn pcm_bytes(buf: &[f32], fmt: AudioFormat, big_endian: bool) -> Vec<
 type Writer<'f, 's> = Mp4Writer<&'f mut crate::out::Out<'s>>;
 
 pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut State<'_>) -> Result<Report> {
+    #[cfg(windows)]
+    if let Some(report) = crate::native_windows::try_movie(job, comp, w, h, st).await? {
+        return Ok(report);
+    }
     let rate = job.settings.rate(comp);
     let fmt = job.output.format;
     let channels = match job.output.channels {

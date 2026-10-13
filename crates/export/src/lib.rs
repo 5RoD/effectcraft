@@ -2,7 +2,7 @@
 //!
 //! | Format | Container / files | Video | Alpha | Audio |
 //! |---|---|---|---|---|
-//! | H.264 | MP4 | FilmCraft H.264 High, 8-bit 4:2:0 BT.709 limited, VBR | no | AAC-LC (FilmCraft), mono/stereo |
+//! | H.264 | MP4 | FilmCraft H.264 High, or opt-in Windows system encoding; 8-bit 4:2:0 BT.709 limited | no | AAC-LC (FilmCraft or Windows), mono/stereo |
 //! | ProRes | QuickTime MOV | FilmCraft ProRes 422 Proxy/LT/422/HQ, 10-bit; 4444/4444 XQ 4:4:4 | 4444 (16-bit alpha coding) | PCM 16/24-bit or 32-bit float, mono/stereo |
 //! | PNG / JPEG / TIFF sequence | one file per frame | 8-bit | PNG, TIFF | — |
 //! | OpenEXR sequence | one file per frame | 32-bit float, linear light, premultiplied | yes | — |
@@ -23,8 +23,9 @@
 //! Frames are rendered in parallel batches (rayon; one batch ≈ one frame per core) and handed to
 //! the encoder in order. They share the job's layer cache, as viewer frames share the viewer's:
 //! static and transform-only layers render once per job. Progress is reported after each batch through a callback that can cancel
-//! the job by returning `false`. Codecs and the MP4/MOV muxer are FilmCraft's pure-Rust crates
-//! (plan ADR 0001); nothing outside this crate touches them.
+//! the job by returning `false`. Software codecs and the MP4/MOV muxer are FilmCraft's pure-Rust
+//! crates (plan ADR 0001). Windows has an optional H.264/AAC system backend; no codec library or
+//! external executable is linked or shipped. See `docs/5rod/native-export.md` for its scope.
 //!
 //! H.264 requires even dimensions: odd output sizes are cropped by one pixel (padded when the
 //! output is a single pixel wide/high).
@@ -34,6 +35,8 @@
 mod encode;
 mod geometry;
 mod hevc_av1;
+#[cfg(windows)]
+mod native_windows;
 mod out;
 mod pipeline;
 mod webm;

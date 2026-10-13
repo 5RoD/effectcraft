@@ -32,6 +32,38 @@ pub(crate) fn exists(sink: Option<&Sink>, path: &str) -> bool {
 }
 
 impl<'a> Out<'a> {
+    /// Close our handle so a native encoder can write the exclusively owned provisional file.
+    #[cfg(windows)]
+    pub(crate) fn external_path(&mut self) -> Result<PathBuf> {
+        let Out::File { file, .. } = self else { return Err(ExportError::Unsupported("native file export cannot write an in-memory sink".into())) };
+        let path = file.temp.canonicalize().map_err(io)?;
+        let mut writer = file.writer.take().ok_or_else(|| ExportError::Io("export file is already closed".into()))?;
+        writer.flush().map_err(io)?;
+        let handle = writer.into_inner().map_err(|e| ExportError::Io(e.to_string()))?;
+        handle.sync_all().map_err(io)?;
+        drop(handle);
+        Ok(path)
+    }
+
+    /// Publish a native encoder's output after it has closed its stream successfully.
+    #[cfg(windows)]
+    pub(crate) fn finish_external(self) -> Result<u64> {
+        let Out::File { file, cleanup } = self else { return Err(ExportError::Unsupported("native file export cannot write an in-memory sink".into())) };
+        if file.writer.is_some() {
+            return Err(ExportError::Io("native export still has an open EffectCraft writer".into()));
+        }
+        let destination = (!file.target_existed).then(|| file.target.to_string_lossy().into_owned());
+        let handle = std::fs::OpenOptions::new().read(true).write(true).open(&file.temp).map_err(io)?;
+        if handle.metadata().map_err(io)?.len() == 0 {
+            return Err(ExportError::Encode("native encoder produced an empty export".into()));
+        }
+        let bytes = file.publish(handle)?;
+        if let (Some(cleanup), Some(destination)) = (cleanup, destination) {
+            cleanup.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(destination);
+        }
+        Ok(bytes)
+    }
+
     /// Cancellation owns only successfully published, newly created destinations. Failed
     /// encoders own their provisional file, whose guard removes it without touching the target.
     pub(crate) fn track_cleanup(&mut self, destinations: &'a Mutex<Vec<String>>) {
@@ -121,6 +153,10 @@ impl FileOut {
         let mut writer = self.writer.take().ok_or_else(|| ExportError::Io("export file is already closed".into()))?;
         writer.flush().map_err(io)?;
         let file = writer.into_inner().map_err(|error| ExportError::Io(error.to_string()))?;
+        self.publish(file)
+    }
+
+    fn publish(mut self, file: std::fs::File) -> Result<u64> {
         file.sync_all().map_err(io)?;
         let size = file.metadata().map_err(io)?.len();
         // Windows cannot rename an open file. The same-directory rename replaces the old
@@ -153,6 +189,41 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ec-export-atomic-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn native_publication_preserves_failed_destinations_and_tracks_only_complete_new_files() {
+        let dir = dir();
+        let target = dir.join("previous.mp4");
+        let cleanup = Mutex::new(Vec::new());
+        std::fs::write(&target, b"previous completed output").unwrap();
+        for empty in [false, true] {
+            let mut output = create(None, target.to_str().unwrap()).unwrap();
+            output.track_cleanup(&cleanup);
+            let provisional = output.external_path().unwrap();
+            if !empty {
+                std::fs::write(&provisional, b"unfinished native movie").unwrap();
+            }
+            if empty {
+                assert!(output.finish_external().is_err());
+            } else {
+                drop(output);
+            }
+            assert_eq!(std::fs::read(&target).unwrap(), b"previous completed output");
+            assert!(cleanup.lock().unwrap().is_empty());
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        }
+        for destination in [&target, &dir.join("new.mp4")] {
+            let mut output = create(None, destination.to_str().unwrap()).unwrap();
+            output.track_cleanup(&cleanup);
+            let provisional = output.external_path().unwrap();
+            std::fs::write(provisional, b"complete native movie").unwrap();
+            assert_eq!(output.finish_external().unwrap(), 21);
+            assert_eq!(std::fs::read(destination).unwrap(), b"complete native movie");
+        }
+        assert_eq!(*cleanup.lock().unwrap(), vec![dir.join("new.mp4").to_string_lossy().into_owned()]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

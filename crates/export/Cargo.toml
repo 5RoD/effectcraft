@@ -29,6 +29,10 @@ web-time = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.62.2", features = ["Foundation", "Media_Core", "Media_MediaProperties", "Media_Transcoding", "Storage", "Storage_Streams", "Win32_Media_MediaFoundation"] }
+windows-future = "=0.3.2"
+
 [dev-dependencies]
 effectcraft-effects = { workspace = true }
 effectcraft-media = { workspace = true }
