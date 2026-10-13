@@ -41,7 +41,9 @@ fn source(w: usize, h: usize, kind: u32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 }
 
 fn decode(frame: &[u8]) -> filmcraft_vp9::Picture {
-    let mut d = Decoder::new();
+    // These per-packet assertions require synchronous output. The default decoder now uses
+    // frame threads and can return a picture in a later call or at flush.
+    let mut d = Decoder::with_threads(1);
     let mut pics = d.decode(frame, 0).expect("decode");
     assert_eq!(pics.len(), 1);
     pics.remove(0)
@@ -189,7 +191,7 @@ fn planes_of(p: &filmcraft_vp9::Picture, w: usize, h: usize) -> [Vec<u8>; 3] {
 fn run_sequence(cfg: EncoderConfig, n: usize, kind: u32) -> (usize, f64) {
     let (w, h) = (cfg.width as usize, cfg.height as usize);
     let mut e = Vp9Encoder::new(cfg);
-    let mut d = Decoder::new();
+    let mut d = Decoder::with_threads(1);
     let (mut bytes, mut db) = (0usize, 0.0);
     for t in 0..n {
         let (y, u, v) = moving(w, h, t, kind);
@@ -226,6 +228,24 @@ fn inter_frames_decode_exactly() {
 fn inter_frames_with_tile_columns_decode_exactly() {
     let cfg = EncoderConfig { width: 4160, height: 24, quality: 80, keyframe_interval: 0, ..Default::default() };
     run_sequence(cfg, 3, 0);
+}
+
+#[test]
+fn threaded_decoder_drains_every_frame_in_order() {
+    let (w, h) = (96usize, 72usize);
+    let cfg = EncoderConfig { width: w as u32, height: h as u32, quality: 80, keyframe_interval: 4, ..Default::default() };
+    let (frames, reconstruction) = encode_moving(cfg, 9, 0);
+    let mut decoder = Decoder::with_threads(2);
+    let mut pictures = Vec::new();
+    for (index, packet) in frames.iter().enumerate() {
+        pictures.extend(decoder.decode(packet, index as i64).expect("decode threaded VP9"));
+    }
+    pictures.extend(decoder.flush());
+    assert_eq!(pictures.len(), frames.len(), "flush must preserve all queued frames");
+    for (index, (picture, expected)) in pictures.iter().zip(&reconstruction).enumerate() {
+        assert_eq!(picture.pts, index as i64, "presentation order");
+        assert_eq!(planes_of(picture, w, h), *expected, "threaded frame {index} pixels");
+    }
 }
 
 #[test]
@@ -344,7 +364,7 @@ fn frames_never_end_in_a_superframe_marker() {
     }
     let Some((w, h, q, frames, recon)) = padded else { panic!("no frame needed the padding: widen the search") };
     // The padded frames decode exactly, with FilmCraft's decoder and with ffmpeg.
-    let mut d = Decoder::new();
+    let mut d = Decoder::with_threads(1);
     for (t, (f, r)) in frames.iter().zip(&recon).enumerate() {
         let mut pics = d.decode(f, t as i64).unwrap_or_else(|e| panic!("{w}x{h} q{q} frame {t}: {e:?}"));
         assert_eq!(planes_of(&pics.remove(0), w, h), *r, "{w}x{h} q{q} frame {t}");

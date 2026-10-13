@@ -18,6 +18,8 @@ mod appimage;
 mod apple_events;
 mod audio_out;
 mod control_server;
+#[cfg(target_os = "windows")]
+mod hardware_media;
 mod launch_guard;
 #[cfg(target_os = "macos")]
 mod native_menu;
@@ -95,6 +97,8 @@ fn main() -> eframe::Result {
         println!("effectcraft {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     };
+    #[cfg(target_os = "windows")]
+    hardware_media::initialize();
     // The font menus list the installed fonts: read their names while the window opens.
     effectcraft_engine::text::fonts::scan_system_in_background();
     // Wayland shows the window's icon from its desktop entry: an AppImage brings its own.

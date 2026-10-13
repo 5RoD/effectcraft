@@ -194,6 +194,17 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
         },
         "ui.menu.list" => ok(serde_json::to_value(crate::menus::menu_items(app)).unwrap_or_default()),
         "ui.inspect" => ok(inspect(app, ctx)),
+        "ui.decoder.stats" => {
+            let stats = effectcraft_host::hardware_decoder_stats();
+            ok(json!({
+                "enabled": stats.enabled,
+                "backend": stats.backend,
+                "hardwareFrames": stats.frames,
+                "sessions": stats.sessions,
+                "declined": stats.declined,
+                "fallbacks": stats.fallbacks,
+            }))
+        }
         "ui.elements" => {
             let prefix = s("prefix").unwrap_or("");
             ok(serde_json::to_value(app.auto.query(prefix)).unwrap_or_default())

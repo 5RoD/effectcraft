@@ -513,7 +513,7 @@ impl MediaPool {
         let path: Arc<str> = footage.path.as_str().into();
         let src = self.inner.source(&path).map_err(|e| e.to_string())?;
         let s0 = start.to_units_floor(rate as i64);
-        let native = src.info().audio.as_ref().map_or(rate, |a| a.sample_rate);
+        let native = src.info().audio().map_or(rate, |a| a.sample_rate);
         if native == 0 || rate == 0 || native == rate {
             return read_stereo(&src, s0, frames, rate);
         }
@@ -674,9 +674,11 @@ impl Inner {
                 let rate = footage.frame_rate;
                 let n = Self::frame_count(rate, footage.duration);
                 let i = Self::frame_index(rate, t, n, footage.loop_count);
-                // Middle of the frame in the file's own timing (robust to timestamp rounding).
                 let native = footage.native_rate.unwrap_or(rate);
-                let mt = native.tick_of(i) + Tick(native.frame_duration().0 / 2);
+                // FilmCraft rounds container timestamps to the nearest timebase unit. A
+                // half-frame offset would round ties forward and display the following frame.
+                // GIF delay lookup still samples within its presentation interval.
+                let mt = native.tick_of(i) + if gif_anim::is_gif(footage) { Tick(native.frame_duration().0 / 2) } else { Tick::ZERO };
                 Loc { key: key(&footage.path, i), media_t: Some(mt) }
             }
         }

@@ -18,12 +18,14 @@
 mod convert;
 pub mod exr_channels;
 mod gif_anim;
+mod hardware;
 mod layered;
 pub use layered::vector_doc;
 mod pool;
 mod probe;
 mod reader;
 
+pub use hardware::{HardwareDecoderStats, hardware_decoder_stats, set_hardware_decoding};
 pub use pool::{DEFAULT_BUDGET, MediaPool, PoolStats};
 pub use probe::{DEFAULT_SEQUENCE_RATE, probe, probe_bytes, probe_model};
 

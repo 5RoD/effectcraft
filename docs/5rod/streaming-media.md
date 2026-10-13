@@ -8,11 +8,14 @@ the separate playback acceptance evidence.
 
 ## Public interfaces and bounds
 
-The integration uses the existing pinned FilmCraft revision
+The original streaming milestone used FilmCraft revision
 `2c5ba7a72619935f0481f99d59409e0d1844b234`: `ByteReader`, `SharedReader` and the
 `filmcraft_codecs::reader_openers()` registry. No decoder implementation was inspected or
-copied, and no dependency revision or runtime package was added. The two development
+copied, and that milestone added no dependency revision or runtime package. The two development
 dependencies already used elsewhere in the workspace generate the small synthetic MP4.
+
+The following [native decoder integration](hardware-decoding.md) updates the shared FilmCraft
+pin while retaining these file-reader bounds and regressions.
 
 The native reader checks regular files and captures their length. Reads validate checked
 ranges and are limited to 64 MiB each. Seek/read errors retain their path and operating-system

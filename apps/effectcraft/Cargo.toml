@@ -22,6 +22,10 @@ pollster = { workspace = true }
 cpal = { workspace = true }
 log = { workspace = true }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+# Safe public OS adapter, registered by this native host; never part of the WASM media layer.
+filmcraft-platform = { workspace = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # Settings ▸ Appearance ▸ Sync with System: the XDG desktop portal's colour scheme. Already in
 # Cargo.lock (accesskit, through eframe), so it adds no new crates.

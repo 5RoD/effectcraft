@@ -6,6 +6,10 @@ application and Desktop shortcut have not been removed or replaced.
 
 ## Changes in this milestone
 
+- Windows startup registers the native hardware decoder with software fallback. A launch-time
+  `auto`/`off` setting and read-only frame counters support comparisons using the same executable.
+  This does not yet establish full-resolution 120 fps acceptance. See
+  [hardware decoding](hardware-decoding.md) for API boundaries and measurement requirements.
 - Native containers use FilmCraft's streaming reader openers for metadata and sample reads,
   retaining an index and file handle instead of the entire compressed recording. Formats without
   a streaming opener have a checked 512 MiB per-file input budget. Source-opening errors retain
