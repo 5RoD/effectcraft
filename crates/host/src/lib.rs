@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use effectcraft_engine::project::render_queue::OutputFormat;
 use effectcraft_engine::{ExportJob, ExportResult, Exporter, Importer, Session};
-pub use effectcraft_media::{HardwareDecoderStats, hardware_decoder_stats, set_hardware_decoding};
+pub use effectcraft_media::{HardwareDecoderStats, MediaWorkStats, hardware_decoder_stats, media_work_stats, set_hardware_decoding};
 use effectcraft_project::Footage;
 pub use effectcraft_script as script;
 

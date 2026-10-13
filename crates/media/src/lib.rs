@@ -25,7 +25,7 @@ mod pool;
 mod probe;
 mod reader;
 
-pub use hardware::{HardwareDecoderStats, hardware_decoder_stats, set_hardware_decoding};
+pub use hardware::{HardwareDecoderStats, MediaWorkStats, hardware_decoder_stats, media_work_stats, set_hardware_decoding};
 pub use pool::{DEFAULT_BUDGET, MediaPool, PoolStats};
 pub use probe::{DEFAULT_SEQUENCE_RATE, probe, probe_bytes, probe_model};
 

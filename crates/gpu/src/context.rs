@@ -112,6 +112,7 @@ pub(crate) struct Pool {
 pub(crate) struct Transfers {
     ups: std::sync::atomic::AtomicU64,
     up_bytes: std::sync::atomic::AtomicU64,
+    upload_cpu_ns: std::sync::atomic::AtomicU64,
     downs: std::sync::atomic::AtomicU64,
     down_bytes: std::sync::atomic::AtomicU64,
 }
@@ -121,6 +122,9 @@ pub(crate) struct Transfers {
 pub struct TransferStats {
     pub uploads: u64,
     pub upload_bytes: u64,
+    /// CPU wall time allocating/reusing an image texture and enqueueing its upload. This is
+    /// not GPU execution time, DMA completion or shader time.
+    pub upload_cpu_nanoseconds: u64,
     pub readbacks: u64,
     pub readback_bytes: u64,
 }
@@ -830,6 +834,7 @@ impl GpuContext {
         TransferStats {
             uploads: t.ups.load(Relaxed),
             upload_bytes: t.up_bytes.load(Relaxed),
+            upload_cpu_nanoseconds: t.upload_cpu_ns.load(Relaxed),
             readbacks: t.downs.load(Relaxed),
             readback_bytes: t.down_bytes.load(Relaxed),
         }
@@ -845,6 +850,7 @@ impl GpuContext {
         if !self.fits(img.width, img.height) {
             return None;
         }
+        let started = web_time::Instant::now();
         self.transfers.count(true, img.data.len() * 16);
         let g = self.image(img.width, img.height);
         self.queue.write_texture(
@@ -853,6 +859,13 @@ impl GpuContext {
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(img.width * 16), rows_per_image: Some(img.height) },
             wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
         );
+        let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        // Keep the atomic update API available on the workspace's Rust 1.95 minimum.
+        #[allow(deprecated)]
+        let _ = self
+            .transfers
+            .upload_cpu_ns
+            .fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |n| Some(n.saturating_add(elapsed)));
         Some(g)
     }
 

@@ -196,6 +196,7 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
         "ui.inspect" => ok(inspect(app, ctx)),
         "ui.decoder.stats" => {
             let stats = effectcraft_host::hardware_decoder_stats();
+            let work = effectcraft_host::media_work_stats();
             ok(json!({
                 "enabled": stats.enabled,
                 "backend": stats.backend,
@@ -203,6 +204,21 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
                 "sessions": stats.sessions,
                 "declined": stats.declined,
                 "fallbacks": stats.fallbacks,
+                "decodeCalls": work.decode_calls,
+                "decodeNanoseconds": work.decode_nanoseconds,
+                "conversionCalls": work.conversion_calls,
+                "conversionNanoseconds": work.conversion_nanoseconds,
+            }))
+        }
+        "ui.transfer.stats" => {
+            let Some(gpu) = &app.gpu else { return err("GPU context unavailable") };
+            let stats = gpu.context().transfer_stats();
+            ok(json!({
+                "uploads": stats.uploads,
+                "uploadBytes": stats.upload_bytes,
+                "uploadCpuNanoseconds": stats.upload_cpu_nanoseconds,
+                "readbacks": stats.readbacks,
+                "readbackBytes": stats.readback_bytes,
             }))
         }
         "ui.elements" => {

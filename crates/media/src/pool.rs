@@ -807,7 +807,11 @@ impl Inner {
             }
             Some(mt) => {
                 let src = self.source(path)?;
-                let vf = src.video_frame(FrameRequest::full(filmcraft_time::Tick(mt.0))).map_err(MediaError::from)?;
+                let vf = {
+                    let _timing = crate::hardware::decode_timer();
+                    src.video_frame(FrameRequest::full(filmcraft_time::Tick(mt.0))).map_err(MediaError::from)?
+                };
+                let _timing = crate::hardware::conversion_timer();
                 // A reduced-resolution render's frame, made at its size (a frame of the footage's
                 // own size only, as the renderer resamples only those).
                 let (w, h) = loc.key.size;

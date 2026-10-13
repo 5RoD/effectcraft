@@ -44,3 +44,49 @@ requires the same production executable, source, preview settings and disk-cache
 pixels and seeks. The earlier streaming build measured about 22.3 distinct viewer frames per
 second on a 30-second slice of the user's 1440p/120 OBS recording with disk caching disabled;
 that software baseline does not attribute the entire cost to the decoder.
+
+## Production comparison, 2026-10-13
+
+The clean production build at `26e58633978e2651a71641a4402ad0daa3f770ff` passed the full
+gate: 3,028 tests, zero failures, 27 ignored, strict Clippy, layers, assets and 32-crate WASM
+checks. Rust 1.99.0, Thin LTO and one codegen unit produced executable SHA256
+`3bc40bb69e7911d0315fe1a5ba2785b63c61efa7004243e68b4b72f773eaa3b2`.
+
+One sequential 30-second capture per mode used the same 2560×1440/120 H.264 OBS slice,
+one effectless video layer, Full resolution, Fit display, zero intentional skips, disk caching
+off and audio off. No compiler or validation job ran during capture. OS/driver caching and
+other desktop activity were uncontrolled. This measures viewer texture changes, including
+waiting draws, rather than physical monitor presentation or multi-layer edit performance.
+
+| Measurement | Software (`off`) | Hardware (`auto`) |
+|---|---:|---:|
+| Distinct viewer frames per second, including waits | 23.80 | 24.16 |
+| Texture hold p50 / p95 / p99, ms | 44.05 / 51.07 / 62.39 | 44.27 / 50.12 / 60.90 |
+| Longest completed texture hold, ms | 82.50 | 66.73 |
+| Mean process CPU cores used | 7.29 | 5.84 |
+| Peak process private bytes, GiB | 6.60 | 6.88 |
+| Hardware-frame counter delta | 0 | 730 |
+| Declined-stream / fallback counter deltas | 0 / 0 | 0 / 0 |
+
+The enabled capture confirms Media Foundation hardware decoding. Its roughly 20% lower
+observed CPU use is useful, but the 1.5% cadence difference is too small to establish a playback
+speed gain from a single pair. Peak private bytes increased about 4.3%. Both captures had zero
+minimum selected-frame skips, stale draws, reverse transitions and missing textures, and quit
+normally. Full-resolution 120 fps playback still fails this acceptance case.
+
+After the timing windows, full-resolution renders at frames 0, 61, 119, 120, 239 and 1200,
+followed by a return to frame 0, were identical between modes, including alpha. Independent
+FFmpeg PNG references differed by at most one 8-bit RGB value, at 73.55–74.10 dB PSNR.
+Both backward-seek frame-zero results exactly matched their initial frame-zero result. These
+seven samples do not establish conformance for every codec, frame or damaged stream.
+
+The private runner SHA256 was
+`f6c6adc67a9b2a1952c457cabf75b68698b0a444f7ee13012c5e2c97f8e87b0c`; source slice SHA256
+`11aae53e5e59a93a61e77098fb3bf40a105c02720e81fd89ccbd69c54a352f40`.
+External FFmpeg remains an oracle only. User footage and screenshots are not committed.
+
+Subsequent read-only work counters separate source-frame calls, frame conversion and CPU
+texture-upload enqueueing. They are diagnostic evidence for choosing the next optimization;
+the counters themselves are not a performance improvement. Source timers include read-ahead,
+decoder/cache work and allocation, and concurrent calls overlap. Upload timing excludes GPU
+DMA completion and shader execution. Use before/after snapshots outside viewer observations.
