@@ -555,7 +555,11 @@ fn instants(ctx: &EffectCtx) -> Result<Instants, String> {
     if !(Tick::MIN..=Tick::MAX).contains(&current) {
         return Err(invalid("host layer time exceeds the supported Tick range"));
     }
-    let source = if by_frame || speed == 100.0 {
+    let integrated = if by_frame { None } else { ctx.env.host.and_then(|host| host.integrated_time("speed", 100.0, current)) };
+    let integrated = integrated.transpose().map_err(invalid)?;
+    let source = if let Some(source) = integrated {
+        source
+    } else if by_frame || speed == 100.0 {
         current
     } else if speed == -100.0 {
         Tick(current.0.checked_neg().ok_or_else(|| invalid("reverse source time overflows"))?)
@@ -579,8 +583,21 @@ fn instants(ctx: &EffectCtx) -> Result<Instants, String> {
             let before = position.floor();
             (before, (position - before) as f32)
         } else {
-            let delta = checked_tick(offset / fps * TICKS_PER_SECOND as f64)?;
-            let instant = Tick(source.0.checked_add(delta.0).ok_or_else(|| invalid("shutter source time overflows"))?);
+            let instant = if integrated.is_some() && sample > 0 {
+                // Shutter offsets are output-time offsets. Integrate through rate changes
+                // inside the exposure instead of extrapolating the speed at its start.
+                let output_offset = angle / 360.0 * sample as f64 / (samples - 1) as f64;
+                let delta = checked_tick(output_offset / fps * TICKS_PER_SECOND as f64)?;
+                let output_time = Tick(current.0.checked_add(delta.0).ok_or_else(|| invalid("shutter output time overflows"))?);
+                ctx.env
+                    .host
+                    .and_then(|host| host.integrated_time("speed", 100.0, output_time))
+                    .ok_or_else(|| invalid("the host no longer supplies the animated rate curve"))?
+                    .map_err(invalid)?
+            } else {
+                let delta = checked_tick(offset / fps * TICKS_PER_SECOND as f64)?;
+                Tick(source.0.checked_add(delta.0).ok_or_else(|| invalid("shutter source time overflows"))?)
+            };
             if !(Tick::MIN..=Tick::MAX).contains(&instant) {
                 return Err(invalid("shutter source time exceeds the supported Tick range"));
             }

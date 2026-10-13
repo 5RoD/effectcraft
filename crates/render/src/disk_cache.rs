@@ -779,7 +779,7 @@ fn decode_layer(p: &[u8]) -> Option<Buf> {
 /// Bump when rendering changes in a way that makes old disk entries wrong.
 // Fork evaluation includes Native Text Counter, checked media, native decoding and Timewarp. Keep the
 // disk container format at v1; existing upstream pixels are misses under this renderer salt.
-const RENDER_VERSION: &str = "effectcraft-5rod-render-9";
+const RENDER_VERSION: &str = "effectcraft-5rod-render-10";
 
 fn hash_debug(h: &mut Hash128, v: &impl std::fmt::Debug) {
     h.write(format!("{v:?}").as_bytes());

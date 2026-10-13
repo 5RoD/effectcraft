@@ -366,6 +366,12 @@ pub trait EffectHost: Sync {
     fn params_at(&self, _layer_time: f64) -> Option<Params> {
         None
     }
+    /// Source layer time accumulated from a rate parameter between layer time zero and
+    /// `at` (`normal` means 100% playback). Native hosts integrate keyframes directly.
+    /// `None` preserves constant-rate behavior for hosts without animation curves.
+    fn integrated_time(&self, _parameter: &str, _normal: f64, _at: effectcraft_time::Tick) -> Option<Result<effectcraft_time::Tick, String>> {
+        None
+    }
     /// A particle simulation backend (GPU particles; see [`psim`]). `None` = simulate on the
     /// CPU.
     fn particles(&self) -> Option<&dyn psim::ParticleSim> {

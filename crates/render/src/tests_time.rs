@@ -103,6 +103,118 @@ fn alpha(img: &crate::Image) -> f32 {
 }
 
 #[test]
+fn timewarp_animated_speed_accumulates_motion_independently_of_seek_order() {
+    let (mut project, cid) = scene(Some(("ec.time.timewarp", &[("method", Value::Enum(1))])));
+    project.settings.bit_depth = effectcraft_project::BitDepth::Bpc32;
+    let rate = project.comp_mut(cid).unwrap().layers[0].props.prop_mut("effects/#1/speed").unwrap();
+    rate.keys = vec![Keyframe::new(Tick::ZERO, Value::Scalar(50.0)), Keyframe::new(Tick::from_seconds_f64(2.0), Value::Scalar(150.0))];
+    let (mut reference, reference_cid) = scene(None);
+    reference.settings.bit_depth = effectcraft_project::BitDepth::Bpc32;
+    let cache = crate::LayerCache::default();
+    for time in [1.0, 0.5, 0.9, 0.0, 0.5, 1.2, 0.9] {
+        // Integral of (50 + 50*t)% from zero: 0.5*t + 0.25*t².
+        let expected = alpha(&render(&reference, reference_cid, 0.5 * time + 0.25 * time * time, None));
+        for cached in [None, Some(&cache)] {
+            let actual = alpha(&render(&project, cid, time, cached));
+            assert!((actual - expected).abs() < 2e-6, "time {time}: {actual} != {expected}");
+        }
+    }
+    // Freeze then reverse: a zero/negative current speed must not discard prior travel.
+    let speed = project.comp_mut(cid).unwrap().layers[0].props.prop_mut("effects/#1/speed").unwrap();
+    speed.keys = vec![
+        Keyframe::new(Tick::ZERO, Value::Scalar(100.0)).hold(),
+        Keyframe::new(Tick::from_seconds_f64(0.5), Value::Scalar(0.0)).hold(),
+        Keyframe::new(Tick::from_seconds_f64(1.0), Value::Scalar(-100.0)).hold(),
+    ];
+    for (time, source) in [(0.75, 0.5), (1.25, 0.25), (0.75, 0.5)] {
+        let expected = alpha(&render(&reference, reference_cid, source, None));
+        let actual = alpha(&render(&project, cid, time, Some(&cache)));
+        assert!((actual - expected).abs() < 2e-6, "freeze/reverse at {time}: {actual} != {expected}");
+    }
+}
+
+#[test]
+fn timewarp_integral_cache_reuses_curves_but_never_holds_old_property_trees() {
+    use std::sync::Arc;
+    let (mut project, cid) = scene(Some(("ec.time.timewarp", &[])));
+    let speed = project.comp_mut(cid).unwrap().layers[0].props.prop_mut("effects/#1/speed").unwrap();
+    speed.keys = vec![Keyframe::new(Tick::ZERO, Value::Scalar(50.0)), Keyframe::new(Tick::from_seconds_f64(1.0), Value::Scalar(100.0))];
+    let cache = crate::LayerCache::default();
+    let tree = &project.comp(cid).unwrap().layers[0].props;
+    let weak = tree.downgrade();
+    let first = cache.scalar_integral(tree, tree.prop("effects/#1/speed").unwrap()).unwrap();
+    for _ in 0..100 {
+        assert!(Arc::ptr_eq(&first, &cache.scalar_integral(tree, tree.prop("effects/#1/speed").unwrap()).unwrap()));
+    }
+    project.comp_mut(cid).unwrap().layers[0].props.prop_mut("effects/#1/speed").unwrap().keys[1].value = Value::Scalar(200.0);
+    assert!(weak.upgrade().is_none(), "prepared curves must not retain document trees");
+    let tree = &project.comp(cid).unwrap().layers[0].props;
+    let next = cache.scalar_integral(tree, tree.prop("effects/#1/speed").unwrap()).unwrap();
+    assert!(!Arc::ptr_eq(&first, &next));
+    assert!(next.between(Tick::ZERO, Tick::from_seconds_f64(1.0)).unwrap() > first.between(Tick::ZERO, Tick::from_seconds_f64(1.0)).unwrap());
+}
+
+#[test]
+fn timewarp_shutter_samples_follow_a_speed_change_inside_the_exposure() {
+    let (mut project, cid) = scene(Some((
+        "ec.time.timewarp",
+        &[
+            ("method", Value::Enum(1)),
+            ("motionBlur/enableMotionBlur", Value::Bool(true)),
+            ("motionBlur/shutterSamples", Value::Scalar(3.0)),
+            ("motionBlur/shutterControl", Value::Enum(1)),
+            ("motionBlur/shutterAngle", Value::Scalar(180.0)),
+        ],
+    )));
+    project.comp_mut(cid).unwrap().layers[0].props.prop_mut("effects/#1/speed").unwrap().keys =
+        vec![Keyframe::new(Tick::ZERO, Value::Scalar(100.0)).hold(), Keyframe::new(Tick::from_seconds_f64(0.5), Value::Scalar(0.0)).hold()];
+    project.settings.bit_depth = effectcraft_project::BitDepth::Bpc32;
+    let actual = alpha(&render(&project, cid, 0.49, Some(&crate::LayerCache::default())));
+    let expected = (0.49 + 0.49 + 0.5 / 30.0 / 2.0 + 0.5) / 3.0;
+    assert!((actual - expected).abs() < 2e-6, "shutter must freeze at source 0.5: {actual} != {expected}");
+}
+
+#[test]
+fn timewarp_native_rate_integration_keeps_ticks_and_evaluates_expressions_in_layer_time() {
+    use effectcraft_effects::EffectHost;
+    use effectcraft_project::Expression;
+    use std::sync::atomic::AtomicUsize;
+    struct Rate;
+    impl crate::eval::ExprHost for Rate {
+        fn eval(&self, ctx: &crate::EvalCtx, layer: &effectcraft_project::Layer, _: &effectcraft_project::Property, _: &Value) -> Result<Value, String> {
+            Ok(Value::Scalar(50.0 + 50.0 * layer.layer_time(ctx.time).seconds()))
+        }
+    }
+    let (mut project, cid) = scene(Some(("ec.time.timewarp", &[])));
+    let layer = &mut project.comp_mut(cid).unwrap().layers[0];
+    layer.start_time = Tick::from_seconds_f64(0.2);
+    layer.stretch = 200.0;
+    layer.props.prop_mut("effects/#1/speed").unwrap().keys =
+        vec![Keyframe::new(Tick::ZERO, Value::Scalar(100.0)).eased(), Keyframe::new(Tick::from_seconds_f64(1.0), Value::Scalar(100.0)).eased()];
+    let cache = crate::LayerCache::default();
+    let run = |project: &Project, expr: Option<&dyn crate::eval::ExprHost>, at: Tick| {
+        let mut r = crate::Renderer::new(project, &crate::NoFootage, crate::RenderOpts::default());
+        r.cache = Some(&cache);
+        r.expr = expr;
+        let comp = project.comp(cid).unwrap();
+        let layer = &comp.layers[0];
+        let ctx = crate::EvalCtx { project, comp_id: cid, comp, time: layer.comp_time(at), expr, footage: None };
+        let host = crate::FxHost { r: &r, ctx: &ctx, layer, origin: [0.0; 2], index: AtomicUsize::new(0), original: None };
+        host.integrated_time("speed", 100.0, at).unwrap()
+    };
+    for at in [Tick(FrameRate::FPS_120.tick_of(31_000_003).0 - 1), Tick::from_seconds_f64(-0.5)] {
+        assert_eq!(run(&project, None, at).unwrap(), at, "constant keyed 100% retains individual Ticks");
+    }
+    project.comp_mut(cid).unwrap().layers[0].props.prop_mut("effects/#1/speed").unwrap().expr = Some(Expression { text: "50+time*50".into(), enabled: true });
+    for seconds in [0.5, 1.0, -0.5] {
+        let expected = Tick::from_seconds_f64(0.5 * seconds + 0.25 * seconds * seconds);
+        let actual = run(&project, Some(&Rate), Tick::from_seconds_f64(seconds)).unwrap();
+        assert!((actual.0 - expected.0).abs() <= 2, "expression area {seconds}: {actual:?} != {expected:?}");
+    }
+    assert!(run(&project, None, Tick::from_seconds_f64(1.0)).unwrap_err().contains("expression evaluator"));
+}
+
+#[test]
 fn posterize_time_holds_frames() {
     let (p, cid) = scene(Some(("ec.time.posterizetime", &[("frameRate", Value::Scalar(4.0))])));
     for (t, want) in [(0.3, 0.25), (0.45, 0.25), (0.5, 0.5), (0.74, 0.5), (0.8, 0.75)] {

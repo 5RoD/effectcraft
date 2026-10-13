@@ -125,6 +125,53 @@ struct FxHost<'r, 'a, 'c> {
 }
 
 impl FxHost<'_, '_, '_> {
+    fn integrate_expression(&self, property: &effectcraft_project::Property, at: Tick) -> Result<f64, String> {
+        let expr = self.ctx.expr.ok_or("Speed expression requires an expression evaluator")?;
+        let mut evaluations = 0usize;
+        let mut point = |time: Tick| -> Result<f64, String> {
+            evaluations += 1;
+            if evaluations > 4096 {
+                return Err("Speed expression exceeds the integration work budget; animate Source Frame for an explicit mapping".into());
+            }
+            let ctx = self.ctx.at(self.layer.comp_time(time));
+            match expr.eval(&ctx, self.layer, property, &property.value_at(time))? {
+                effectcraft_keyframe::Value::Scalar(v) if v.is_finite() => Ok(v),
+                _ => Err("Speed expression must return a finite scalar".into()),
+            }
+        };
+        if at == Tick::ZERO {
+            point(Tick::ZERO)?;
+            return Ok(0.0);
+        }
+        let (lo, hi) = if at < Tick::ZERO { (at, Tick::ZERO) } else { (Tick::ZERO, at) };
+        let mut start = lo;
+        let mut area = 0.0;
+        // Split at key boundaries so expressions reading `value` preserve held changes.
+        for end in property.keys.iter().map(|k| k.time).filter(|t| *t > lo && *t < hi).chain(std::iter::once(hi)) {
+            if end < start {
+                return Err("Speed expression keys must be ordered".into());
+            }
+            let duration = (end.0 as i128 - start.0 as i128) as f64;
+            if duration > 0.0 {
+                let average = effectcraft_keyframe::integral::integrate_function(|u| {
+                    let mut time = Tick(start.0.saturating_add((duration * u).round() as i64));
+                    // A held key changes at `end`, but that endpoint has zero area in the
+                    // interval ending there. Sample its left limit rather than the next hold.
+                    if time >= end {
+                        time = Tick(end.0.saturating_sub(1));
+                    }
+                    point(time)
+                })?;
+                area += average * duration;
+                if !area.is_finite() {
+                    return Err("Speed expression integral exceeds finite arithmetic".into());
+                }
+            }
+            start = end;
+        }
+        Ok(if at < Tick::ZERO { -area } else { area })
+    }
+
     /// Another layer's pixels for a layer parameter, in its effect space; `layer_space`: `buf`
     /// is still in layer space (its source or its content).
     fn pixels(&self, other: &Layer, mut buf: Buf, layer_space: bool) -> LayerPixels {
@@ -256,6 +303,39 @@ impl EffectHost for FxHost<'_, '_, '_> {
         let g = self.layer.effects()?.groups().nth(i)?;
         let ctx = self.ctx.at(self.layer.comp_time(Tick::from_seconds_f64(layer_time)));
         Some(effectcraft_effects::flatten_params(g, &mut |pr| ctx.value(self.layer, pr)))
+    }
+
+    fn integrated_time(&self, parameter: &str, normal: f64, at: Tick) -> Option<Result<Tick, String>> {
+        let i = self.index.load(std::sync::atomic::Ordering::Relaxed);
+        let property = self.layer.effects()?.groups().nth(i)?.prop(parameter)?;
+        if !property.has_expression() && property.keys.len() <= 1 {
+            return None;
+        }
+        Some((|| {
+            if !normal.is_finite() || normal == 0.0 {
+                return Err("rate integration requires a finite nonzero normal rate".into());
+            }
+            if !(Tick::MIN..=Tick::MAX).contains(&at) {
+                return Err("rate integration time exceeds the supported Tick range".into());
+            }
+            let area = if property.has_expression() {
+                self.integrate_expression(property, at)?
+            } else {
+                let curve = match self.r.cache {
+                    Some(cache) => cache.scalar_integral(&self.layer.props, property)?,
+                    None => Arc::new(effectcraft_keyframe::integral::ScalarIntegral::new(&property.keys)?),
+                };
+                if curve.constant_value() == Some(normal) {
+                    return Ok(at);
+                }
+                curve.between(Tick::ZERO, at)?
+            };
+            let ticks = area / normal;
+            if !ticks.is_finite() || ticks < Tick::MIN.0 as f64 || ticks > Tick::MAX.0 as f64 {
+                return Err("integrated rate exceeds the supported source-time range".into());
+            }
+            Ok(Tick(ticks.round() as i64))
+        })())
     }
 
     fn comp_scene(&self) -> Option<effectcraft_effects::CompScene> {

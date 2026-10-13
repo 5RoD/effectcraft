@@ -119,6 +119,38 @@ above for installed fonts, Unicode affixes, and text animators. Full language-sp
 and unsupported currency glyphs are not provided by the Numbers effect. Prefix/suffix rendering is bounded to 256 characters
 each so malformed files cannot create unbounded glyph lists per frame.
 
+## Animated Timewarp Speed
+
+Timewarp Speed now accumulates source time from layer time zero. A linear ramp from
+50% to 150% over two seconds reaches source time 0.75 seconds at output time one
+second; multiplying the latest 100% speed by the entire elapsed second incorrectly
+reached source time one second. Held zero/negative speeds freeze or reverse from
+the accumulated position instead of jumping back to the beginning. Source Frame
+remains an explicit frame-position curve.
+
+Linear, Hold, Bézier and auto-Bézier speed curves use prepared cumulative areas.
+Steady queries search their key intervals rather than replaying prior frames. The
+renderer caches prepared curves against weak immutable property-tree identities,
+with a 16 MiB/512-entry bound; edits invalidate the identity, and cached curves do
+not retain old project trees. Motion-blur samples integrate the speed at each
+output sample time, including rate changes inside the exposure. Constant and
+single-key rates retain the existing exact Tick transport.
+
+Speed expressions use bounded adaptive numerical integration in layer time.
+Smooth constant, linear and polynomial rates are supported; failed, non-finite
+or non-converging expressions return a render error with context. This numerical
+path has an evaluation budget and does not establish exact integration for every
+possible expression or discontinuity. Source Frame provides an explicit mapping
+when a rate expression exceeds that budget. Changes to the renderer salt prevent
+older disk frames from masking the corrected behavior.
+
+Tests cover analytic areas, overlapping easing influences, seeks in different
+orders, freeze/reverse ramps, property edits, weak-cache lifetime, native expression
+timing and shutter changes. The `integral_bench` example measures preparation and
+lookup cost separately; it does not measure decoding, optical flow or full playback.
+This fixes a native retiming behavior, not commercial Twixtor algorithm compatibility
+or complete After Effects Timewarp fidelity (including its fractional-frame phase).
+
 ## Remaining requested workflows
 
 Flow-style curve editing and libraries use the existing Ease Presets panel; this work does not

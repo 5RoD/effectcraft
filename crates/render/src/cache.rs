@@ -22,7 +22,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use effectcraft_effects::Buf;
-use effectcraft_project::{ItemKind, Layer, LayerSource, Node, PropGroup};
+use effectcraft_project::{ItemKind, Layer, LayerSource, Node, PropGroup, Property, PropertyTree};
 
 use crate::eval::EvalCtx;
 
@@ -39,6 +39,18 @@ pub struct LayerCache {
     store: Mutex<Option<(Arc<dyn LayerStore>, u64)>>,
     /// While set, inserts are dropped (see [`LayerCache::set_gate`]).
     gate: Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
+    scalar_integrals: Mutex<ScalarCache>,
+}
+
+#[derive(Default)]
+struct ScalarCache {
+    map: HashMap<(usize, u64), ScalarEntry>,
+    bytes: usize,
+}
+
+struct ScalarEntry {
+    tree: std::sync::Weak<PropGroup>,
+    curve: Arc<effectcraft_keyframe::integral::ScalarIntegral>,
 }
 
 struct Entry {
@@ -81,6 +93,7 @@ impl LayerCache {
             disk: Mutex::new(None),
             store: Mutex::new(None),
             gate: Mutex::new(None),
+            scalar_integrals: Mutex::new(ScalarCache::default()),
         }
     }
 
@@ -92,6 +105,38 @@ impl LayerCache {
         if let Ok(mut g) = self.gate.lock() {
             *g = gate;
         }
+    }
+
+    /// Prepared keyframe curves share immutable property storage. Weak identities expire
+    /// after edits, and a bounded cache avoids retaining either old projects or large curves.
+    pub(crate) fn scalar_integral(&self, tree: &PropertyTree, prop: &Property) -> Result<Arc<effectcraft_keyframe::integral::ScalarIntegral>, String> {
+        let weak = tree.downgrade();
+        let key = (weak.as_ptr() as usize, prop.uid);
+        {
+            let cache = self.scalar_integrals.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(entry) = cache.map.get(&key).filter(|e| e.tree.strong_count() > 0) {
+                return Ok(entry.curve.clone());
+            }
+        }
+        let curve = Arc::new(effectcraft_keyframe::integral::ScalarIntegral::new(&prop.keys)?);
+        let bytes = curve.memory_bytes();
+        // Larger valid curves remain usable; they simply do not occupy the shared cache.
+        const BUDGET: usize = 16 * 1024 * 1024;
+        if bytes <= BUDGET {
+            let mut cache = self.scalar_integrals.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(entry) = cache.map.get(&key).filter(|e| e.tree.strong_count() > 0) {
+                return Ok(entry.curve.clone());
+            }
+            cache.map.retain(|_, e| e.tree.strong_count() > 0);
+            cache.bytes = cache.map.values().fold(0usize, |total, e| total.saturating_add(e.curve.memory_bytes()));
+            if cache.bytes.saturating_add(bytes) > BUDGET || cache.map.len() >= 512 {
+                cache.map.clear();
+                cache.bytes = 0;
+            }
+            cache.bytes = cache.bytes.saturating_add(bytes);
+            cache.map.insert(key, ScalarEntry { tree: weak, curve: curve.clone() });
+        }
+        Ok(curve)
     }
 
     fn gated(&self) -> bool {
@@ -244,6 +289,9 @@ impl LayerCache {
             g.map.clear();
             g.bytes = 0;
         }
+        let mut curves = self.scalar_integrals.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        curves.map.clear();
+        curves.bytes = 0;
     }
 
     pub fn stats(&self) -> CacheStats {

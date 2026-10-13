@@ -13,6 +13,14 @@ pub type Uid = u64;
 #[serde(transparent)]
 pub struct PropertyTree(std::sync::Arc<PropGroup>);
 
+impl PropertyTree {
+    /// Weak process-local identity for prepared render data. An edit detaches this storage,
+    /// invalidating caches without retaining old project trees or scanning their keyframes.
+    pub fn downgrade(&self) -> std::sync::Weak<PropGroup> {
+        std::sync::Arc::downgrade(&self.0)
+    }
+}
+
 impl From<PropGroup> for PropertyTree {
     fn from(group: PropGroup) -> Self {
         Self(std::sync::Arc::new(group))
