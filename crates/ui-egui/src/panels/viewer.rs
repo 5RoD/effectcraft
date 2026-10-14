@@ -1144,8 +1144,41 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
 
     // Interaction.
     let resp = ui.interact(area, egui::Id::new("viewer-interact"), Sense::click_and_drag());
+    let mods = ui.input(|i| i.modifiers);
+    let space_pan = super::space_hand(&ctx);
+    let alt_id = egui::Id::new(("viewer-alt-camera", cid.0));
+    // Capture temporary navigation at the press, including clicks too short to start a drag.
+    // Its release must not open a context menu or pick a layer if Alt was released first.
+    let can_alt_camera = app.session.prefs.three_d.alt_camera_navigation
+        && mods.alt
+        && !mods.ctrl
+        && !mods.command
+        && !space_pan
+        && app.dialog.is_none()
+        && app.session.state.text_edit.is_none()
+        && ui.input(|i| i.focused)
+        && !ctx.egui_wants_keyboard_input()
+        && !widgets::any_menu_open(&ctx)
+        && matches!(app.ui.tool, Tool::Selection | Tool::Hand | Tool::Rotate | Tool::UnifiedCamera | Tool::Orbit | Tool::PanCamera | Tool::Dolly)
+        && comp.layers.iter().any(|l| l.switches.three_d || l.is_camera());
+    if ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::WindowFocused(false)))) {
+        ui.data_mut(|d| d.remove::<bool>(alt_id));
+    } else if ui.input(|i| i.pointer.any_pressed() && i.pointer.press_origin().is_some_and(|p| area.contains(p))) && can_alt_camera {
+        ui.data_mut(|d| d.insert_temp(alt_id, true));
+    }
+    let alt_camera = can_alt_camera || ui.data(|d| d.get_temp::<bool>(alt_id)).unwrap_or(false);
+    let viewer_tool = if space_pan {
+        Tool::Hand
+    } else if alt_camera {
+        Tool::UnifiedCamera
+    } else {
+        app.ui.tool
+    };
+    if !ui.input(|i| i.pointer.any_down()) {
+        ui.data_mut(|d| d.remove::<bool>(alt_id));
+    }
     let menu_hits_id = egui::Id::new(("viewer-menu-hits", cid.0));
-    if app.ui.tool != Tool::UnifiedCamera
+    if viewer_tool != Tool::UnifiedCamera
         && resp.secondary_clicked()
         && let Some(pos) = resp.interact_pointer_pos()
     {
@@ -1159,7 +1192,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let context_layers: Vec<u64> =
         app.session.state.selected_layers.iter().filter(|id| comp.layer(**id).is_some_and(|l| !l.switches.locked)).map(|id| id.0).collect();
     let mut context_actions = Vec::new();
-    if app.ui.tool != Tool::UnifiedCamera {
+    if viewer_tool != Tool::UnifiedCamera {
         resp.context_menu(|ui| {
             let hits = ui.data(|d| d.get_temp::<Vec<(u64, String)>>(menu_hits_id)).unwrap_or_default();
             if !hits.is_empty() {
@@ -1195,7 +1228,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let c = map.to_comp(hp);
             [c[0] as f32, c[1] as f32]
         });
-        let cursor = match app.ui.tool {
+        let cursor = match viewer_tool {
             Tool::Hand => egui::CursorIcon::Grab,
             Tool::Zoom => egui::CursorIcon::ZoomIn,
             Tool::Type | Tool::TypeVertical => egui::CursorIcon::Text,
@@ -1248,8 +1281,6 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         app.pointer_comp = None;
     }
     app.ui.viewer.interacting = resp.dragged();
-    let mods = ui.input(|i| i.modifiers);
-    let space_pan = super::space_hand(&ctx);
     // Pen tool: each press places a vertex (dragging pulls Bezier tangents); pressing on the
     // first vertex closes the path.
     if app.ui.tool == Tool::Pen
@@ -1271,7 +1302,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         vertex_hits.iter().rev().filter(|h| h.tangent.is_some() == tangents).find(|h| h.pos.distance(pos) < 6.0).copied()
     };
     // On-canvas text editing (Type tool, double-click a text layer) owns its clicks and drags.
-    let text_owns = super::viewer_text::hook(app, ui, &painter, &map, &ectx, &resp, space_pan);
+    let text_owns = !alt_camera && super::viewer_text::hook(app, ui, &painter, &map, &ectx, &resp, space_pan);
     if resp.drag_started()
         && !text_owns
         && let Some(pos) = resp.interact_pointer_pos()
@@ -1280,7 +1311,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let press = ui.input(|i| i.pointer.press_origin()).unwrap_or(pos);
         let tool = if space_pan {
             Tool::Hand
-        } else if app.ui.tool == Tool::UnifiedCamera {
+        } else if viewer_tool == Tool::UnifiedCamera {
             if resp.dragged_by(egui::PointerButton::Middle) {
                 Tool::PanCamera
             } else if resp.dragged_by(egui::PointerButton::Secondary) {
@@ -1291,10 +1322,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         } else if resp.dragged_by(egui::PointerButton::Middle) {
             Tool::Hand
         } else {
-            app.ui.tool
+            viewer_tool
         };
         let g = match tool {
             Tool::Hand => Some(Gesture::Pan { start_pan: app.ui.viewer.pan }),
+            Tool::Orbit | Tool::PanCamera | Tool::Dolly => Some(Gesture::Camera { tool, unified: viewer_tool == Tool::UnifiedCamera, horizontal: None }),
             // Region of Interest armed: the drag draws it.
             _ if app.ui.viewer.roi_draw => Some(Gesture::Overlay(ov::Drag::Roi { start: map.to_comp(press), keep: [None, None] })),
             // A region of interest handle: resize it from the opposite corner / edge.
@@ -1388,7 +1420,6 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
                 Some(Gesture::PuppetPin { layer: h.layer, pin: h.pin, inv })
             }),
-            Tool::Orbit | Tool::PanCamera | Tool::Dolly => Some(Gesture::Camera { tool, unified: app.ui.tool == Tool::UnifiedCamera, horizontal: None }),
             Tool::Selection if super::tracker::hit_at(&track_hits, press).is_some() => {
                 let hit = super::tracker::hit_at(&track_hits, press);
                 track_cur.zip(hit).and_then(|((tl, tu), hit)| {
@@ -1778,7 +1809,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         && let Some(pos) = resp.interact_pointer_pos()
     {
         let cpt = map.to_comp(pos);
-        match app.ui.tool {
+        match viewer_tool {
             Tool::Zoom => {
                 let k = if mods.alt { 0.5 } else { 2.0 };
                 let nz = (zoom * k).clamp(0.01, 32.0);
@@ -1788,6 +1819,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 app.ui.viewer.pan = [pan.x, pan.y];
             }
             Tool::Type | Tool::TypeVertical => {}
+            t if t.is_camera() => {}
             Tool::Pen | Tool::MaskFeather => {}
             // On a motion path (After Effects): Add Vertex adds a keyframe where it is clicked,
             // Delete Vertex removes the keyframe, Convert Vertex switches it between Linear and
@@ -1866,7 +1898,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
     if resp.double_clicked()
         && !text_owns
-        && app.ui.tool == Tool::Selection
+        && viewer_tool == Tool::Selection
         && let Some(pos) = resp.interact_pointer_pos()
         && let Some((l, m)) = vertex_at(pos, false).map(|h| (h.layer, h.mask)).or_else(|| ov::segment_at(&paths, &map, pos, 6.0).map(|s| (s.0, s.1)))
     {
@@ -1880,6 +1912,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         ov::begin_free_transform(&ctx, l, m);
     } else if resp.double_clicked()
         && !text_owns
+        && !viewer_tool.is_camera()
         && !app.ui.tool.is_pen()
         && let Some(pos) = resp.interact_pointer_pos()
     {

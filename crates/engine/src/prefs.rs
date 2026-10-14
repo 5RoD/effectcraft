@@ -282,6 +282,8 @@ page!(ThreeD {
     show_reference_axes: bool = true,
     extended_viewer: bool = false,
     realtime_shadows: bool = true,
+    /// Alt/Option-drag temporarily navigates a 3D view, preserving the selected tool.
+    alt_camera_navigation: bool = true,
 });
 
 page!(
@@ -1325,6 +1327,7 @@ pub fn pages() -> Vec<Page> {
                 s("threeD.showReferenceAxes", "Show 3D Reference Axes", B, true),
                 s("threeD.extendedViewer", "Extended Viewer", B, true),
                 s("threeD.realtimeShadows", "Realtime Shadows in Draft", B, true),
+                s("threeD.altCameraNavigation", "Alt/Option-Drag for Camera Navigation", B, true),
             ],
         },
         Page {

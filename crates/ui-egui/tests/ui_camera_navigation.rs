@@ -165,3 +165,122 @@ fn unified_camera_navigates_a_default_view_without_a_camera_layer() {
     assert_eq!(serde_json::to_value(&*h.state().session.project).unwrap(), before);
     assert!(h.state().session.active_comp().unwrap().layers.iter().all(|l| !l.is_camera()));
 }
+
+#[test]
+fn alt_camera_navigation_preserves_the_toolbar_and_merges_each_camera_drag() {
+    let mut h = Harness::builder().with_size(vec2(1280.0, 800.0)).build_eframe(|_| app(true));
+    h.run_steps(3);
+    let slots = h.state().ui.slot_tools.clone();
+    let selection = h.state().session.state.selected_layers.clone();
+    let pan = h.state().ui.viewer.pan;
+    for button in [PointerButton::Primary, PointerButton::Middle, PointerButton::Secondary] {
+        let position = camera_prop(&h, "transform/position");
+        let undo = h.state().session.history.undo.len();
+        drag(&mut h, button, Modifiers::ALT);
+        assert_ne!(camera_prop(&h, "transform/position"), position, "Alt+{button:?} navigates the camera");
+        assert_eq!(h.state().session.history.undo.len(), undo + 1);
+        assert_eq!(h.state().ui.tool, Tool::Selection);
+        assert_eq!(h.state().ui.slot_tools, slots);
+        assert_eq!(h.state().ui.viewer.pan, pan);
+        assert_eq!(h.state().session.state.selected_layers, selection);
+        assert!(!egui::Popup::is_any_open(&h.ctx));
+        h.state_mut().session.undo();
+        h.run_steps(2);
+        assert_eq!(camera_prop(&h, "transform/position"), position);
+    }
+    h.state_mut().session.execute("prefs.set", json!({"key": "threeD.altCameraNavigation", "value": false})).unwrap();
+    let saved = serde_json::to_value(&h.state().session.prefs).unwrap();
+    let reopened: effectcraft_engine::prefs::Prefs = serde_json::from_value(saved).unwrap();
+    assert!(!reopened.three_d.alt_camera_navigation);
+    assert!(effectcraft_engine::prefs::Prefs::from_json("{}").three_d.alt_camera_navigation);
+    let position = camera_prop(&h, "transform/position");
+    drag(&mut h, PointerButton::Middle, Modifiers::ALT);
+    assert_eq!(camera_prop(&h, "transform/position"), position);
+    assert_ne!(h.state().ui.viewer.pan, pan, "disabling the preference restores canvas panning");
+}
+
+#[test]
+fn alt_navigates_the_default_3d_view_but_preserves_flat_composition_controls() {
+    let mut h = Harness::builder().with_size(vec2(1280.0, 800.0)).build_eframe(|_| app(false));
+    h.run_steps(3);
+    let cid = h.state().session.active_comp_id().unwrap();
+    let project = serde_json::to_value(&*h.state().session.project).unwrap();
+    let undo = h.state().session.history.undo.len();
+    drag(&mut h, PointerButton::Primary, Modifiers::ALT);
+    let orbit = h.state().session.view_camera(cid).unwrap().eye;
+    drag(&mut h, PointerButton::Middle, Modifiers::ALT);
+    assert_ne!(h.state().session.view_camera(cid).unwrap().eye, orbit);
+    assert_eq!(h.state().session.history.undo.len(), undo);
+    assert_eq!(serde_json::to_value(&*h.state().session.project).unwrap(), project);
+    assert_eq!(h.state().ui.tool, Tool::Selection);
+    let solid = h.state().session.state.selected_layers[0];
+    h.state_mut().session.execute("layer.setSwitch", json!({"layer": solid.0, "switch": "threeD", "value": false})).unwrap();
+    let view = serde_json::to_value(&h.state().session.state.views3d).unwrap();
+    let pan = h.state().ui.viewer.pan;
+    drag(&mut h, PointerButton::Middle, Modifiers::ALT);
+    assert_eq!(serde_json::to_value(&h.state().session.state.views3d).unwrap(), view);
+    assert_ne!(h.state().ui.viewer.pan, pan);
+}
+
+#[test]
+fn alt_camera_release_and_other_modifier_controls_do_not_leak_into_selection() {
+    let mut h = Harness::builder().with_size(vec2(1280.0, 800.0)).build_eframe(|_| app(true));
+    h.run_steps(3);
+    let selection = h.state().session.state.selected_layers.clone();
+    let [x, y, w, hh] = h.state().auto.find("viewer.area").unwrap().rect;
+    let from = pos2(x + w * 0.5, y + hh * 0.5);
+    // Release Alt before the right button, for both a click and a camera drag.
+    for delta in [vec2(0.0, 0.0), vec2(36.0, 18.0)] {
+        h.input_mut().events.extend([
+            Event::ModifiersChanged(Modifiers::ALT),
+            Event::PointerMoved(from),
+            Event::PointerButton { pos: from, button: PointerButton::Secondary, pressed: true, modifiers: Modifiers::ALT },
+        ]);
+        h.step();
+        h.input_mut().events.push(Event::PointerMoved(from + delta));
+        h.step();
+        h.input_mut().events.push(Event::ModifiersChanged(Modifiers::NONE));
+        h.step();
+        h.input_mut().events.push(Event::PointerButton { pos: from + delta, button: PointerButton::Secondary, pressed: false, modifiers: Modifiers::NONE });
+        h.run_steps(2);
+        assert_eq!(h.state().session.state.selected_layers, selection);
+        assert_eq!(h.state().ui.tool, Tool::Selection);
+        assert!(!egui::Popup::is_any_open(&h.ctx));
+    }
+    let blank = from + vec2(140.0, 75.0);
+    h.input_mut().events.extend([
+        Event::ModifiersChanged(Modifiers::ALT),
+        Event::PointerMoved(blank),
+        Event::PointerButton { pos: blank, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::ALT },
+    ]);
+    h.step();
+    h.input_mut().events.push(Event::ModifiersChanged(Modifiers::NONE));
+    h.step();
+    h.input_mut().events.push(Event::PointerButton { pos: blank, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+    h.step();
+    assert_eq!(h.state().session.state.selected_layers, selection, "a short Alt-click on empty space does not deselect");
+    let position = camera_prop(&h, "transform/position");
+    let pan = h.state().ui.viewer.pan;
+    h.input_mut().events.push(Event::Key { key: Key::Space, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });
+    h.step();
+    drag(&mut h, PointerButton::Primary, Modifiers::ALT);
+    h.input_mut().events.push(Event::Key { key: Key::Space, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE });
+    h.step();
+    assert_eq!(camera_prop(&h, "transform/position"), position);
+    assert_ne!(h.state().ui.viewer.pan, pan, "Spacebar panning takes priority");
+    drag(&mut h, PointerButton::Middle, Modifiers::ALT | Modifiers::COMMAND);
+    assert_eq!(camera_prop(&h, "transform/position"), position, "Ctrl/Cmd+Alt retains its alternate tool actions");
+    h.state_mut().ui.tool = Tool::Zoom;
+    h.run_steps(2);
+    let zoom = h.state().ui.viewer.zoom.unwrap();
+    h.input_mut().events.extend([
+        Event::ModifiersChanged(Modifiers::ALT),
+        Event::PointerMoved(from),
+        Event::PointerButton { pos: from, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::ALT },
+    ]);
+    h.step();
+    h.input_mut().events.push(Event::PointerButton { pos: from, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::ALT });
+    h.step();
+    assert_eq!(h.state().ui.viewer.zoom, Some(zoom * 0.5), "Zoom's Alt-click still zooms out");
+    assert_eq!(camera_prop(&h, "transform/position"), position);
+}

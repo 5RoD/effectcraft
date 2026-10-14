@@ -79,6 +79,11 @@ Commands (CLI, MCP, control channel):
 - `memory.mediaCacheMb`: Footage Frame Cache (in the browser at most 256 MB)
 - `memory.previewCacheMb`: Preview (RAM) Cache
 - `threeD.defaultRenderer`: Default 3D Renderer
+- `threeD.altCameraNavigation`: Alt/Option-drag for temporary camera navigation in a
+  composition with 3D layers or a camera. Left/middle/right drag orbit/pan/dolly. The selected
+  toolbar tool stays unchanged. Disable it to retain Selection tool Alt-drag behavior.
+  Drawing, Zoom, Pan Behind and text tools retain their existing modifier actions; typing,
+  dialogs and menus own their input, and Spacebar panning takes precedence.
 - `labels.N.name` / `labels.N.color`: the 16 label names and colours, used by the Label menu,
   the timeline, project panel, render queue and viewer handles
 - `general.switchesAffectNestedComps`: a precomp layer's Quality (Draft / Wireframe) and Motion

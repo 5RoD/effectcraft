@@ -61,17 +61,25 @@ Adobe’s shortcut editor documentation also says conflicts should be visible, p
 
 ## Focused Windows shortcut gaps in the development fork
 
-The follow-up audit identified these remaining gaps in the current source. Adobe's
+The follow-up audit identified these gaps and scoped camera improvements in the current source. Adobe's
 [shortcut reference](https://helpx.adobe.com/uk/after-effects/desktop/get-started/keyboard-shortcuts/keyboard-shortcuts-reference.html)
-is the behavioral reference; these items have not been fixed or accepted in this milestone.
+is the behavioral reference. Source interaction tests use original small scenes; they do not
+establish complete After Effects behavior or pixel fidelity.
 
 | Workflow | Current gap | Acceptance check |
 | --- | --- | --- |
 | Temporary tools | Most single-letter tool keys latch on key-down; only Space has a temporary Hand lifecycle. | Hold a tool key during a drag, then release and recover the previous tool; a tap keeps the chosen tool. |
-| Camera navigation | Orbit/Pan/Dolly exist on 1/2/3, but C cycling and Unified Camera are missing. Activation is not restricted to compositions with a camera layer. | Cycle the four documented camera modes with C, verify gestures, and verify activation context. |
-| Camera framing | F routes to Timeline's Reveal Feather even while a viewer has focus; camera framing lacks the documented F/Ctrl+Shift+F bindings. | With a camera tool active, frame selected/all 3D layers from the viewer; Timeline's F must still reveal feather in its proper context. |
+| Camera navigation | C cycles Unified/Orbit/Pan/Dolly; 1/2/3 select individual tools. Unified uses left/middle/right buttons, and Default view navigation works without a camera layer. Cursor-centered interaction modes and parented camera transforms still need fidelity checks. | Verify camera/default-view gestures, one undo per camera drag, locked cameras, and orthographic constraints; then compare cursor modes and parenting with a behavioral reference. |
+| Temporary camera navigation | Alt/Option-drag uses Unified navigation without changing the selected toolbar tool in a 3D composition. `threeD.altCameraNavigation` can disable it. Drawing, Zoom, Pan Behind and text tools preserve their existing alternate actions. | Verify all three buttons, early Alt release, selection preservation, Default view without document edits, Space priority, and disabling the preference. Alternate drawing-tool interactions still need a live reference. |
+| Camera framing | Viewer F/Ctrl+Shift+F frame selected/all 3D content while a camera tool is selected; Timeline and non-camera contexts keep Feather commands. | Verify focus, camera-tool context, offscreen 2D exclusions, and selected/all 3D framing; compare framing distance and parenting with a behavioral reference. |
 | 3D manipulators | V is Selection; 4/5/6 do not select Position/Scale/Rotation gizmos. | Switch the documented manipulators with a 3D selection and viewer focus without breaking other tool contexts. |
 | Panel scopes | All Timeline bindings are allowed in Composition/Layer/Viewer panels. | Verify each panel-specific binding against Adobe's scope, with focused-panel bindings taking precedence over app bindings. |
+
+The [3D preferences reference](https://helpx.adobe.com/in/after-effects/desktop/get-started/preferences-and-settings/preferences.html)
+documents Alt/Option camera navigation as a configurable behavior. EffectCraft's new checkbox
+is available in Settings ▸ 3D and through `prefs.get`/`prefs.set`; missing values in older
+settings files use the enabled default. Scroll-wheel camera modes and the 1–6 preference
+choices remain separate gaps.
 
 Core J/K, I/O, Home/End, Page Up/Page Down navigation and F10–F12 3D view switching already
 have bindings. Their presence is not evidence that every edge case matches Adobe.
