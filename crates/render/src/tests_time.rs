@@ -71,6 +71,37 @@ fn render(p: &Project, cid: ItemId, t: f64, cache: Option<&crate::LayerCache>) -
     r.comp_frame(cid, Tick::from_seconds_f64(t))
 }
 
+#[test]
+fn timewarp_missing_precomp_samples_do_not_show_the_current_frame() {
+    let mut project = Project::default();
+    let source = Comp::new(8, 8, FrameRate::FPS_120, Tick::from_seconds_f64(1.0));
+    let source_id = project.add_item("Source", Label::Aqua, None, ItemKind::Comp(source.clone().into()));
+    let solid_id = project.add_item("Card", Label::Red, None, ItemKind::Solid(Solid { color: [0.8, 0.4, 0.2], width: 8, height: 8, pixel_aspect: 1.0 }));
+    let card = build::layer(&mut project, &source, "Card", LayerSource::Solid { item: solid_id }, (8, 8), None);
+    project.comp_mut(source_id).unwrap().layers.push(card);
+    let main = Comp::new(8, 8, FrameRate::FPS_120, Tick::from_seconds_f64(1.0));
+    let main_id = project.add_item("Retimed", Label::Sandstone, None, ItemKind::Comp(main.clone().into()));
+    let mut layer = build::layer(&mut project, &main, "Source", LayerSource::Comp { item: source_id }, (8, 8), None);
+    let spec = effectcraft_effects::find("ec.time.timewarp").unwrap();
+    let mut next = project.next_id;
+    let mut effect = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [8.0; 2]);
+    effect.prop_mut("adjustTimeBy").unwrap().value = Value::Enum(1);
+    layer.props.sub_mut("effects").unwrap().children.push(effect.into());
+    project.next_id = next;
+    project.comp_mut(main_id).unwrap().layers.push(layer);
+    let cache = crate::LayerCache::default();
+    for method in 0..=2 {
+        project.comp_mut(main_id).unwrap().layers[0].props.prop_mut("effects/#1/method").unwrap().value = Value::Enum(method);
+        // Before the source, after its end, then valid again: include repeated cached seeks.
+        for frame in [-30.5, 150.5, 60.0, -30.5, 60.0] {
+            project.comp_mut(main_id).unwrap().layers[0].props.prop_mut("effects/#1/sourceFrame").unwrap().value = Value::Scalar(frame);
+            let image = render(&project, main_id, 0.5, Some(&cache));
+            let expected = if frame == 60.0 { render(&project, source_id, 0.5, None) } else { crate::Image::new(8, 8) };
+            assert_eq!(image.data, expected.data, "method={method}, sourceFrame={frame}");
+        }
+    }
+}
+
 /// A white 200×100 solid whose full-frame mask fades in (opacity 0 → 100 over 0..1 s), with
 /// effect `fx` (and parameter overrides) applied.
 fn scene(fx: Option<(&str, &[(&str, Value)])>) -> (Project, ItemId) {

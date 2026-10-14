@@ -38,6 +38,40 @@ impl effectcraft_effects::EffectHost for Clock {
 }
 
 #[test]
+fn checked_timewarp_missing_samples_are_transparent_on_the_gpu() {
+    struct CurrentOnly;
+    impl effectcraft_effects::EffectHost for CurrentOnly {
+        fn layer(&self, _: u64, _: bool) -> Option<effectcraft_effects::LayerPixels> {
+            None
+        }
+        fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+            None
+        }
+        fn self_at(&self, time: f64, _: usize) -> Option<effectcraft_effects::Buf> {
+            (time == 0.7).then(|| effectcraft_effects::Buf {
+                img: effectcraft_raster::Image::filled(31, 19, [0.1, 0.2, 0.3, 1.0]),
+                offset: [1.0, 2.0],
+                scale: 0.5,
+            })
+        }
+    }
+    let gpu = crate::tests::gpu();
+    assert!(std::env::var("EFFECTCRAFT_REQUIRE_GPU").as_deref() != Ok("1") || gpu.is_some());
+    let Some(gpu) = gpu else { return };
+    let spec = effectcraft_effects::find(effectcraft_effects::timewarp::ID).unwrap();
+    for method in 0..=2 {
+        let mut parameters = timewarp_parameters(method, 8);
+        parameters.values.insert("sourceFrame".into(), n(-3.5));
+        let mut ctx = timewarp_context(&parameters);
+        ctx.env.host = Some(&CurrentOnly);
+        let input = ctx.env.host.unwrap().self_at(0.7, 0).unwrap();
+        let output = effectcraft_render::Accelerator::effect_checked(gpu, &effectcraft_render::FxStep { spec, ctx }, &input, None).unwrap().unwrap();
+        assert_eq!((output.img.width, output.img.height, output.offset, output.scale), (31, 19, input.offset, input.scale));
+        assert!(output.img.data.iter().all(|pixel| *pixel == [0.0; 4]), "method={method}");
+    }
+}
+
+#[test]
 fn exact_timewarp_source_boundaries_reach_gpu_without_float_host_roundtrips() {
     use effectcraft_effects::{Buf, EffectHost, LayerPixels};
     use effectcraft_raster::Image;

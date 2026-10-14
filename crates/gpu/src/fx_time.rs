@@ -223,7 +223,8 @@ impl WarpGpu {
     }
 }
 
-/// Run a checked Timewarp over resident pixels. A missing host/source retains the input;
+/// Run a checked Timewarp over resident pixels. An unavailable host retains the input;
+/// missing retimed samples with available current geometry are transparent.
 /// rejected controls/plans/kernels remain errors rather than legacy Option pass-through.
 pub(crate) fn checked(e: &mut Enc, ctx: &EffectCtx, input: GBuf) -> Result<GBuf, String> {
     if !input.scale.is_finite() || input.scale <= 0.0 || input.offset.iter().any(|value| !value.is_finite() || value.abs() > 1e12) {

@@ -684,7 +684,22 @@ fn prepare(ctx: &EffectCtx, input_pixels: u64) -> Result<Option<TimewarpPlan>, S
         }
         sources.push(source);
     }
-    let Some(grid) = union(&sources)? else { return Ok(None) };
+    let grid = match union(&sources)? {
+        Some(grid) => grid,
+        None => {
+            // Missing samples are transparent, including when *all* requested times lie
+            // outside a precomp. Borrow only the current source's geometry; its pixels
+            // must never become replacement samples. Unsupported hosts still pass through.
+            let current = host.time_ticks().map(|(layer, _)| layer).unwrap_or_else(|| Tick::from_seconds_f64(ctx.time));
+            if !(Tick::MIN..=Tick::MAX).contains(&current) {
+                return Err(invalid("host layer time exceeds the supported Tick range"));
+            }
+            let Some(reference) = host.self_at_tick(current, 0) else { return Ok(None) };
+            validate_input(&reference)?;
+            raw_bytes = mul(area(reference.img.width, reference.img.height)?, 16)?;
+            union(&[Some(reference)])?.ok_or_else(|| invalid("current source geometry is unavailable"))?
+        }
+    };
     // Validate floating products before PixelMotion's integer conversions.
     for value in [32.0 * grid.scale, ctx.params.get("tuning/blockSize").map(Value::as_f64).unwrap_or(8.0).max(4.0) * grid.scale] {
         if !value.is_finite() || value > MAX_DIMENSION as f64 {
@@ -887,6 +902,41 @@ mod tests {
             adjustment: false,
             env: EffectEnv { host: Some(host), frame_rate: 10.0, comp_time: 0.7, ..Default::default() },
         }
+    }
+
+    #[test]
+    fn missing_retimed_samples_use_current_geometry_without_current_pixels() {
+        struct CurrentOnly(Buf);
+        impl EffectHost for CurrentOnly {
+            fn layer(&self, _: u64, _: bool) -> Option<LayerPixels> {
+                None
+            }
+            fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+                None
+            }
+            fn self_at(&self, time: f64, _: usize) -> Option<Buf> {
+                (time == 0.7).then(|| self.0.clone())
+            }
+        }
+        let input = Buf { img: Image::filled(32, 20, [0.1, 0.2, 0.3, 1.0]), offset: [2.0, -3.0], scale: 0.5 };
+        let host = CurrentOnly(input.clone());
+        for method in 0..=2 {
+            for samples in [1, 8] {
+                let mut params = parameters(samples, method);
+                params.values.insert("sourceFrame".into(), Value::Scalar(-3.5));
+                params.values.insert("motionBlur/shutterAngle".into(), Value::Scalar(180.0));
+                let ctx = context(&params, &host);
+                let output = render_checked(&ctx, input.clone()).unwrap();
+                assert_eq!((output.img.width, output.img.height, output.offset, output.scale), (32, 20, input.offset, input.scale));
+                assert!(output.img.data.iter().all(|pixel| *pixel == [0.0; 4]), "method={method}, samples={samples}");
+                let malformed = CurrentOnly(Buf { img: Image::filled(32, 20, [f32::NAN; 4]), ..input.clone() });
+                assert!(render_checked(&context(&params, &malformed), input.clone()).unwrap_err().contains("non-finite RGBA"));
+            }
+        }
+        let params = parameters(1, 0);
+        let mut ctx = context(&params, &host);
+        ctx.env.host = None;
+        assert_eq!(render_checked(&ctx, input.clone()).unwrap().img.data, input.img.data);
     }
 
     /// The previous materialized-output path: retain every output, then sum per pixel in

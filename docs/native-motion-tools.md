@@ -139,6 +139,11 @@ Keyed constant 100%, -100% and 0% rates also use integer identity, checked negat
 and zero paths. Retimed values are checked against the supported Tick range after
 rounding, including the asymmetric positive/negative endpoints.
 
+When every retimed sample is outside a nested composition, Timewarp now returns
+transparent pixels using the current source's validated geometry. It no longer
+silently substitutes the current frame. CPU and GPU use the same prepared samples;
+source-range behavior is consistent with the renderer's existing precomp bounds.
+
 Speed expressions use bounded adaptive numerical integration in layer time.
 Smooth constant, linear and polynomial rates are supported; failed, non-finite
 or non-converging expressions return a render error with context. This numerical
