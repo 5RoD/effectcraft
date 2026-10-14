@@ -67,6 +67,7 @@ mod three_d;
 pub mod time;
 mod timeline;
 mod track;
+mod transform3d;
 mod view;
 pub mod viewer_cmds;
 pub(crate) mod vpe;
@@ -168,6 +169,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(animation::specs());
         v.extend(view::specs());
         v.extend(viewer_cmds::specs());
+        v.extend(transform3d::specs());
         v.extend(shape_stroke::specs());
         v.extend(shape_tool::specs());
         v.extend(focus::specs());

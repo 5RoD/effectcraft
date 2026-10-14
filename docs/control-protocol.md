@@ -30,6 +30,13 @@ printf '{"id":1,"method":"engine.execute","params":{"command":"comp.new","params
 
 ## Engine
 
+`layer.setTransforms3D` accepts `changes: [{layer, position?, scale?, orientation?, rotation?}]`;
+each supplied transform is an XYZ vector. It applies 1–4096 updates atomically to unlocked
+3D layers in the active comp, preserving animation and separated Position axes. Enabled
+expressions and invalid targets reject the whole update. Optional `time` uses composition
+seconds; consecutive updates with the same `merge` key form one undo step. This is the
+command foundation for 3D manipulation; it does not itself add viewer handles.
+
 | Method | Params | Result |
 |---|---|---|
 | `engine.execute` | `{command, params?}` | The command's result. Every engine command (`effectcraft-cli commands`) runs exactly as it does headless, so it never opens a dialog: `comp.new {}` creates a default comp. UI-only ids (`tool.*`, `view.*`, `window.*`, `playback.*`, `timeline.*`, `app.*`) fall through to the menu dispatcher. Unknown top-level params are rejected, and the error lists the accepted keys. |
