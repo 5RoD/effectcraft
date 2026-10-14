@@ -205,6 +205,22 @@ fn timewarp_native_rate_integration_keeps_ticks_and_evaluates_expressions_in_lay
     for at in [Tick(FrameRate::FPS_120.tick_of(31_000_003).0 - 1), Tick::from_seconds_f64(-0.5)] {
         assert_eq!(run(&project, None, at).unwrap(), at, "constant keyed 100% retains individual Ticks");
     }
+    for key in &mut project.comp_mut(cid).unwrap().layers[0].props.prop_mut("effects/#1/speed").unwrap().keys {
+        key.value = Value::Scalar(-100.0);
+    }
+    for delta in [-1, 0, 1] {
+        let at = Tick(FrameRate::FPS_120.tick_of(31_000_003).0 + delta);
+        let actual = run(&project, None, at).unwrap();
+        assert_eq!(actual, Tick(-at.0), "constant keyed reverse playback retains individual Ticks");
+        assert_eq!(FrameRate::FPS_120.frame_at(actual), FrameRate::FPS_120.frame_at(Tick(-at.0)));
+    }
+    assert!(run(&project, None, Tick::MIN).unwrap_err().contains("supported source-time range"));
+    assert_eq!(run(&project, None, Tick::MAX).unwrap(), Tick(-Tick::MAX.0));
+    for key in &mut project.comp_mut(cid).unwrap().layers[0].props.prop_mut("effects/#1/speed").unwrap().keys {
+        key.value = Value::Scalar(0.0);
+    }
+    assert_eq!(run(&project, None, Tick::MIN).unwrap(), Tick::ZERO);
+    assert_eq!(run(&project, None, Tick::MAX).unwrap(), Tick::ZERO);
     project.comp_mut(cid).unwrap().layers[0].props.prop_mut("effects/#1/speed").unwrap().expr = Some(Expression { text: "50+time*50".into(), enabled: true });
     for seconds in [0.5, 1.0, -0.5] {
         let expected = Tick::from_seconds_f64(0.5 * seconds + 0.25 * seconds * seconds);

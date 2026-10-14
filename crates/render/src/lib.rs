@@ -328,13 +328,27 @@ impl EffectHost for FxHost<'_, '_, '_> {
                 if curve.constant_value() == Some(normal) {
                     return Ok(at);
                 }
+                if curve.constant_value() == Some(-normal) {
+                    let reversed = Tick(at.0.checked_neg().ok_or("reverse rate integration overflows")?);
+                    if !(Tick::MIN..=Tick::MAX).contains(&reversed) {
+                        return Err("reverse rate integration exceeds the supported source-time range".into());
+                    }
+                    return Ok(reversed);
+                }
+                if curve.constant_value() == Some(0.0) {
+                    return Ok(Tick::ZERO);
+                }
                 curve.between(Tick::ZERO, at)?
             };
             let ticks = area / normal;
             if !ticks.is_finite() || ticks < Tick::MIN.0 as f64 || ticks > Tick::MAX.0 as f64 {
                 return Err("integrated rate exceeds the supported source-time range".into());
             }
-            Ok(Tick(ticks.round() as i64))
+            let result = Tick(ticks.round() as i64);
+            if !(Tick::MIN..=Tick::MAX).contains(&result) {
+                return Err("integrated rate exceeds the supported source-time range after rounding".into());
+            }
+            Ok(result)
         })())
     }
 

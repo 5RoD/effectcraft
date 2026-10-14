@@ -135,6 +135,9 @@ with a 16 MiB/512-entry bound; edits invalidate the identity, and cached curves 
 not retain old project trees. Motion-blur samples integrate the speed at each
 output sample time, including rate changes inside the exposure. Constant and
 single-key rates retain the existing exact Tick transport.
+Keyed constant 100%, -100% and 0% rates also use integer identity, checked negation
+and zero paths. Retimed values are checked against the supported Tick range after
+rounding, including the asymmetric positive/negative endpoints.
 
 Speed expressions use bounded adaptive numerical integration in layer time.
 Smooth constant, linear and polynomial rates are supported; failed, non-finite
