@@ -120,7 +120,7 @@ Points are logical window coordinates. A target is `{id}` (the element's centre;
 | `ui.move` | `{id \| x,y}` |
 | `ui.drag` | `{from: target, to: target, steps? (12), button?: left\|right\|middle, modifiers?}`: press, move, release |
 | `ui.scroll` | `{id \| x,y, dx, dy}` |
-| `ui.key` | `{key}`, for example `Space`, `F9`, `Cmd+Z`, `Cmd+Shift+Z`, `PageDown`, `Escape` |
+| `ui.key` | `{key, phase?: tap\|down\|up}`, for example `Space`, `F9`, `Cmd+Z`, `Cmd+Shift+Z`, `PageDown`, `Escape`. Default `tap` presses and releases; use `down`, other pointer actions, then `up` to exercise held tools. Invalid phases return an error without adding input. |
 | `ui.type` | `{text}`: text input into the focused field |
 
 ## Locating things

@@ -11,7 +11,7 @@
 //! - `ui.panel.show {panel}` / `ui.panel.close {panel}`
 //! - `ui.click {id | x,y, button?, count?, modifiers?}` / `ui.move {x,y}` / `ui.scroll {x,y,dx,dy}`
 //! - `ui.drag {from:{id|x,y}, to:{id|x,y}, steps?, button?, modifiers?}`: synthetic press-move-release
-//! - `ui.key {key, command?, shift?, alt?, ctrl?}` / `ui.type {text}`
+//! - `ui.key {key, phase?: tap|down|up, command?, shift?, alt?, ctrl?}` / `ui.type {text}`
 //! - `ui.viewer.locate {x, y}`: screen point of a comp pixel; `ui.viewer.hit {x, y}`: comp pixel at a screen point
 //! - `ui.timeline.locate {layer, time?}`: screen point of a layer bar (at a comp time)
 //! - `ui.playback {action: play|stop|toggle}`
@@ -228,7 +228,7 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
         "ui.set" => {
             if let Some(t) = s("tool") {
                 match Tool::from_name(t) {
-                    Some(t) => app.ui.tool = t,
+                    Some(t) => crate::menus::set_tool(app, ctx, t),
                     None => return err(format!("unknown tool `{t}`")),
                 }
             }
@@ -400,12 +400,27 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             Outcome::AfterInput
         }
         "ui.key" => {
+            let phase = match p.get("phase") {
+                None => "tap",
+                Some(Value::String(phase)) if matches!(phase.as_str(), "tap" | "down" | "up") => phase.as_str(),
+                _ => return err("`phase` must be tap, down or up"),
+            };
             let Some(name) = s("key") else { return err("missing `key`") };
             let Some((mut m, key)) = crate::menus::parse_shortcut(name) else { return err(format!("unknown key `{name}`")) };
             let extra = modifiers(p);
             m |= extra;
-            app.synthetic.push(egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: m });
-            app.synthetic.push(egui::Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers: m });
+            let previous = ctx.input(|i| i.modifiers);
+            app.synthetic.push(egui::Event::ModifiersChanged(m));
+            if phase != "up" {
+                let repeat = ctx.input(|i| i.key_down(key));
+                app.synthetic.push(egui::Event::Key { key, physical_key: None, pressed: true, repeat, modifiers: m });
+            }
+            if phase != "down" {
+                app.synthetic.push(egui::Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers: m });
+            }
+            if phase == "tap" {
+                app.synthetic.push(egui::Event::ModifiersChanged(previous));
+            }
             Outcome::AfterInput
         }
         "ui.type" => {

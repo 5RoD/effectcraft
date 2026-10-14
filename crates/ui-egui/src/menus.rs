@@ -12,6 +12,16 @@ use crate::dock::PanelKind;
 use crate::state::{Resolution, Tool};
 use effectcraft_engine::menus::{MenuEntry, MenuNode};
 
+#[path = "menus_held_tools.rs"]
+mod held_tools;
+
+/// Explicit toolbar, menu or agent choices cancel temporary shortcut ownership, even when
+/// choosing the currently visible temporary tool. Key dispatch marks its own selections.
+pub(crate) fn set_tool(app: &mut EffectcraftApp, ctx: &egui::Context, tool: Tool) {
+    held_tools::explicit_choice(app, ctx);
+    app.ui.tool = tool;
+}
+
 pub struct UiCommand {
     pub id: &'static str,
     pub label: &'static str,
@@ -364,7 +374,7 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
                 Tool::PanCamera => Tool::Dolly,
                 _ => Tool::UnifiedCamera,
             };
-            app.ui.tool = next;
+            set_tool(app, ctx, next);
             if matches!(next, Tool::UnifiedCamera | Tool::Orbit)
                 && let Some(saved) = app.ui.slot_tools.get_mut(3)
             {
@@ -392,14 +402,14 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
                 Some(i) => tools[(i + 1) % tools.len()],
                 None => app.ui.slot_tools.get(si).copied().filter(|x| tools.contains(x)).unwrap_or(tools[0]),
             };
-            app.ui.tool = next;
+            set_tool(app, ctx, next);
             if si < app.ui.slot_tools.len() && si != 11 {
                 app.ui.slot_tools[si] = next;
             }
             return Ok(json!({"tool": next}));
         }
         let tool = Tool::from_name(t).ok_or_else(|| format!("unknown tool `{t}`"))?;
-        app.ui.tool = tool;
+        set_tool(app, ctx, tool);
         if tool == Tool::Orbit
             && let Some(saved) = app.ui.slot_tools.get_mut(3)
         {
@@ -1670,6 +1680,13 @@ pub fn handle_tab_shortcut(app: &mut EffectcraftApp, ctx: &egui::Context) {
 
 fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only: bool) {
     let start = modifiers_at_start(ctx);
+    if !tab_only {
+        held_tools::update(app, ctx);
+        if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::WindowFocused(false)))) {
+            ctx.data_mut(|d| d.remove::<bool>(space_tap_id()));
+            return;
+        }
+    }
     // Dialog cancellation owns Escape even when a text field has keyboard focus.
     if !tab_only && app.dialog.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         if crate::panels::shortcut_editor::recording(app) || egui::Popup::is_any_open(ctx) {
@@ -1732,7 +1749,7 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
                 {
                     out.push((*key, *modifiers, true));
                 }
-                egui::Event::Key { key: egui::Key::Space, pressed: false, .. } => out.push((egui::Key::Space, egui::Modifiers::NONE, false)),
+                egui::Event::Key { key, pressed: false, modifiers, .. } => out.push((*key, *modifiers, false)),
                 egui::Event::Copy if clipboard => out.push((egui::Key::C, held(at), true)),
                 // On Windows, Shift+Delete is the old Cut key and arrives as Cut too. The Project
                 // panel has no clipboard: there a Cut with only Shift held is Shift+Delete (Delete
@@ -1763,6 +1780,12 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
     }
     let binds = scoped_bindings(&app.session, Some(app.ui.focused));
     for (key, mods, pressed) in events {
+        if !pressed {
+            held_tools::release(app, ctx, key);
+            if key != egui::Key::Space {
+                continue;
+            }
+        }
         // Plain Spacebar runs its shortcut (Play Current Preview) on the release: held, it is
         // the Hand tool (After Effects), and a drag with it must not start or stop playback.
         if key == egui::Key::Space && (!pressed || !mods.any()) {
@@ -1824,8 +1847,16 @@ fn handle_shortcuts_impl(app: &mut EffectcraftApp, ctx: &egui::Context, tab_only
             *k == key && mods_match(*m, mods) && (!matches!(id.as_str(), "view.cameraLookAtSelected" | "view.cameraLookAtAll") || app.ui.tool.is_camera())
         }) {
             let (id, params) = (id.clone(), if params.is_null() { json!({}) } else { params.clone() });
+            if id.starts_with("tool.") && app.session.state.text_edit.is_some() {
+                continue;
+            }
+            let temporary = held_tools::eligible(key, mods, &id);
+            let before = temporary.then(|| held_tools::Snapshot::capture(app));
+            let _dispatch = temporary.then(|| held_tools::KeyDispatch::new(ctx));
             if let Err(e) = invoke(app, ctx, &id, params) {
                 app.ui.status = e;
+            } else if let Some(before) = before {
+                held_tools::begin(app, ctx, key, before);
             }
         }
     }

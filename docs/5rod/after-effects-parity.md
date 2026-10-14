@@ -68,7 +68,7 @@ establish complete After Effects behavior or pixel fidelity.
 
 | Workflow | Current gap | Acceptance check |
 | --- | --- | --- |
-| Temporary tools | Most single-letter tool keys latch on key-down; only Space has a temporary Hand lifecycle. | Hold a tool key during a drag, then release and recover the previous tool; a tap keeps the chosen tool. |
+| Temporary tools | Unmodified letter bindings for tool commands are spring-loaded: a quick tap latches, a hold or pointer use restores the previous tool and slot memory on release. Remapped letters use the configured bindings; Space keeps its separate Hand behavior. | Verify taps/cycles, held Hand/camera drags, overlapping keys in both release orders, explicit toolbar choices, typing, menus/dialogs and focus loss. The 300 ms tap cutoff is an EffectCraft choice and has not been measured against Adobe. |
 | Camera navigation | C cycles Unified/Orbit/Pan/Dolly; 1/2/3 select individual tools. Unified uses left/middle/right buttons, and Default view navigation works without a camera layer. Cursor-centered interaction modes and parented camera transforms still need fidelity checks. | Verify camera/default-view gestures, one undo per camera drag, locked cameras, and orthographic constraints; then compare cursor modes and parenting with a behavioral reference. |
 | Temporary camera navigation | Alt/Option-drag uses Unified navigation without changing the selected toolbar tool in a 3D composition. `threeD.altCameraNavigation` can disable it. Drawing, Zoom, Pan Behind and text tools preserve their existing alternate actions. | Verify all three buttons, early Alt release, selection preservation, Default view without document edits, Space priority, and disabling the preference. Alternate drawing-tool interactions still need a live reference. |
 | Camera framing | Viewer F/Ctrl+Shift+F frame selected/all 3D content while a camera tool is selected; Timeline and non-camera contexts keep Feather commands. | Verify focus, camera-tool context, offscreen 2D exclusions, and selected/all 3D framing; compare framing distance and parenting with a behavioral reference. |
@@ -80,6 +80,13 @@ documents Alt/Option camera navigation as a configurable behavior. EffectCraft's
 is available in Settings ▸ 3D and through `prefs.get`/`prefs.set`; missing values in older
 settings files use the enabled default. Scroll-wheel camera modes and the 1–6 preference
 choices remain separate gaps.
+
+The temporary letter-tool state is transient, capped at the 26 letter keys, and does not
+poll or repaint while waiting for release. Tool gestures keep their document/view changes;
+restoring the previous tool does not undo the work. The control channel's `ui.key` supports
+separate `down` and `up` phases for the same behavior. Conflicting remaps still follow the
+shortcut editor's normal conflict and panel-scope rules; changing a binding does not remove
+another command's existing assignment.
 
 Core J/K, I/O, Home/End, Page Up/Page Down navigation and F10–F12 3D view switching already
 have bindings. Their presence is not evidence that every edge case matches Adobe.
