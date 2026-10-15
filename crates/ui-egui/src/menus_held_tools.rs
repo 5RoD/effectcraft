@@ -10,16 +10,20 @@ const SLOT_COUNT: usize = Tool::SLOTS.len();
 pub(super) struct Snapshot {
     tool: Tool,
     slots: [Tool; SLOT_COUNT],
+    gizmo: crate::state::GizmoMode,
 }
 
 impl Snapshot {
     pub(super) fn capture(app: &EffectcraftApp) -> Self {
-        Self { tool: app.ui.tool, slots: std::array::from_fn(|i| app.ui.slot_tools.get(i).copied().unwrap_or(Tool::Selection)) }
+        Self { tool: app.ui.tool, slots: std::array::from_fn(|i| app.ui.slot_tools.get(i).copied().unwrap_or(Tool::Selection)), gizmo: app.ui.viewer.gizmo }
     }
 
     fn restore(self, app: &mut EffectcraftApp, applied: Self) {
         if app.ui.tool == applied.tool {
             app.ui.tool = self.tool;
+            if app.ui.viewer.gizmo == applied.gizmo {
+                app.ui.viewer.gizmo = self.gizmo;
+            }
         }
         self.restore_slots(app, applied);
     }

@@ -72,7 +72,7 @@ establish complete After Effects behavior or pixel fidelity.
 | Camera navigation | C cycles Unified/Orbit/Pan/Dolly; 1/2/3 select individual tools. Unified uses left/middle/right buttons, and Default view navigation works without a camera layer. Cursor-centered interaction modes and parented camera transforms still need fidelity checks. | Verify camera/default-view gestures, one undo per camera drag, locked cameras, and orthographic constraints; then compare cursor modes and parenting with a behavioral reference. |
 | Temporary camera navigation | Alt/Option-drag uses Unified navigation without changing the selected toolbar tool in a 3D composition. `threeD.altCameraNavigation` can disable it. Drawing, Zoom, Pan Behind and text tools preserve their existing alternate actions. | Verify all three buttons, early Alt release, selection preservation, Default view without document edits, Space priority, and disabling the preference. Alternate drawing-tool interactions still need a live reference. |
 | Camera framing | Viewer F/Ctrl+Shift+F frame selected/all 3D content while a camera tool is selected; Timeline and non-camera contexts keep Feather commands. | Verify focus, camera-tool context, offscreen 2D exclusions, and selected/all 3D framing; compare framing distance and parenting with a behavioral reference. |
-| 3D manipulators | V is Selection; 4/5/6 do not select Position/Scale/Rotation gizmos. | Switch the documented manipulators with a 3D selection and viewer focus without breaking other tool contexts. |
+| 3D manipulators | In Composition/Layer panels, 4/5/6 choose Position/Scale/Rotation and V restores Universal. Original arrows, squares and rings support selected, unlocked 3D content. Local/World/View axes are available in the toolbar; narrow windows use a compact 3D menu. | Verify pointer movement, parent spaces, grouped undo, saved transforms and input ownership. This is functional coverage, without an Adobe geometry or visual-fidelity comparison. |
 | Panel scopes | All Timeline bindings are allowed in Composition/Layer/Viewer panels. | Verify each panel-specific binding against Adobe's scope, with focused-panel bindings taking precedence over app bindings. |
 
 The [3D preferences reference](https://helpx.adobe.com/in/after-effects/desktop/get-started/preferences-and-settings/preferences.html)
@@ -80,6 +80,22 @@ documents Alt/Option camera navigation as a configurable behavior. EffectCraft's
 is available in Settings ▸ 3D and through `prefs.get`/`prefs.set`; missing values in older
 settings files use the enabled default. Scroll-wheel camera modes and the 1–6 preference
 choices remain separate gaps.
+
+The transform handles send one checked `layer.setTransforms3D` batch per drag step and share
+one undo merge key. Selecting a parent and its child transforms the parent once. Position
+converts world movement back into each parent's coordinates; Scale uses the layer's local
+axes, with Shift for uniform scaling. Rotation writes Orientation while retaining authored
+X/Y/Z Rotation, snaps to one degree (Shift: five degrees), and keeps fractional precision
+with Ctrl/Command. A single layer's unchanged Position is retained, including its expression.
+Changing the composition, time, selection, tool, view or axis space, or losing window focus, ends
+the gesture. The controls do not read pixels back from the GPU or poll while idle.
+
+Current limits: camera/light layers keep their existing camera navigation and property
+controls; the new transform handles apply to 3D content layers. Auto-oriented rotation
+requires disabling Auto-Orient. A rotation requiring shear under a nonuniformly scaled
+parent fails with an actionable error before the batch changes the project. Singular or
+cyclic parent chains and driven target properties likewise return errors. These are
+remaining compatibility limits, not complete 3D parity.
 
 The temporary letter-tool state is transient, capped at the 26 letter keys, and does not
 poll or repaint while waiting for release. Tool gestures keep their document/view changes;

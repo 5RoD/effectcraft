@@ -128,6 +128,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
 
     // Tool options.
     x += 10.0;
+    let compact_gizmo = rect.width() < 1200.;
+    let gizmo_width = if compact_gizmo { 56. } else { 210. };
+    let has_gizmo = crate::panels::viewer_gizmo::toolbar(app, ui, Rect::from_min_size(pos2(x, cy - 13.), vec2(gizmo_width, 26.)));
+    if has_gizmo {
+        x += gizmo_width + 10.;
+    }
     // Selected shape layers: the options show their paint and edit it (as in After Effects).
     let shape_layers: Vec<u64> = app
         .session
@@ -180,7 +186,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         app.ui.snapping = app.session.state.snapping;
     }
     app.auto.add("header.snapping", snap, "Snapping");
-    let label = p.text(pos2(snap.max.x + 4.0, cy), Align2::LEFT_CENTER, tr("Snapping"), Tokens::ui(12.0), t.text_dim);
+    let label =
+        p.text(pos2(snap.max.x + 4.0, cy), Align2::LEFT_CENTER, if has_gizmo && compact_gizmo { "" } else { tr("Snapping") }, Tokens::ui(12.0), t.text_dim);
     snapping_options(app, ui, Rect::from_min_size(pos2(label.max.x + 2.0, cy - 9.0), vec2(18.0, 18.0)));
 
     // Right side: community buttons, workspaces.

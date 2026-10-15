@@ -20,6 +20,9 @@ mod held_tools;
 pub(crate) fn set_tool(app: &mut EffectcraftApp, ctx: &egui::Context, tool: Tool) {
     held_tools::explicit_choice(app, ctx);
     app.ui.tool = tool;
+    if tool == Tool::Selection {
+        app.ui.viewer.gizmo = crate::state::GizmoMode::Universal;
+    }
 }
 
 pub struct UiCommand {
@@ -116,6 +119,11 @@ pub const UI_COMMANDS: &[UiCommand] = &[
     uic!("timeline.keyAt.rotation", "Add or Remove Rotation Keyframe", [], Some("Alt+Shift+R")),
     uic!("timeline.keyAt.opacity", "Add or Remove Opacity Keyframe", [], Some("Alt+Shift+T")),
     uic!("tool.selection", "Selection Tool", [], Some("V")),
+    uic!("view.gizmo.position", "Position Gizmo", [], Some("4")),
+    uic!("view.gizmo.scale", "Scale Gizmo", [], Some("5")),
+    uic!("view.gizmo.rotation", "Rotation Gizmo", [], Some("6")),
+    uic!("view.gizmo.universal", "Universal Gizmo", [], None),
+    uic!("view.gizmo.space", "3D Gizmo Axis Space", [], None),
     uic!("tool.hand", "Hand Tool", [], Some("H")),
     uic!("tool.zoom", "Zoom Tool", [], Some("Z")),
     uic!("tool.camera", "Cycle Camera Tools", [], Some("C")),
@@ -365,6 +373,30 @@ pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: V
             return frontend(app, ctx, "window.resetWorkspace", json!({}));
         }
         return frontend(app, ctx, "window.workspace", json!({"name": ws}));
+    }
+    if let Some(mode) = id.strip_prefix("view.gizmo.") {
+        use crate::state::{GizmoMode, GizmoSpace};
+        if mode == "space" {
+            let space = match params.get("space").and_then(Value::as_str) {
+                Some("local") => GizmoSpace::Local,
+                Some("world") => GizmoSpace::World,
+                Some("view") => GizmoSpace::View,
+                _ => return Err("gizmo space: local, world or view".into()),
+            };
+            held_tools::explicit_choice(app, ctx);
+            app.ui.viewer.gizmo_space = space;
+            return Ok(json!({"space":space}));
+        }
+        let mode = match mode {
+            "universal" => GizmoMode::Universal,
+            "position" => GizmoMode::Position,
+            "scale" => GizmoMode::Scale,
+            "rotation" => GizmoMode::Rotation,
+            _ => return Err("unknown gizmo mode".into()),
+        };
+        set_tool(app, ctx, Tool::Selection);
+        app.ui.viewer.gizmo = mode;
+        return Ok(json!({"gizmo":mode}));
     }
     if let Some(t) = id.strip_prefix("tool.") {
         if t == "camera" {

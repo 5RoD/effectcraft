@@ -59,6 +59,7 @@ pub fn last_fit(ctx: &egui::Context) -> f32 {
 /// What a drag in the viewer is doing.
 #[derive(Clone, Debug)]
 enum Gesture {
+    Gizmo(Box<super::viewer_gizmo::Drag>),
     /// Per layer: start position and the parent-space change per comp pixel of drag in x and y.
     Move {
         layers: Vec<(LayerId, [f64; 3], [f64; 3], [f64; 3])>,
@@ -307,7 +308,11 @@ fn project_clipped(m: &Mat3, poly: &[[f64; 2]]) -> Vec<[f64; 2]> {
 }
 
 /// The segment a → b (world space) through the projection `pc`, clipped at the near plane.
-fn project_segment(pc: &effectcraft_engine::geom::Mat4, a: effectcraft_engine::geom::Vec3, b: effectcraft_engine::geom::Vec3) -> Option<[[f64; 2]; 2]> {
+pub(super) fn project_segment(
+    pc: &effectcraft_engine::geom::Mat4,
+    a: effectcraft_engine::geom::Vec3,
+    b: effectcraft_engine::geom::Vec3,
+) -> Option<[[f64; 2]; 2]> {
     let h = |p: effectcraft_engine::geom::Vec3| {
         let r = |i: usize| pc.0.get(i).map_or(0.0, |row| row[0] * p.x + row[1] * p.y + row[2] * p.z + row[3]);
         [r(0), r(1), r(3)]
@@ -999,26 +1004,16 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 painter.line_segment([s - vec2(9.0, 0.0), s + vec2(9.0, 0.0)], Stroke::new(1.0, Color32::WHITE));
                 painter.line_segment([s - vec2(0.0, 9.0), s + vec2(0.0, 9.0)], Stroke::new(1.0, Color32::WHITE));
                 app.auto.add(&format!("viewer.anchor.{}", l.id.0), Rect::from_center_size(s, vec2(12.0, 12.0)), "anchor point");
-                // 3D axis gizmo.
-                if l.is_3d() {
-                    let w = ectx.world_matrix(l);
-                    let pc = cam_state(&ectx).projection(cw as f64, ch as f64) * w;
-                    let a3 = effectcraft_engine::geom::vec3(a[0], a[1], a[2]);
-                    let len = 60.0 / zoom as f64;
-                    for (axis, col) in [
-                        (effectcraft_engine::geom::vec3(len, 0.0, 0.0), Color32::from_rgb(0xe0, 0x50, 0x50)),
-                        (effectcraft_engine::geom::vec3(0.0, len, 0.0), Color32::from_rgb(0x60, 0xd0, 0x60)),
-                        (effectcraft_engine::geom::vec3(0.0, 0.0, len), Color32::from_rgb(0x50, 0x8c, 0xf0)),
-                    ] {
-                        // (clipped at the camera's near plane, #572)
-                        if let Some([o, e]) = project_segment(&pc, a3, a3 + axis) {
-                            painter.arrow(map.to_screen(o), map.to_screen(e) - map.to_screen(o), Stroke::new(2.0, col));
-                        }
-                    }
-                }
             }
         }
     }
+
+    let gizmo = if app.layer_controls_visible() && app.ui.tool == Tool::Selection {
+        super::viewer_gizmo::Geometry::new(&ectx, &selected, app.ui.viewer.gizmo_space, cam_state(&ectx), map)
+    } else {
+        None
+    };
+    let gizmo_hits = gizmo.as_ref().map(|g| g.draw(app, &painter, app.ui.viewer.gizmo)).unwrap_or_default();
 
     // Settings ▸ 3D: Extended Viewer (3D layers outlined beyond the comp frame) and Show 3D
     // Reference Axes (world X/Y/Z in the corner, turning with the view).
@@ -1303,6 +1298,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     };
     // On-canvas text editing (Type tool, double-click a text layer) owns its clicks and drags.
     let text_owns = !alt_camera && super::viewer_text::hook(app, ui, &painter, &map, &ectx, &resp, space_pan);
+    if ui.input(|i| !i.focused || i.events.iter().any(|event| matches!(event, egui::Event::WindowFocused(false))))
+        && matches!(ui.data(|d| d.get_temp::<Gesture>(gid)), Some(Gesture::Gizmo(_)))
+    {
+        ui.data_mut(|d| d.remove::<Gesture>(gid));
+    }
     if resp.drag_started()
         && !text_owns
         && let Some(pos) = resp.interact_pointer_pos()
@@ -1331,6 +1331,20 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             _ if app.ui.viewer.roi_draw => Some(Gesture::Overlay(ov::Drag::Roi { start: map.to_comp(press), keep: [None, None] })),
             // A region of interest handle: resize it from the opposite corner / edge.
             _ if roi_drag(app, &map, comp_rect, zoom, press).is_some() => roi_drag(app, &map, comp_rect, zoom, press).map(Gesture::Overlay),
+            Tool::Selection if super::viewer_gizmo::hit(&gizmo_hits, press).is_some() => {
+                let begin = gizmo.as_ref().zip(super::viewer_gizmo::hit(&gizmo_hits, press)).map(|(g, h)| g.begin(&ectx, h, press));
+                match begin {
+                    Some(Ok(drag)) => {
+                        app.stop();
+                        Some(Gesture::Gizmo(Box::new(drag)))
+                    }
+                    Some(Err(error)) => {
+                        app.ui.status = error;
+                        None
+                    }
+                    None => None,
+                }
+            }
             Tool::Selection if ft.as_ref().and_then(|f| ov::begin_ft_drag(f, press, &map)).is_some() => {
                 ft.as_ref().and_then(|f| ov::begin_ft_drag(f, press, &map)).map(Gesture::Overlay)
             }
@@ -1523,6 +1537,15 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let cpt = map.to_comp(pos);
         let merge = format!("viewer-drag-{}", ui.data(|d| d.get_temp::<u64>(egui::Id::new("viewer-drag-n")).unwrap_or(0)));
         match g {
+            Gesture::Gizmo(mut drag) => match drag.apply(app, gizmo.as_ref(), pos, mods, &merge) {
+                Ok(()) => {
+                    ui.data_mut(|d| d.insert_temp(gid, Gesture::Gizmo(drag)));
+                }
+                Err(error) => {
+                    app.ui.status = error;
+                    ui.data_mut(|d| d.remove::<Gesture>(gid));
+                }
+            },
             Gesture::Pan { start_pan } => {
                 // No total drag on the release frame: keep the pan reached so far (it used to
                 // snap back to where the drag began).
@@ -1801,11 +1824,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         ui.data_mut(|d| {
             d.remove::<Gesture>(gid);
             let n: u64 = d.get_temp(egui::Id::new("viewer-drag-n")).unwrap_or(0);
-            d.insert_temp(egui::Id::new("viewer-drag-n"), n + 1);
+            d.insert_temp(egui::Id::new("viewer-drag-n"), n.saturating_add(1));
         });
     }
     if resp.clicked()
         && !text_owns
+        && resp.interact_pointer_pos().is_none_or(|pos| super::viewer_gizmo::hit(&gizmo_hits, pos).is_none())
         && let Some(pos) = resp.interact_pointer_pos()
     {
         let cpt = map.to_comp(pos);

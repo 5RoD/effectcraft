@@ -109,3 +109,6 @@ The geometric EffectCraft monogram in crates/ui-egui/src/header.rs is original w
 
 Appearance theme previews in `crates/ui-egui/src/panels/settings.rs` are drawn procedurally
 from original shapes under MIT OR Apache-2.0.
+
+3D transform handles in `crates/ui-egui/src/panels/viewer_gizmo.rs` are original procedural
+arrows, squares and circles created for this fork (2026-10-14), under MIT OR Apache-2.0.

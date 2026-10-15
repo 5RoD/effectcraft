@@ -130,6 +130,23 @@ Points are logical window coordinates. A target is `{id}` (the element's centre;
 | `ui.key` | `{key, phase?: tap\|down\|up}`, for example `Space`, `F9`, `Cmd+Z`, `Cmd+Shift+Z`, `PageDown`, `Escape`. Default `tap` presses and releases; use `down`, other pointer actions, then `up` to exercise held tools. Invalid phases return an error without adding input. |
 | `ui.type` | `{text}`: text input into the focused field |
 
+3D content handles use the same input methods. In Composition/Layer panels, `4`, `5`, `6`
+choose Position, Scale and Rotation gizmos; `V` selects Universal. UI commands
+`view.gizmo.position`, `.scale`, `.rotation`, `.universal` work through `ui.menu.invoke` or
+`engine.execute`. `view.gizmo.space {space: "local"|"world"|"view"}` chooses the axis space;
+unknown values fail before changing UI state. Serialized viewer fields are `gizmo` and
+`gizmo_space`, with lowercase values.
+
+Toolbar IDs are `tools.gizmo.mode` and `tools.gizmo.space`; below 1200 logical points they
+become `tools.gizmo.compact`, with the same menu-row IDs (`tools.gizmo.position`, `.scale`,
+`.rotation`, `.universal`, and `tools.gizmo.space.local|world|view`). Handle IDs are
+`viewer.gizmo.position.x|y|z`, `viewer.gizmo.scale.x|y|z`, and
+`viewer.gizmo.rotation.x|y|z.<segment>` (0–47). These register the visible hit geometry,
+including segment-sized rectangles on rotation rings. Scale uses local axes; Shift scales
+uniformly. Rotation snaps to one degree, Shift to five, and Ctrl/Command keeps fractional
+precision. A drag merges its checked transform batches into one undo step. See the
+[3D compatibility limits](5rod/after-effects-parity.md).
+
 ## Locating things
 
 | Method | Params | Result |

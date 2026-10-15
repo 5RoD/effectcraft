@@ -275,9 +275,30 @@ impl Resolution {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GizmoMode {
+    #[default]
+    Universal,
+    Position,
+    Scale,
+    Rotation,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GizmoSpace {
+    #[default]
+    Local,
+    World,
+    View,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ViewerState {
+    pub gizmo: GizmoMode,
+    pub gizmo_space: GizmoSpace,
     /// Magnification (1 = 100%); None = fit.
     pub zoom: Option<f32>,
     /// Pan offset in points from the centred position.
@@ -319,6 +340,8 @@ pub struct ViewerState {
 impl Default for ViewerState {
     fn default() -> Self {
         ViewerState {
+            gizmo: GizmoMode::default(),
+            gizmo_space: GizmoSpace::default(),
             zoom: None,
             pan: [0.0, 0.0],
             res: Resolution::Auto,

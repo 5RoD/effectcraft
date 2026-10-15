@@ -6,6 +6,11 @@ application and Desktop shortcut have not been removed or replaced.
 
 ## Changes in this milestone
 
+- Original 3D content handles now support Position, Scale, Rotation and Universal modes,
+  Local/World/View axes, parent-space movement and one undo step per drag. Composition-panel
+  shortcuts use 4/5/6 and V; narrow windows expose the same choices in a compact 3D menu.
+  Camera/light handles, auto-oriented rotation and rotations requiring parent-space shear
+  remain compatibility limits. See [3D control behavior](after-effects-parity.md).
 - Windows launches request the tested fast presentation mode by default, with a
   synchronized override. H.264 file export defaults to the system's hardware encoder
   with software fallback for unsupported profiles before rendering. These defaults

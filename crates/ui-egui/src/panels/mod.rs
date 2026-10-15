@@ -53,6 +53,7 @@ pub mod tracker;
 pub mod unsaved;
 pub mod viewer;
 pub mod viewer_drop;
+pub(crate) mod viewer_gizmo;
 pub mod viewer_overlays;
 pub mod viewer_text;
 pub mod viewer_tools;
