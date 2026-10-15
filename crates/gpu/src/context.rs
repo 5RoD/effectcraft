@@ -758,11 +758,39 @@ impl GpuContext {
     /// A bounded native readback: polling and receiving share one deadline.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn read_buffer(&self, buffer: &wgpu::Buffer, row: usize, stride: usize, height: usize) -> Result<Vec<u8>, String> {
+        self.read_buffer_with(buffer, |view| crate::readback::packed(view, row, stride, height))
+    }
+
+    /// Keep the mapped allocation on the waiting thread: synchronous image downloads can
+    /// copy straight into their final f32 storage instead of allocating a second frame.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_buffer_with<T>(&self, buffer: &wgpu::Buffer, copy: impl FnOnce(&[u8]) -> Result<T, String>) -> Result<T, String> {
         let deadline = std::time::Instant::now() + crate::readback::TIMEOUT;
         let (tx, rx) = std::sync::mpsc::channel();
-        self.map_readback(buffer, row, stride, height, move |r| {
+        let ticket = self.readbacks.start(move |r| {
             let _ = tx.send(r);
+        })?;
+        if !ticket.active() {
+            return Err("GPU readback cancelled before mapping".into());
+        }
+        let b = buffer.clone();
+        buffer.map_async(wgpu::MapMode::Read, .., move |result| {
+            if !ticket.active() {
+                b.unmap();
+                return;
+            }
+            ticket.complete(result.map(|_| Vec::new()).map_err(|e| format!("GPU buffer mapping: {e}")));
         });
+        let result = self.wait_readback(rx, deadline).and_then(|_| {
+            let view = buffer.get_mapped_range(..).map_err(|e| format!("GPU mapped range: {e}"))?;
+            copy(&view)
+        });
+        buffer.unmap();
+        result
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wait_readback(&self, rx: std::sync::mpsc::Receiver<Result<Vec<u8>, String>>, deadline: std::time::Instant) -> Result<Vec<u8>, String> {
         loop {
             self.readbacks.check()?;
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -785,6 +813,16 @@ impl GpuContext {
 
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn read_buffer(&self, _buffer: &wgpu::Buffer, _row: usize, _stride: usize, _height: usize) -> Result<Vec<u8>, String> {
+        Err("synchronous GPU readback is unavailable in the browser".into())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_buffer_into(&self, buffer: &wgpu::Buffer, row: usize, stride: usize, height: usize, out: &mut [u8]) -> Result<(), String> {
+        self.read_buffer_with(buffer, |view| crate::readback::packed_into(view, row, stride, height, out))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn read_buffer_into(&self, _buffer: &wgpu::Buffer, _row: usize, _stride: usize, _height: usize, _out: &mut [u8]) -> Result<(), String> {
         Err("synchronous GPU readback is unavailable in the browser".into())
     }
 
@@ -1280,12 +1318,7 @@ impl<'g> Enc<'g> {
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         );
         self.submit();
-        let bytes = self.g.read_buffer(&buf, row, padded as usize, h as usize).map_err(|e| log::error!("gpu texture readback: {e}")).ok()?;
-        if bytes.len() != out.len() {
-            log::error!("gpu texture readback size mismatch");
-            return None;
-        }
-        out.copy_from_slice(&bytes);
+        self.g.read_buffer_into(&buf, row, padded as usize, h as usize, out).map_err(|e| log::error!("gpu texture readback: {e}")).ok()?;
         // Keep a few staging buffers per size (frames read back at the same size every time).
         // Layers whose bounds change every frame read back at a new size each time: drop the
         // other sizes once over budget, or mapped host memory grows for the whole render (#2081).

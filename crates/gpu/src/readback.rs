@@ -282,6 +282,16 @@ thread_local! {
 
 /// Validate every row before publishing tightly packed bytes.
 pub(crate) fn packed(view: &[u8], row: usize, stride: usize, height: usize) -> Result<Vec<u8>, Error> {
+    let size = packed_size(view, row, stride, height)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(size).map_err(|e| format!("allocating GPU readback output: {e}"))?;
+    for source in view.chunks(stride).take(height) {
+        out.extend_from_slice(source.get(..row).ok_or("short GPU readback row")?);
+    }
+    Ok(out)
+}
+
+fn packed_size(view: &[u8], row: usize, stride: usize, height: usize) -> Result<usize, Error> {
     if row == 0 || height == 0 || stride < row {
         return Err("invalid GPU readback layout".into());
     }
@@ -290,14 +300,21 @@ pub(crate) fn packed(view: &[u8], row: usize, stride: usize, height: usize) -> R
     if view.len() < end {
         return Err(format!("short GPU readback: {} bytes, needs {end}", view.len()));
     }
-    let mut out = Vec::new();
-    out.try_reserve_exact(size).map_err(|e| format!("allocating GPU readback output: {e}"))?;
-    for y in 0..height {
-        let start = y.checked_mul(stride).ok_or("GPU readback row overflow")?;
-        let bytes = view.get(start..start + row).ok_or("short GPU readback row")?;
-        out.extend_from_slice(bytes);
+    Ok(size)
+}
+
+/// Copy mapped rows directly into the caller's allocation. Reject the entire layout before
+/// changing any destination byte, including when the final row is truncated.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn packed_into(view: &[u8], row: usize, stride: usize, height: usize, out: &mut [u8]) -> Result<(), Error> {
+    if packed_size(view, row, stride, height)? != out.len() {
+        return Err("GPU readback destination size mismatch".into());
     }
-    Ok(out)
+    for (source, destination) in view.chunks(stride).zip(out.chunks_mut(row)) {
+        let bytes = source.get(..row).ok_or("short GPU readback row")?;
+        destination.copy_from_slice(bytes);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -525,5 +542,27 @@ mod tests {
     fn no_partial_rows() {
         assert!(packed(&[0; 7], 4, 4, 2).is_err());
         assert_eq!(packed(&[1, 2, 0, 0, 3, 4], 2, 4, 2).unwrap(), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn direct_packing_validates_all_rows_before_changing_destination() {
+        let mut out = [99; 4];
+        for (view, row, stride, height) in [
+            (&[1, 2, 0, 0, 3][..], 2, 4, 2),
+            (&[1, 2, 3, 4][..], 0, 4, 2),
+            (&[1, 2, 3, 4][..], 2, 1, 2),
+            (&[1, 2, 3, 4][..], 2, 2, 0),
+            (&[1, 2, 3, 4][..], usize::MAX, usize::MAX, 2),
+            (&[1, 2, 3, 4][..], 1, 1, 3),
+        ] {
+            assert!(packed_into(view, row, stride, height, &mut out).is_err());
+            assert_eq!(out, [99; 4], "a rejected layout must publish no partial pixels");
+        }
+        for view in [&[1, 2, 0, 0, 3, 4][..], &[1, 2, 0, 0, 3, 4, 0, 0, 5, 6][..]] {
+            packed_into(view, 2, 4, 2, &mut out).unwrap();
+            assert_eq!(out, [1, 2, 3, 4]);
+            assert_eq!(packed(view, 2, 4, 2).unwrap(), out);
+        }
     }
 }

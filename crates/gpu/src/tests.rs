@@ -872,6 +872,31 @@ fn readback_staging_stays_bounded_across_sizes() {
     assert!(held <= (256 << 20) + 2 * 1024 * 16 * 376, "staging buffers hold {held} bytes");
 }
 
+#[test]
+fn direct_image_readbacks_keep_float_bits_padding_and_reused_staging() {
+    let Some(g) = gpu() else {
+        assert_ne!(std::env::var("EFFECTCRAFT_REQUIRE_GPU").as_deref(), Ok("1"));
+        return;
+    };
+    for (w, h) in [(1, 3), (17, 5), (32, 2)] {
+        let mut image = Image::new(w, h);
+        for (i, pixel) in image.data.iter_mut().enumerate() {
+            *pixel = [i as f32 / 7.0, -0.125, 4.5, 0.25];
+        }
+        let before = g.ctx.transfer_stats();
+        let mut encoder = crate::context::Enc::new(&g.ctx);
+        let uploaded = g.ctx.upload_image(&image).unwrap();
+        for _ in 0..3 {
+            let actual = encoder.download(&uploaded).unwrap();
+            assert_eq!((actual.width, actual.height), (w, h));
+            assert_eq!(bytemuck::cast_slice::<_, u8>(&actual.data), bytemuck::cast_slice::<_, u8>(&image.data));
+        }
+        let after = g.ctx.transfer_stats();
+        assert_eq!(after.readbacks - before.readbacks, 3);
+        assert_eq!(after.readback_bytes - before.readback_bytes, u64::from(w) * u64::from(h) * 16 * 3);
+    }
+}
+
 /// A static adjustment layer with a time-dependent effect (Noise) keeps its footprint key
 /// across frames (the footprint is the source through the masks, not the effects), so the GPU
 /// uploads nothing after the first frame; matches the CPU.
