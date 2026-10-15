@@ -44,10 +44,10 @@ pub(crate) fn gpu_inflight(var: Option<&str>) -> usize {
 /// Without `cap` every frame renders and encodes in one parallel batch (the CPU path, as
 /// before). With `cap` (GPU frames in flight), the frames go in windows of
 /// `max(cap, threads)`: each window renders in consecutive chunks of `cap` (at most `cap`
-/// renders at once), then encodes in parallel, so only the render is serialised and at most
-/// one window of rendered images is held in memory. Chunks hold no lock or slot, so a failing
-/// or panicking frame cannot leak one, and nested parallelism (or a single thread) cannot
-/// deadlock.
+/// renders at once). Completed renders immediately enter CPU processing while the next
+/// chunk renders, keeping both stages busy within the same bounded window. Only completed
+/// results take a short collection lock; no render/encode holds a permit or waits on another
+/// frame. Nested parallelism and a single worker remain supported.
 pub(crate) fn map_frames<I: Send, T: Send>(
     ks: Vec<u64>,
     cap: Option<usize>,
@@ -61,11 +61,24 @@ pub(crate) fn map_frames<I: Send, T: Send>(
     let window = n.max(rayon::current_num_threads());
     let mut out = Vec::with_capacity(ks.len());
     for win in ks.chunks(window) {
-        let mut imgs = Vec::with_capacity(win.len());
-        for chunk in win.chunks(n) {
-            imgs.par_extend(chunk.par_iter().map(|&k| render(k)));
-        }
-        out.par_extend(win.par_iter().copied().zip(imgs.into_par_iter()).map(|(k, img)| encode(k, img)));
+        let results = Mutex::new(Vec::with_capacity(win.len()));
+        rayon::scope(|scope| {
+            let mut index = 0usize;
+            for chunk in win.chunks(n) {
+                let images: Vec<_> = chunk.par_iter().map(|&k| render(k)).collect();
+                for (&k, image) in chunk.iter().zip(images) {
+                    let (results, encode, order) = (&results, &encode, index);
+                    index = index.saturating_add(1);
+                    scope.spawn(move |_| {
+                        let value = encode(k, image);
+                        results.lock().unwrap_or_else(|e| e.into_inner()).push((order, value));
+                    });
+                }
+            }
+        });
+        let mut results = results.into_inner().unwrap_or_else(|e| e.into_inner());
+        results.sort_unstable_by_key(|(index, _)| *index);
+        out.extend(results.into_iter().map(|(_, value)| value));
     }
     out
 }
@@ -472,7 +485,40 @@ mod tests {
         let want: Vec<u64> = (0..40).map(|k| k * 10).collect();
         for cap in [None, Some(1), Some(3), Some(7)] {
             assert_eq!(run_capped(40, cap).0, want, "cap {cap:?}");
+            assert_eq!(map_frames(vec![4, 1, 4, 0], cap, |k| k, |_, v| v * 10), vec![40, 10, 40, 0]);
         }
+    }
+
+    #[test]
+    fn capped_rendering_overlaps_completed_frame_processing() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let (sent, received) = mpsc::channel();
+        let received = Mutex::new(received);
+        let overlap = AtomicBool::new(false);
+        let out = pool.install(|| {
+            map_frames(
+                (0..4).collect(),
+                Some(1),
+                |k| {
+                    if k == 1 {
+                        overlap.store(received.lock().unwrap().recv_timeout(std::time::Duration::from_secs(2)).is_ok(), Ordering::SeqCst);
+                    }
+                    k
+                },
+                |k, image| {
+                    if k == 0 {
+                        sent.send(()).unwrap();
+                    }
+                    image
+                },
+            )
+        });
+        assert!(overlap.load(Ordering::SeqCst), "CPU processing waited for the entire GPU window");
+        assert_eq!(out, vec![0, 1, 2, 3]);
     }
 
     #[test]

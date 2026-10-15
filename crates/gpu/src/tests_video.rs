@@ -91,6 +91,20 @@ fn native_video_pixels_cover_odd_edges_ranges_matrices_and_project_depths() {
     }
 }
 
+#[test]
+fn staged_video_uploads_keep_each_frames_planes_until_submission() {
+    let Some(g) = native_gpu() else { return };
+    let a = frame(5, 3, 0.2126, 0.0722, false);
+    let b = frame(9, 1, 0.299, 0.114, true);
+    let mut encoder = Enc::new(&g.ctx);
+    // Both staging views have been dropped before the shared command buffer is submitted.
+    // Odd plane lengths also exercise the zero padding between storage-buffer planes.
+    let first = crate::video::upload(&mut encoder, &a, None).unwrap().unwrap();
+    let second = crate::video::upload(&mut encoder, &b, None).unwrap().unwrap();
+    assert_eq!(diff(&reference(&a), &encoder.download(&first).unwrap(), 2e-6).over, 0);
+    assert_eq!(diff(&reference(&b), &encoder.download(&second).unwrap(), 2e-6).over, 0);
+}
+
 struct Source {
     raw_calls: AtomicUsize,
     image_calls: AtomicUsize,

@@ -36,14 +36,37 @@ pub(crate) fn upload(e: &mut Enc, frame: &Yuv420Frame, levels: Option<f32>) -> R
     if size as u64 > limits.max_buffer_size || size as u64 > limits.max_storage_buffer_binding_size {
         return Ok(None);
     }
-    let mut bytes = Vec::new();
-    bytes.try_reserve_exact(size).map_err(|e| format!("native video upload allocation: {e}"))?;
-    for ((plane, len), padding) in frame.planes().iter().zip(lengths).zip(padded) {
-        let data = plane.get(..len).ok_or("truncated native video upload plane")?;
-        bytes.extend_from_slice(data);
-        bytes.resize(bytes.len().saturating_add(padding - len), 0);
+    let staging_size = wgpu::BufferSize::new(size as u64).ok_or("empty native video upload")?;
+    let data = g.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("native YUV420 planes"),
+        size: staging_size.get(),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    {
+        // Assemble directly in staging memory: no temporary concatenation Vec or second
+        // full-plane copy. Keep creation unmapped so driver allocation failures stay scoped.
+        let mut staging = g.queue.write_buffer_with(&data, 0, staging_size).ok_or("cannot allocate native video upload staging buffer")?;
+        let mut offset = 0usize;
+        for ((plane, len), padding) in frame.planes().iter().zip(lengths).zip(padded) {
+            let pixels_end = offset.checked_add(len).ok_or("native video upload offset overflow")?;
+            let padded_end = offset.checked_add(padding).ok_or("native video upload padding overflow")?;
+            if pixels_end > padded_end || padded_end > staging.len() {
+                return Err("native video upload exceeds staging buffer".into());
+            }
+            let pixels = plane.get(..len).ok_or("truncated native video upload plane")?;
+            let zeros = [0u8; 4];
+            let padding_len = padding.checked_sub(len).ok_or("native video upload has invalid padding")?;
+            let zeros = zeros.get(..padding_len).ok_or("native video upload padding exceeds alignment")?;
+            // QueueWriteBufferView is write-only in wgpu 30. Validate its bounds and exact
+            // lengths before using slice/copy_from_slice, which have no fallible variants.
+            staging.slice(offset..pixels_end).copy_from_slice(pixels);
+            if !zeros.is_empty() {
+                staging.slice(pixels_end..padded_end).copy_from_slice(zeros);
+            }
+            offset = padded_end;
+        }
     }
-    let data = g.buffer_init(Some("native YUV420 planes"), &bytes, wgpu::BufferUsages::STORAGE);
     let mut p = Params::default();
     p.u[0] = [frame.width(), frame.width().div_ceil(2), frame.height().div_ceil(2), 0];
     p.u[1] = [padded[0] as u32, padded[0].saturating_add(padded[1]) as u32, 0, 0];
