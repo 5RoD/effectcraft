@@ -3,7 +3,7 @@
 <!-- Generated from the effect registry (crates/effects/src/catalog.rs); do not edit by hand.
      Regenerate: UPDATE_DOCS=1 cargo test -p effectcraft-effects --lib effects_doc_is_current -->
 
-EffectCraft ships 309 effects with 3063 parameters in total, grouped into the same categories as the Effects & Presets panel. Every effect is our own implementation, written from public behaviour descriptions and standard image-processing literature. Reference-workflow effects use corresponding parameter names, order, popup options, units, defaults and ranges; original native tools use their own documented controls.
+EffectCraft ships 309 effects with 3064 parameters in total, grouped into the same categories as the Effects & Presets panel. Every effect is our own implementation, written from public behaviour descriptions and standard image-processing literature. Reference-workflow effects use corresponding parameter names, order, popup options, units, defaults and ranges; original native tools use their own documented controls.
 
 - **GPU**: 282 effects register a GPU implementation; CPU/GPU comparisons cover the tested cases.
 - **32**: 309 effects declare 32-bit float (HDR, overbright) support.
@@ -387,7 +387,7 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 | Posterize Time | `ec.time.posterizetime` | 1 | GPU | 32 | Implemented |
 | Time Difference | `ec.time.timedifference` | 5 | GPU | 32 | Implemented |
 | Time Displacement | `ec.time.timedisplacement` | 4 | GPU | 32 | Implemented |
-| Timewarp | `ec.time.timewarp` | 28 | GPU | 32 | Implemented |
+| Timewarp | `ec.time.timewarp` | 29 | GPU | 32 | Implemented |
 
 ## Transition
 

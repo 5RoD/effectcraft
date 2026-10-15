@@ -5,7 +5,7 @@ use effectcraft_project::{Layer, Property, Uid};
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
-use super::{CommandSpec, bad, has_layers, layer_mut, layers_p, str_p, unlocked};
+use super::{CommandSpec, always, bad, has_layers, layer_mut, layers_p, str_p, unlocked};
 use crate::{EngineError, KeyRef, Result, Session, cmd};
 
 const ACTION: &str = "anim.nativeAction";
@@ -105,7 +105,23 @@ fn commit(s: &mut Session, cid: effectcraft_project::ItemId, label: &str, edits:
     })
 }
 
-fn action(s: &mut Session, p: &Value) -> Result<Value> {
+struct ActionSettings<'a> {
+    action: &'a str,
+    path: &'static str,
+    out: bool,
+    axis: usize,
+    duration: f64,
+    stagger: f64,
+    start: f64,
+    distance: f64,
+    amount: f64,
+    overshoot: f64,
+    reverse: bool,
+    curve: EaseCurve,
+}
+
+// Read-only settings parsing is shared by execution and portable-preset validation.
+fn action_settings<'a>(s: &Session, p: &'a Value) -> Result<ActionSettings<'a>> {
     let action = str_p(p, "action").unwrap_or("fadeIn");
     let (path, out) = match action {
         "fadeIn" => ("transform/opacity", false),
@@ -144,6 +160,11 @@ fn action(s: &mut Session, p: &Value) -> Result<Value> {
     } else {
         crate::ease_presets::find(s, str_p(p, "ease").unwrap_or("Ease In-Out")).ok_or_else(|| bad(ACTION, "unknown easing preset"))?
     };
+    Ok(ActionSettings { action, path, out, axis, duration, stagger, start, distance, amount, overshoot, reverse, curve })
+}
+
+fn action(s: &mut Session, p: &Value) -> Result<Value> {
+    let ActionSettings { action, path, out, axis, duration, stagger, start, distance, amount, overshoot, reverse, curve } = action_settings(s, p)?;
     let (cid, ids) = layers_p(s, p)?;
     let selected: std::collections::BTreeSet<_> = unlocked(s, cid, ids, ACTION)?.into_iter().collect();
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
@@ -255,7 +276,18 @@ fn noise(seed: u64, stream: u64, x: f64) -> f64 {
     sample(i) * (1.0 - weight) + sample(i.wrapping_add(1)) * weight
 }
 
-fn shake(s: &mut Session, p: &Value) -> Result<Value> {
+struct ShakeSettings {
+    duration: f64,
+    start: f64,
+    frequency: f64,
+    decay: f64,
+    rotation: f64,
+    scale: f64,
+    amplitudes: [f64; 3],
+    seed: u64,
+}
+
+fn shake_settings(s: &Session, p: &Value) -> Result<ShakeSettings> {
     let duration = number(p, "duration", 1.0, 0.001, 600.0, SHAKE)?;
     let start = number(p, "time", s.time().seconds(), 0.0, Tick::MAX.seconds(), SHAKE)?;
     let frequency = number(p, "frequency", 8.0, 0.01, 120.0, SHAKE)?;
@@ -270,6 +302,11 @@ fn shake(s: &mut Session, p: &Value) -> Result<Value> {
             .or_else(|| v.as_f64().filter(|n| n.is_finite() && *n >= 0.0 && *n <= 9_007_199_254_740_991.0 && n.fract() == 0.0).map(|n| n as u64))
             .ok_or_else(|| bad(SHAKE, "seed must be an unsigned integer"))?,
     };
+    Ok(ShakeSettings { duration, start, frequency, decay, rotation, scale, amplitudes, seed })
+}
+
+fn shake(s: &mut Session, p: &Value) -> Result<Value> {
+    let ShakeSettings { duration, start, frequency, decay, rotation, scale, amplitudes, seed } = shake_settings(s, p)?;
     let (cid, ids) = layers_p(s, p)?;
     let mut ids = unlocked(s, cid, ids, SHAKE)?;
     ids.sort();
@@ -358,8 +395,190 @@ fn shake(s: &mut Session, p: &Value) -> Result<Value> {
     commit(s, cid, "Native Seeded Shake", edits)
 }
 
+// Portable settings reuse the existing native handlers; this is not command replay.
+const SAVE_SETTINGS: &str = "anim.saveNativePreset";
+pub(super) const MAX_NATIVE_PRESET_BYTES: usize = 64 * 1024;
+const MAX_NATIVE_PRESET_TARGETS: usize = 4096;
+const ACTION_KEYS: &[&str] = &["action", "duration", "stagger", "reverse", "axis", "distance", "amount", "angle", "scalePercent", "overshoot", "ease", "curve"];
+const SHAKE_KEYS: &[&str] = &["duration", "frequency", "decay", "x", "y", "z", "rotation", "scale", "seed"];
+
+fn only_keys<'a>(value: &'a Value, allowed: &[&str], command: &str) -> Result<&'a serde_json::Map<String, Value>> {
+    let object = value.as_object().ok_or_else(|| bad(command, "expected a settings object"))?;
+    if object.len() > allowed.len() || object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err(bad(command, "unsupported field in native motion preset"));
+    }
+    Ok(object)
+}
+
+fn supported_curve(value: &Value) -> Result<EaseCurve> {
+    let error = || bad(SAVE_SETTINGS, "curve must contain supported finite Bézier influences and speeds");
+    match value {
+        Value::Array(values) if values.len() == 4 => {
+            let handles =
+                values.iter().map(Value::as_f64).collect::<Option<Vec<_>>>().and_then(|values| <[f64; 4]>::try_from(values).ok()).ok_or_else(error)?;
+            if handles.iter().any(|number| !number.is_finite()) {
+                return Err(error());
+            }
+            let curve = EaseCurve::from_handles(handles).ok_or_else(error)?;
+            if curve.handles().iter().zip(handles).any(|(actual, requested)| (actual - requested).abs() > 16.0 * f64::EPSILON * requested.abs().max(1.0)) {
+                return Err(error());
+            }
+            Ok(curve)
+        }
+        Value::Object(_) => {
+            let object = only_keys(value, &["outInfluence", "outSpeed", "inInfluence", "inSpeed"], SAVE_SETTINGS)?;
+            if object.len() != 4 {
+                return Err(error());
+            }
+            if object.values().any(|value| value.as_f64().is_none_or(|number| !number.is_finite())) {
+                return Err(error());
+            }
+            let curve: EaseCurve = serde_json::from_value(value.clone()).map_err(|_| error())?;
+            if curve.sanitized() != Some(curve) {
+                return Err(error());
+            }
+            Ok(curve)
+        }
+        _ => Err(error()),
+    }
+}
+
+fn native_settings(s: &Session, command: &str, settings: &Value, portable: bool) -> Result<Value> {
+    match command {
+        ACTION => {
+            let object = only_keys(settings, ACTION_KEYS, SAVE_SETTINGS)?;
+            for key in ["action", "axis", "ease"] {
+                if let Some(value) = object.get(key)
+                    && value.as_str().is_none_or(|text| text.is_empty() || text.len() > 256)
+                {
+                    return Err(bad(SAVE_SETTINGS, "action, axis and ease must be bounded text"));
+                }
+            }
+            if portable && (object.contains_key("ease") || !object.contains_key("curve")) {
+                return Err(bad(SAVE_SETTINGS, "portable action settings require curve values, not a library name"));
+            }
+            if object.contains_key("ease") && object.contains_key("curve") {
+                return Err(bad(SAVE_SETTINGS, "choose ease or curve, not both"));
+            }
+            for (key, value) in object {
+                if matches!(key.as_str(), "action" | "axis" | "ease" | "curve") {
+                    continue;
+                }
+                let valid = if key == "reverse" { value.is_boolean() } else { value.as_f64().is_some_and(f64::is_finite) };
+                if !valid {
+                    return Err(bad(SAVE_SETTINGS, "native action settings must use their documented scalar types"));
+                }
+            }
+            // Validate the complete curve before cloning the bounded scalar settings.
+            let curve = object.get("curve").map(supported_curve).transpose()?;
+            let mut normalized = object.clone();
+            if let Some(curve) = curve {
+                normalized.insert("curve".into(), json!(curve));
+            }
+            let normalized = Value::Object(normalized);
+            let a = action_settings(s, &normalized)?;
+            let axis = ["x", "y", "z"].get(a.axis).ok_or_else(|| bad(SAVE_SETTINGS, "unsupported slide axis"))?;
+            Ok(json!({"action":a.action,"duration":a.duration,"stagger":a.stagger,"reverse":a.reverse,
+                "axis":axis,"distance":a.distance,"amount":a.amount,"overshoot":a.overshoot,"curve":a.curve}))
+        }
+        SHAKE => {
+            only_keys(settings, SHAKE_KEYS, SAVE_SETTINGS)?;
+            let a = shake_settings(s, settings)?;
+            let [x, y, z] = a.amplitudes;
+            Ok(json!({"duration":a.duration,"frequency":a.frequency,"decay":a.decay,
+                "x":x,"y":y,"z":z,
+                "rotation":a.rotation,"scale":a.scale,"seed":a.seed}))
+        }
+        _ => Err(bad(SAVE_SETTINGS, "native presets support only anim.nativeAction and anim.nativeShake")),
+    }
+}
+
+fn preset_name<'a>(value: Option<&'a Value>, fallback: &'a str) -> Result<&'a str> {
+    let name = match value {
+        Some(value) => value.as_str().filter(|name| name.len() <= 512).ok_or_else(|| bad(SAVE_SETTINGS, "name must be bounded text"))?.trim(),
+        None => fallback,
+    };
+    if name.is_empty() || name.chars().take(129).count() > 128 {
+        return Err(bad(SAVE_SETTINGS, "name must contain 1–128 characters"));
+    }
+    Ok(name)
+}
+
+fn save_native_preset(s: &mut Session, p: &Value) -> Result<Value> {
+    only_keys(p, &["path", "name", "command", "settings"], SAVE_SETTINGS)?;
+    let path = str_p(p, "path")
+        .filter(|path| !path.is_empty() && path.len() <= 32768 && !path.contains('\0'))
+        .ok_or_else(|| bad(SAVE_SETTINGS, "provide a bounded preset path"))?;
+    let command = str_p(p, "command").ok_or_else(|| bad(SAVE_SETTINGS, "provide a native command"))?;
+    let settings = native_settings(s, command, p.get("settings").ok_or_else(|| bad(SAVE_SETTINGS, "provide settings"))?, false)?;
+    let name = preset_name(p.get("name"), if command == ACTION { "Native Animation Action" } else { "Native Seeded Shake" })?;
+    let tag = super::animation::PRESET_TAG;
+    let document = json!({tag:1,"name":name,"nativeMotion":{"version":1,"command":command,"settings":settings}});
+    let bytes = serde_json::to_vec_pretty(&document).map_err(|error| bad(SAVE_SETTINGS, error.to_string()))?;
+    if bytes.len() > MAX_NATIVE_PRESET_BYTES {
+        return Err(bad(SAVE_SETTINGS, "native preset exceeds 64 KiB"));
+    }
+    s.services.write_file(path, &bytes).map_err(|error| bad(SAVE_SETTINGS, format!("cannot save native settings: {error}")))?;
+    Ok(json!({"path":path,"command":command,"settings":settings}))
+}
+
+pub(super) fn apply_native_preset(s: &mut Session, document: &Value, p: &Value) -> Result<Value> {
+    const C: &str = "anim.applyPreset";
+    only_keys(p, &["path", "preset", "layers", "layer", "comp"], C)?;
+    let target_id = |value: &Value| value.as_u64().is_some() || value.as_str().is_some_and(|text| !text.is_empty() && text.len() <= 256);
+    for key in ["layer", "comp"] {
+        if p.get(key).is_some_and(|value| !target_id(value)) {
+            return Err(bad(C, "native preset target ids must be numbers or bounded text"));
+        }
+    }
+    if p.get("path").is_some_and(|value| value.as_str().is_none_or(|path| path.is_empty() || path.len() > 32768 || path.contains('\0'))) {
+        return Err(bad(C, "provide a bounded preset path"));
+    }
+    only_keys(document, &[super::animation::PRESET_TAG, "name", "nativeMotion"], C)?;
+    if document.get(super::animation::PRESET_TAG).and_then(Value::as_u64) != Some(1) {
+        return Err(bad(C, "unsupported native animation preset version"));
+    }
+    preset_name(document.get("name"), "Native Motion")?;
+    let native = document.get("nativeMotion").ok_or_else(|| bad(C, "native motion settings are missing"))?;
+    let object = only_keys(native, &["version", "command", "settings"], C)?;
+    if object.get("version").and_then(Value::as_u64) != Some(1) {
+        return Err(bad(C, "unsupported native motion settings version"));
+    }
+    let command = object.get("command").and_then(Value::as_str).ok_or_else(|| bad(C, "native motion command is missing"))?;
+    let settings = native_settings(s, command, object.get("settings").ok_or_else(|| bad(C, "native motion settings are missing"))?, true)?;
+    let mut params = settings.as_object().cloned().ok_or_else(|| bad(C, "native motion settings are invalid"))?;
+    if p.get("layers")
+        .is_some_and(|layers| layers.as_array().is_none_or(|layers| layers.len() > MAX_NATIVE_PRESET_TARGETS || layers.iter().any(|value| !target_id(value))))
+        || (p.get("layers").is_none() && p.get("layer").is_none() && s.state.selected_layers.len() > MAX_NATIVE_PRESET_TARGETS)
+    {
+        return Err(bad(C, "select at most 4096 layers per native preset"));
+    }
+    for key in ["comp", "layer", "layers"] {
+        if let Some(value) = p.get(key) {
+            params.insert(key.into(), value.clone());
+        }
+    }
+    let params = Value::Object(params);
+    // No nested command dispatch: the only two routes call their checked planners,
+    // then create exactly one native edit after all targets have been validated.
+    match command {
+        ACTION => action(s, &params),
+        SHAKE => shake(s, &params),
+        _ => Err(bad(C, "unsupported native motion command")),
+    }
+}
+
 pub fn specs() -> Vec<CommandSpec> {
     vec![
+        cmd!(
+            "anim.saveNativePreset",
+            "Save Native Motion Settings",
+            [],
+            None,
+            "{path (.ecpreset),name?,command:anim.nativeAction|anim.nativeShake,settings:{...}} — saves portable parameters, not absolute keys or target ids",
+            always,
+            save_native_preset
+        ),
         cmd!(
             "anim.nativeAction",
             "Animation Action...",
@@ -484,6 +703,217 @@ mod tests {
             assert!(s.execute(SHAKE, json!({"duration":1})).is_err());
             assert!(s.execute(ACTION, json!({"action":"scaleIn","duration":1,"overshoot":overshoot})).is_err());
             assert!(s.project.same_content(&before));
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_preset_tests {
+    use super::*;
+    use effectcraft_project::LayerId;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn fixture(label: &str) -> (Session, u64, std::path::PathBuf) {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let mut s = Session::default();
+        s.execute("comp.new", json!({"width":160,"height":90,"duration":6,"frameRate":120})).unwrap();
+        let target = s.execute("layer.newNull", json!({"name":"Target"})).unwrap()["layer"].as_u64().unwrap();
+        for (time, value) in [(0.0, [800.0, 400.0, 0.0]), (4.0, [1200.0, 800.0, 0.0])] {
+            s.execute("prop.addKey", json!({"layer":target,"path":"transform/position","time":time,"value":value})).unwrap();
+        }
+        s.execute("time.set", json!({"time":1})).unwrap();
+        let path = std::env::temp_dir().join(format!("ec-native-settings-{label}-{}-{}.ecpreset", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        (s, target, path)
+    }
+
+    fn property(s: &Session, target: u64, name: &str) -> Property {
+        s.active_comp().unwrap().layer(LayerId(target)).unwrap().props.prop(name).unwrap().clone()
+    }
+
+    fn load(s: &Session, path: &std::path::Path) -> Value {
+        serde_json::from_slice(&s.services.read_file(path.to_str().unwrap()).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn action_settings_keep_actual_curve_and_regenerate_at_target_cti_with_locks_and_one_undo() {
+        let (mut s, target, path) = fixture("action");
+        let locked = s.execute("layer.newNull", json!({"name":"Locked"})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("layer.setSwitch", json!({"layer":locked,"switch":"locked","value":true})).unwrap();
+        s.execute("keys.easePreset.save", json!({"name":"Portable custom","curve":[0.4,3,0.6,-2]})).unwrap();
+        let before = s.project.clone();
+        let undo = s.history.undo.len();
+        s.execute(
+            SAVE_SETTINGS,
+            json!({"path":path,"command":ACTION,"settings":{"action":"slideIn","axis":"x","distance":-240,"duration":0.6,"ease":"Portable custom"}}),
+        )
+        .unwrap();
+        assert!(s.project.same_content(&before));
+        assert_eq!(s.history.undo.len(), undo);
+        let document = load(&s, &path);
+        let settings = &document["nativeMotion"]["settings"];
+        assert!(settings.get("ease").is_none());
+        assert_eq!(settings["curve"]["outSpeed"], json!(7.5));
+        for forbidden in ["time", "layer", "layers", "comp"] {
+            assert!(settings.get(forbidden).is_none());
+        }
+        s.ease_presets.clear(); // The destination need not have the source's curve library.
+        s.execute("time.set", json!({"time":2})).unwrap();
+        let original = property(&s, target, "transform/position");
+        s.execute("anim.applyPreset", json!({"path":path,"layers":[locked,target]})).unwrap();
+        assert_eq!(s.history.undo.len(), undo + 1);
+        let result = property(&s, target, "transform/position");
+        for key in &original.keys {
+            assert!(result.keys.contains(key), "keys outside the regenerated interval are retained");
+        }
+        let end = Tick::from_seconds_f64(2.6);
+        assert_eq!(result.value_at(end), original.value_at(end));
+        assert_eq!(result.value_at(Tick::from_seconds_f64(2.0)).as_vec3()[0], original.value_at(end).as_vec3()[0] - 240.0);
+        let cid = s.active_comp_id().unwrap();
+        assert_eq!(s.project.comp(cid).unwrap().layer(LayerId(locked)).unwrap().props, before.comp(cid).unwrap().layer(LayerId(locked)).unwrap().props);
+        let after = s.project.clone();
+        s.undo();
+        assert!(s.project.same_content(&before));
+        let mut direct = settings.as_object().unwrap().clone();
+        direct.insert("layers".into(), json!([locked, target]));
+        s.execute(ACTION, Value::Object(direct)).unwrap();
+        assert!(s.project.same_content(&after), "preset regenerates exactly the same native action, not an absolute source snapshot");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn shake_settings_add_to_target_motion_and_seed_survives_file_roundtrip() {
+        let (mut s, target, path) = fixture("shake");
+        let settings = json!({"duration":1,"frequency":9,"decay":2,"x":20,"y":12,"rotation":3,"scale":5,"seed":u64::MAX});
+        let before = s.project.clone();
+        s.execute(SAVE_SETTINGS, json!({"path":path,"command":SHAKE,"settings":settings})).unwrap();
+        let document = load(&s, &path);
+        assert_eq!(document["nativeMotion"]["settings"]["seed"].as_u64(), Some(u64::MAX));
+        let undo = s.history.undo.len();
+        s.execute("anim.applyPreset", json!({"preset":document,"layer":target})).unwrap();
+        assert_eq!(s.history.undo.len(), undo + 1);
+        let result = property(&s, target, "transform/position");
+        let cid = s.active_comp_id().unwrap();
+        let original = before.comp(cid).unwrap().layer(LayerId(target)).unwrap().props.prop("transform/position").unwrap();
+        for key in &original.keys {
+            assert!(result.keys.contains(key));
+        }
+        for time in [1.0, 2.0] {
+            let time = Tick::from_seconds_f64(time);
+            assert_eq!(result.value_at(time), original.value_at(time), "shake endpoints retain target animation");
+        }
+        assert!(
+            result
+                .keys
+                .iter()
+                .filter(|key| key.time > Tick::from_seconds_f64(1.0) && key.time < Tick::from_seconds_f64(2.0))
+                .any(|key| key.value != original.value_at(key.time))
+        );
+        let after = s.project.clone();
+        s.undo();
+        assert!(s.project.same_content(&before));
+        let mut direct = settings.as_object().unwrap().clone();
+        direct.insert("layer".into(), json!(target));
+        s.execute(SHAKE, Value::Object(direct)).unwrap();
+        assert!(s.project.same_content(&after), "seeded preset and direct settings use the identical checked handler");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn invalid_native_documents_and_failed_plans_leave_project_history_and_recent_preferences_unchanged() {
+        let (mut s, target, path) = fixture("invalid");
+        s.execute(SAVE_SETTINGS, json!({"path":path,"command":SHAKE,"settings":{"seed":7}})).unwrap();
+        let valid = load(&s, &path);
+        let mut invalid = Vec::new();
+        for (pointer, value) in [
+            ("/effectcraftAnimationPreset", json!(2)),
+            ("/nativeMotion/version", json!(2)),
+            ("/nativeMotion/command", json!("script.run")),
+            ("/nativeMotion/settings", json!([])),
+            ("/nativeMotion/settings/seed", json!(1.5)),
+            ("/nativeMotion/settings/duration", json!(600)),
+        ] {
+            let mut doc = valid.clone();
+            *doc.pointer_mut(pointer).unwrap() = value;
+            invalid.push(doc);
+        }
+        for key in ["time", "comp", "layer", "layers", "script", "command", "path", "curve"] {
+            let mut doc = valid.clone();
+            doc["nativeMotion"]["settings"][key] = json!(1);
+            invalid.push(doc);
+        }
+        let mut doc = valid.clone();
+        doc["effects"] = json!([]); // A native file cannot also replay absolute/effect payloads.
+        invalid.push(doc);
+        let mut doc = valid.clone();
+        doc["name"] = json!("x".repeat(129));
+        invalid.push(doc);
+        let before = s.project.clone();
+        let undo = s.history.undo.len();
+        let prefs = serde_json::to_value(&s.prefs).unwrap();
+        let revision = s.prefs_revision;
+        for document in invalid {
+            assert!(s.execute("anim.applyPreset", json!({"path":path,"preset":document,"layer":target})).is_err());
+            assert!(s.project.same_content(&before));
+            assert_eq!(s.history.undo.len(), undo);
+            assert_eq!(serde_json::to_value(&s.prefs).unwrap(), prefs);
+            assert_eq!(s.prefs_revision, revision);
+        }
+        s.execute("layer.setSwitch", json!({"layer":target,"switch":"locked","value":true})).unwrap();
+        let locked = s.project.clone();
+        assert!(s.execute("anim.applyPreset", json!({"path":path,"preset":valid,"layer":target})).is_err());
+        assert!(s.project.same_content(&locked));
+        assert_eq!(serde_json::to_value(&s.prefs).unwrap(), prefs);
+        assert_eq!(s.prefs_revision, revision);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn native_file_and_target_budgets_fail_before_editing_or_updating_recent_presets() {
+        let (mut s, target, path) = fixture("budget");
+        s.execute(SAVE_SETTINGS, json!({"path":path,"command":SHAKE,"settings":{"seed":7}})).unwrap();
+        let document = load(&s, &path);
+        let before = s.project.clone();
+        let undo = s.history.undo.len();
+        let prefs = serde_json::to_value(&s.prefs).unwrap();
+        let revision = s.prefs_revision;
+        // Valid JSON with excessive trailing whitespace still exceeds the file budget.
+        let mut bytes = serde_json::to_vec(&document).unwrap();
+        bytes.resize(MAX_NATIVE_PRESET_BYTES + 1, b' ');
+        s.services.write_file(path.to_str().unwrap(), &bytes).unwrap();
+        let error = s.execute("anim.applyPreset", json!({"path":path,"layer":target})).unwrap_err();
+        assert!(error.to_string().contains("64 KiB"));
+        for params in [
+            json!({"preset":document,"layers":vec![target; MAX_NATIVE_PRESET_TARGETS + 1]}),
+            json!({"preset":document,"layers":[{"nested":"not an id"}]}),
+            json!({"preset":document,"layer":target,"time":0}),
+        ] {
+            assert!(s.execute("anim.applyPreset", params).is_err());
+        }
+        assert!(s.project.same_content(&before));
+        assert_eq!(s.history.undo.len(), undo);
+        assert_eq!(serde_json::to_value(&s.prefs).unwrap(), prefs);
+        assert_eq!(s.prefs_revision, revision);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn saving_rejects_context_command_replay_bad_types_and_unsupported_curves_without_writing() {
+        let (mut s, _, path) = fixture("save-invalid");
+        let before = s.project.clone();
+        let undo = s.history.undo.len();
+        for (command, settings) in [
+            ("script.run", json!({})),
+            (SHAKE, json!({"time":1})),
+            (SHAKE, json!({"layers":[1]})),
+            (SHAKE, json!({"duration":"1"})),
+            (SHAKE, json!({"seed":-1})),
+            (ACTION, json!({"curve":[0,0,1,1]})),
+            (ACTION, json!({"curve":{"outInfluence":40,"outSpeed":7.5,"inInfluence":40,"inSpeed":7.5,"script":"bad"}})),
+        ] {
+            assert!(s.execute(SAVE_SETTINGS, json!({"path":path,"command":command,"settings":settings})).is_err());
+            assert!(!path.exists());
+            assert!(s.project.same_content(&before));
+            assert_eq!(s.history.undo.len(), undo);
         }
     }
 }

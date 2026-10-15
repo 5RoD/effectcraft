@@ -241,6 +241,10 @@ establish production speed. Their scope is recorded in [edit recovery](edit-reco
 
 ## Playback and export acceptance targets
 
+Timewarp's optional processing of earlier effects is described in
+[retiming input processing](retiming-inputs.md), including its compatibility default and
+additional work when the preceding stack is expensive.
+
 The latest 0.10 production comparison measured uncached viewer cadence at
 94.11 → 110.46 textures/s and shorter export durations, with the same output
 settings. The full 120 fps target and final installation remain open. See

@@ -1426,6 +1426,7 @@ fn file_dialog(app: &mut EffectcraftApp, id: &str, params: &Value) -> Option<Res
         "comp.saveFrameAsExr" => ("path", Ask::Save("Frame.exr")),
         "file.watchFolder" if params.get("stop").is_none() => ("folder", Ask::Save("Watch Folder")),
         "anim.savePreset" => ("path", Ask::Save("Preset.ecpreset")),
+        "anim.saveNativePreset" => ("path", Ask::Save("Native Motion.ecpreset")),
         "anim.applyPreset" => ("path", Ask::Open(&["ecpreset", "json"])),
         "view.exportGuides" => ("path", Ask::Save("Guides.json")),
         "view.importGuides" => ("path", Ask::Open(&["json"])),

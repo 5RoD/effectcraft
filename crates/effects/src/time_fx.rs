@@ -96,6 +96,7 @@ pub fn specs() -> Vec<EffectSpec> {
                 p("adjustTimeBy", "Adjust Time By", Value::Enum(0), popup(&["Speed", "Source Frame"])),
                 p("speed", "Speed", num(50.0), slider(-10000.0, 10000.0, 0.0, 200.0, 1)),
                 p("sourceFrame", "Source Frame", num(0.0), slider(-100000.0, 100000.0, 0.0, 300.0, 1)),
+                p("processPreviousEffects", "Process Previous Effects", Value::Bool(false), ParamUi::Checkbox),
                 p("tuning/vectorDetail", "Vector Detail", num(20.0), slider(0.0, 100.0, 0.0, 100.0, 1)),
                 p("tuning/smoothing/globalSmoothness", "Global Smoothness", num(0.5), slider(0.0, 1.0, 0.0, 1.0, 2)),
                 p("tuning/smoothing/localSmoothness", "Local Smoothness", num(0.5), slider(0.0, 1.0, 0.0, 1.0, 2)),

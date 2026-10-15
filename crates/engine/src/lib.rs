@@ -101,6 +101,15 @@ pub type Result<T> = std::result::Result<T, EngineError>;
 /// Host services (file access) injected by the frontend.
 pub trait Services: Send + Sync {
     fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>>;
+    /// Bounded document inputs. Native/streaming hosts should enforce the limit while
+    /// reading; the default also supports existing in-memory service implementations.
+    fn read_file_limited(&self, path: &str, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+        let bytes = self.read_file(path)?;
+        if bytes.len() > max_bytes {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file exceeds its read byte budget"));
+        }
+        Ok(bytes)
+    }
     fn write_file(&self, path: &str, data: &[u8]) -> std::io::Result<()>;
     /// Whether a file exists (the background footage check after open).
     fn exists(&self, path: &str) -> bool {
@@ -143,8 +152,51 @@ impl Services for FsServices {
     fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
         std::fs::read(path)
     }
+    fn read_file_limited(&self, path: &str, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+        let mut file = std::fs::File::open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "a regular file is required"));
+        }
+        let max = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+        if metadata.len() > max {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file exceeds its read byte budget"));
+        }
+        let expected = usize::try_from(metadata.len()).map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
+        read_bytes_limited(&mut file, max_bytes, expected)
+    }
     fn write_file(&self, path: &str, data: &[u8]) -> std::io::Result<()> {
         config::atomic_write(std::path::Path::new(path), data)
+    }
+}
+
+/// A metadata hint never grants permission to read/allocate beyond the limit: files
+/// can grow between stat and read. At most one excess byte is read to detect growth.
+fn read_bytes_limited(reader: &mut impl std::io::Read, max_bytes: usize, expected: usize) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(expected.min(max_bytes)).map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let remaining = max_bytes.saturating_sub(bytes.len());
+        let wanted = remaining.saturating_add(1).min(buffer.len());
+        let target = buffer.get_mut(..wanted).ok_or(std::io::ErrorKind::InvalidData)?;
+        let count = match reader.read(target) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 {
+            return Ok(bytes);
+        }
+        if count > remaining {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file exceeds its read byte budget"));
+        }
+        let source = buffer.get(..count).ok_or(std::io::ErrorKind::InvalidData)?;
+        let end = bytes.len().checked_add(count).ok_or(std::io::ErrorKind::OutOfMemory)?;
+        if end > bytes.capacity() {
+            let capacity = bytes.capacity().saturating_mul(2).max(buffer.len()).min(max_bytes).max(end);
+            bytes.try_reserve_exact(capacity.saturating_sub(bytes.len())).map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
+        }
+        bytes.extend_from_slice(source);
     }
 }
 

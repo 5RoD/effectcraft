@@ -2,6 +2,31 @@ use serde_json::json;
 
 use crate::Session;
 
+#[test]
+fn bounded_file_reads_reject_oversize_and_growth_without_losing_later_reads() {
+    use crate::Services;
+    use std::io::{Cursor, ErrorKind};
+    let path = std::env::temp_dir().join(format!(
+        "effectcraft-bounded-input-{}-{}.bin",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::write(&path, [7u8; 64]).unwrap();
+    let path_text = path.to_string_lossy();
+    assert_eq!(crate::FsServices.read_file_limited(&path_text, 63).unwrap_err().kind(), ErrorKind::InvalidData);
+    assert_eq!(crate::FsServices.read_file_limited(&path_text, 64).unwrap(), [7u8; 64]);
+    assert_eq!(crate::FsServices.read_file_limited(&path_text, 0).unwrap_err().kind(), ErrorKind::InvalidData);
+    std::fs::remove_file(&path).unwrap();
+    // Simulate growth after a zero-length metadata hint. Stop after limit+1 bytes,
+    // rather than first reading the complete input and rejecting its length later.
+    let mut growing = Cursor::new([3u8; 100]);
+    assert_eq!(crate::read_bytes_limited(&mut growing, 8, 0).unwrap_err().kind(), ErrorKind::InvalidData);
+    assert_eq!(growing.position(), 9);
+    let mut valid = Cursor::new([2u8; 8]);
+    assert_eq!(crate::read_bytes_limited(&mut valid, 8, 0).unwrap(), [2u8; 8]);
+    assert!(crate::read_bytes_limited(&mut Cursor::new([]), 0, 0).unwrap().is_empty());
+}
+
 fn demo() -> Session {
     let mut s = Session::default();
     s.execute("file.openDemoProject", json!({})).unwrap();

@@ -11,6 +11,32 @@ use effectcraft_time::{FrameRate, Tick};
 
 use crate::tests::{Scene, check, compare_at, effect_case, n, opts, set, v3};
 
+#[test]
+fn gpu_renderer_keeps_timewarp_processed_prefix_and_later_effect_order() {
+    let gpu = crate::tests::gpu();
+    assert!(std::env::var("EFFECTCRAFT_REQUIRE_GPU").as_deref() != Ok("1") || gpu.is_some());
+    let Some(_) = gpu else { return };
+    for method in 0..=2 {
+        for processed in [false, true] {
+            let mut scene = Scene::new(BitDepth::Bpc32);
+            let mut layer = scene.solid([1.0, 0.0, 0.0], 97, 61);
+            scene.effect(&mut layer, "ec.generate.fill", &[("color", Value::Color([0.0, 0.0, 1.0, 1.0]))]);
+            scene.effect(
+                &mut layer,
+                "ec.time.timewarp",
+                &[("method", Value::Enum(method)), ("speed", n(100.0)), ("processPreviousEffects", Value::Bool(processed))],
+            );
+            scene.effect(&mut layer, "ec.generate.fill", &[("color", Value::Color([0.0, 1.0, 0.0, 1.0])), ("opacity", n(50.0))]);
+            scene.push(layer);
+            let time = Tick::from_seconds_f64(0.51);
+            let cpu = effectcraft_render::Renderer::new(&scene.p, &effectcraft_render::NoFootage, RenderOpts::default()).comp_frame_cpu(scene.cid, time);
+            let expected = if processed { [0.0, 0.5, 0.5, 1.0] } else { [0.5, 0.5, 0.0, 1.0] };
+            assert!(cpu.data.iter().all(|pixel| pixel.iter().zip(expected).all(|(actual, expected)| (actual - expected).abs() < 1e-6)));
+            check(&format!("Timewarp prefix method={method}, processed={processed}"), compare_at(&scene, RenderOpts::default(), time), 0.0);
+        }
+    }
+}
+
 fn e(v: u32) -> Value {
     Value::Enum(v)
 }

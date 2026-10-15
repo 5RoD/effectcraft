@@ -117,6 +117,17 @@ impl Services for WebServices {
             .map(|d| d.to_vec())
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("{path}: open it with File ▸ Open (or drop it on the page)")))
     }
+    fn read_file_limited(&self, path: &str, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+        let data =
+            get(path).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("{path}: open it with File ▸ Open (or drop it on the page)")))?;
+        if data.len() > max_bytes {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file exceeds its read byte budget"));
+        }
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(data.len()).map_err(|_| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
+        bytes.extend_from_slice(&data);
+        Ok(bytes)
+    }
     fn write_file(&self, path: &str, data: &[u8]) -> std::io::Result<()> {
         put(path, data.into());
         let quiet = {

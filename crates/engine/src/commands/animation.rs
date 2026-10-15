@@ -89,16 +89,37 @@ fn save_preset(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn apply_preset(s: &mut Session, p: &Value) -> Result<Value> {
-    let doc: Value = match (p.get("preset"), str_p(p, "path")) {
-        (Some(v), _) => v.clone(),
+    // Inline native settings are inspected by reference before any bounded normalization.
+    let mut file_bytes = None;
+    let doc: std::borrow::Cow<'_, Value> = match (p.get("preset"), str_p(p, "path")) {
+        (Some(v), _) => std::borrow::Cow::Borrowed(v),
         (None, Some(path)) => {
-            let bytes = s.services.read_file(path).map_err(|e| EngineError::Other(format!("cannot read {path}: {e}")))?;
-            serde_json::from_slice(&bytes).map_err(|e| bad("anim.applyPreset", format!("not a preset: {e}")))?
+            // Absolute keyframe presets may be much larger than the 64 KiB native
+            // settings format, but neither format may allocate for an unbounded file.
+            let bytes = s
+                .services
+                .read_file_limited(path, 128 * 1024 * 1024)
+                .map_err(|e| EngineError::Other(format!("cannot read {path}: {e} (preset limit: 128 MiB)")))?;
+            file_bytes = Some(bytes.len());
+            std::borrow::Cow::Owned(serde_json::from_slice(&bytes).map_err(|e| bad("anim.applyPreset", format!("not a preset: {e}")))?)
         }
         _ => return Err(bad("anim.applyPreset", "missing `path` (or inline `preset`)")),
     };
     if doc.get(PRESET_TAG).is_none() {
         return Err(bad("anim.applyPreset", "not an EffectCraft animation preset"));
+    }
+    if doc.get("nativeMotion").is_some() {
+        if file_bytes.is_some_and(|bytes| bytes > super::native_motion::MAX_NATIVE_PRESET_BYTES) {
+            return Err(bad("anim.applyPreset", "native preset exceeds 64 KiB"));
+        }
+        let result = super::native_motion::apply_native_preset(s, &doc, p)?;
+        // Failed validation/planning must not change Recent Animation Presets either.
+        if let Some(path) = str_p(p, "path") {
+            s.prefs.push_recent_preset(path);
+            s.save_prefs();
+            s.prefs_revision = s.prefs_revision.saturating_add(1);
+        }
+        return Ok(result);
     }
     let (cid, ids) = layers_p(s, p)?;
     if ids.is_empty() {

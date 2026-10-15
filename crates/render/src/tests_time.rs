@@ -364,3 +364,43 @@ fn input_keys_ignore_later_effects() {
     set(&mut p, "effects/#1/blurriness", 8.0);
     assert_ne!(key(&p).0, one);
 }
+
+#[test]
+fn timewarp_processed_input_retains_preceding_effects_and_applies_later_effects_once() {
+    for method in 0..=2 {
+        for processed in [false, true] {
+            let mut project = Project::default();
+            project.settings.bit_depth = effectcraft_project::BitDepth::Bpc32;
+            let comp = Comp::new(16, 16, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+            let cid = project.add_item("Input processing", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+            let sid =
+                project.add_item("Red source", Label::Red, None, ItemKind::Solid(Solid { color: [1.0, 0.0, 0.0], width: 16, height: 16, pixel_aspect: 1.0 }));
+            let mut layer = build::layer(&mut project, &comp, "Retimed", LayerSource::Solid { item: sid }, (16, 16), None);
+            for (id, values) in [
+                ("ec.generate.fill", vec![("color", Value::Color([0.0, 0.0, 1.0, 1.0]))]),
+                (
+                    "ec.time.timewarp",
+                    vec![("method", Value::Enum(method)), ("speed", Value::Scalar(100.0)), ("processPreviousEffects", Value::Bool(processed))],
+                ),
+                ("ec.generate.fill", vec![("color", Value::Color([0.0, 1.0, 0.0, 1.0])), ("opacity", Value::Scalar(50.0))]),
+            ] {
+                let spec = effectcraft_effects::find(id).unwrap();
+                let mut effect = effectcraft_effects::instantiate(spec, &mut Ids(&mut project.next_id), spec.name, [16.0; 2]);
+                for (name, value) in values {
+                    effect.prop_mut(name).unwrap().value = value;
+                }
+                layer.props.sub_mut("effects").unwrap().children.push(effect.into());
+            }
+            project.comp_mut(cid).unwrap().layers.push(layer);
+            // A fractional source frame exercises Whole, Mix and Motion planning. The
+            // later half-opacity Fill is non-idempotent, exposing duplicate processing.
+            let image = crate::Renderer::new(&project, &crate::NoFootage, crate::RenderOpts::default()).comp_frame_cpu(cid, Tick::from_seconds_f64(0.51));
+            let expected = if processed { [0.0, 0.5, 0.5, 1.0] } else { [0.5, 0.5, 0.0, 1.0] };
+            assert!(
+                image.data.iter().all(|pixel| pixel.iter().zip(expected).all(|(actual, expected)| (actual - expected).abs() < 1e-6)),
+                "method={method}, processed={processed}: {:?}",
+                image.get(8, 8)
+            );
+        }
+    }
+}

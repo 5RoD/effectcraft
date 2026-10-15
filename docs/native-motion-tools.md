@@ -24,8 +24,8 @@ it remain. An enabled expression on a target property gives an error because it 
 the new animation. Generated properties and keys are selected for editing or **Save Animation
 Preset…**, which reuses EffectCraft's existing portable `.ecpreset` format.
 These are absolute keyframe snapshots: applying one replaces the target property's entire key
-list. To regenerate relative motion around a different layer's existing animation, run the native
-action with the same settings. A portable library of action settings remains open work.
+list. To regenerate relative motion around a different layer's existing animation, use the
+Native Animation Action dialog's **Save Settings…** and apply that `.ecpreset` at its playhead.
 
 Agents use `anim.nativeAction` with optional `layers`, `layer`, `comp`, `action`, `time`, `duration`,
 `stagger`, `reverse`, `axis`, `distance`, `scalePercent`, `angle`, `overshoot`, and `ease`. A `curve`
@@ -48,8 +48,8 @@ Shake is added to the existing keyframed motion and stored once per composition 
 keys. Reopening does not require a noise generator or expression runtime. The same layer,
 original animation, settings, and seed produce the same result. Reapplying adds another shake;
 undo first to regenerate it from the same original motion. Save the selected properties through
-**Save Animation Preset…** to share an absolute keyframe snapshot. To add the same configured
-shake around another layer's original motion, run Seeded Shake there with the same settings.
+**Save Animation Preset…** to share an absolute keyframe snapshot. The Seeded Shake dialog's
+**Save Settings…** stores parameters that add the shake around the destination's original motion.
 Locked layers are skipped when applying animation presets; an all-locked target is rejected
 before changing the project, history or recent-preset preferences.
 
@@ -59,6 +59,50 @@ keys; larger requests return an actionable error instead of an unbounded allocat
 above the composition's sampling rate can alias, so use a sufficiently high frame rate for rapid
 shakes. Camera Position/Rotation are ordinary eligible properties; no proprietary camera rig is
 created.
+
+## Portable native settings presets
+
+The Native Animation Action and Native Seeded Shake dialogs offer **Save Settings…** in their
+fixed footer. This saves their parameters as an ordinary `.ecpreset` file without applying an
+animation. Open it with **Animation → Apply Animation Preset…**, **Recent Animation Presets**,
+or `anim.applyPreset {path, layers?}`. It runs at the destination playhead, against the destination
+layers' current animation. Locked layers are skipped; an all-locked selection fails. Generated
+keys replace only the chosen interval, retain outside keys, and create one native undo step.
+
+A native settings file stores duration, action/axis/offset/easing or shake amplitudes/frequency/
+decay/seed. Named easing is resolved to the actual curve when saving, so the receiving machine
+does not need the same personal curve library. It never stores source layer ids, a composition
+id, or the source playhead. Seeded noise remains deterministic for the same target layer,
+settings and original animation; different destination layers use their own noise streams.
+
+The hidden agent command is:
+
+```json
+{"command":"anim.saveNativePreset","params":{"path":"Shake.ecpreset","command":"anim.nativeShake","settings":{"duration":1,"frequency":8,"x":20,"y":20,"rotation":2,"seed":42}}}
+```
+
+The extension is a versioned parameter payload, not arbitrary command replay:
+
+```json
+{"effectcraftAnimationPreset":1,"name":"My Shake","nativeMotion":{"version":1,"command":"anim.nativeShake","settings":{"duration":1,"frequency":8,"decay":3,"x":20,"y":20,"z":0,"rotation":2,"scale":0,"seed":42}}}
+```
+
+Only the two native commands and their documented settings are allowed. Unknown fields,
+unsupported versions, source-context fields, malformed scalars, unsupported curves and mixed
+native/absolute payloads are rejected before an edit or recent-preset preference update.
+Names are limited to 128 characters, saved native files to 64 KiB, paths to 32,768 bytes and
+explicit target batches to 4,096 layers; existing duration/key/work checks still apply.
+Preset files have an outer read limit of 128 MiB, allowing larger absolute keyframe snapshots.
+The bundled desktop host enforces this while reading, including files that grow after their
+size check; the web host checks before copying from its file store. Native settings files
+also enforce the smaller 64 KiB limit after identifying the payload. Custom file-service
+implementations should override `Services::read_file_limited` to bound allocation during reads.
+The source form's Start field is intentionally omitted when saving. Native Action easing is
+stored by value; no commercial preset data is bundled.
+
+**Save Animation Preset…** retains its existing absolute keyframe snapshot semantics. Use
+**Save Settings…** for a shake/action that should regenerate relative to another animation.
+These changes still require the repository gate and a desktop save/reapply check before release.
 
 ## Counter formatting
 
@@ -196,9 +240,10 @@ combined repository gate and desktop validation before release acceptance.
 Flow-style curve editing and libraries use the Ease Presets panel. Applying a curve skips
 locked layers in a mixed selection and creates one undo
 step for the editable pairs. An all-locked selection returns an unlock instruction without
-changing the project or history; read-only curve capture remains available. KeyFast-style Trim Paths macros, dedicated action libraries and modifier shortcuts
-remain. Shake preset sharing uses editable animation presets, not a separate settings library or
-the vendor's preset pack. Deep Glow look/speed parity and Twixtor-quality optical-flow retiming
+changing the project or history; read-only curve capture remains available. Native Action and
+Seeded Shake share portable parameters through `.ecpreset`, Apply Animation Preset and Recent
+Animation Presets. KeyFast-style Trim Paths macros and modifier shortcuts remain. No commercial
+preset pack is bundled. Deep Glow look/speed parity and Twixtor-quality optical-flow retiming
 need independent rendering implementations and measured validation; existing effect names do
 not prove those capabilities.
 

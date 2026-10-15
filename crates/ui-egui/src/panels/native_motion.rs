@@ -1,6 +1,6 @@
 //! Parameter forms for the original native animation tools.
 
-use super::forms::{Field, form};
+use super::forms::{Field, Form, form};
 use crate::EffectcraftApp;
 use serde_json::{Value, json};
 
@@ -47,7 +47,7 @@ pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
                 Field::choice("ease", "Easing curve", &names, selected),
                 Field::note(
                     "help",
-                    "Selected unlocked layers; one undo step. Replaces keys inside the interval. Save Animation Preset stores an absolute keyframe snapshot.",
+                    "Selected unlocked layers; one undo step. Replaces keys inside the interval. Save Settings reuses the parameters on another animation; Save Animation Preset stores absolute keys.",
                 ),
             ],
         )
@@ -67,13 +67,40 @@ pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
                 Field::num("seed", "Random seed (nonnegative integer)", 1.0),
                 Field::note(
                     "help",
-                    "Adds reproducible motion. Endpoints unchanged; one undo step. Rerun these settings to shake another animation; Save Animation Preset stores absolute keys.",
+                    "Adds reproducible motion. Endpoints unchanged; one undo step. Save Settings reuses these parameters on another animation; Save Animation Preset stores absolute keys.",
                 ),
             ],
         )
     };
     form(app, title, id, p.clone(), fields);
     true
+}
+
+pub(super) fn can_save_settings(form: &Form) -> bool {
+    matches!(form.command.as_str(), "anim.nativeAction" | "anim.nativeShake")
+}
+
+pub(super) fn save_settings(app: &mut EffectcraftApp, ctx: &egui::Context, form: &Form) {
+    if !can_save_settings(form) {
+        return;
+    }
+    let params = form.params();
+    let Some(mut settings) = params.as_object().cloned() else {
+        app.ui.status = "Native motion settings are unavailable".into();
+        return;
+    };
+    // A portable file never stores the source selection, comp or playhead.
+    for key in ["time", "comp", "layer", "layers"] {
+        settings.remove(key);
+    }
+    match crate::menus::invoke(app, ctx, "anim.saveNativePreset", json!({"command":form.command,"settings":settings})) {
+        Ok(result) => {
+            if let Some(path) = result.get("path").and_then(Value::as_str) {
+                app.ui.status = format!("Saved native motion settings to {path}");
+            }
+        }
+        Err(error) => app.ui.status = error,
+    }
 }
 
 #[cfg(test)]

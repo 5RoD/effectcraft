@@ -883,7 +883,7 @@ fn form_grid(ui: &mut egui::Ui, f: &mut Form, regs: &mut Vec<(String, egui::Rect
 
 pub fn show_form(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let mut f = app.dialog_state.form.clone();
-    let (mut ok, mut close) = (false, false);
+    let (mut ok, mut close, mut save_settings) = (false, false, false);
     let h = 160.0 + f.fields.len() as f32 * 34.0;
     let mut regs: Vec<(String, egui::Rect, String)> = vec![];
     let mut browse: Option<usize> = None;
@@ -906,6 +906,11 @@ pub fn show_form(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
             regs.push(("form.cancel".into(), c.rect, "Cancel".into()));
             if c.clicked() {
                 close = true;
+            }
+            if super::native_motion::can_save_settings(&f) {
+                let save = ui.button(tr("Save Settings…"));
+                regs.push(("form.saveSettings".into(), save.rect, "Save Settings…".into()));
+                save_settings = save.clicked();
             }
         });
     });
@@ -937,6 +942,10 @@ pub fn show_form(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     }
     let enter = !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Enter));
     app.dialog_state.form = f.clone();
+    if save_settings {
+        super::native_motion::save_settings(app, ctx, &f);
+        return;
+    }
     if ok || enter {
         app.dialog = None;
         let params = f.params();

@@ -637,6 +637,7 @@ const JAPANESE: &[(&str, &str)] = &[
 ];
 
 const SIMPLIFIED_CHINESE: &[(&str, &str)] = &[
+    ("Save Settings…", "保存设置…"),
     ("Appearance Settings…", "外观设置…"),
     ("Add to favorites", "添加到收藏"),
     ("Remove from favorites", "从收藏中移除"),
@@ -1374,6 +1375,7 @@ const SIMPLIFIED_CHINESE: &[(&str, &str)] = &[
 ];
 
 const TRADITIONAL_CHINESE: &[(&str, &str)] = &[
+    ("Save Settings…", "儲存設定…"),
     ("Appearance Settings…", "外觀設定…"),
     ("Add to favorites", "加入最愛"),
     ("Remove from favorites", "從最愛移除"),

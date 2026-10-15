@@ -724,9 +724,10 @@ fn prepare(ctx: &EffectCtx, input_pixels: u64, pmb: bool) -> Result<Option<Timew
     validate_controls_for(ctx, if pmb { PMB_ID } else { ID })?;
     let Instants { values: instants, keys, indices } = if pmb { pmb_instants(ctx)? } else { instants(ctx)? };
     let Some(host) = ctx.env.host else { return Ok(None) };
-    // PMB blurs the result of preceding effects, as the other shutter effects do.
-    // Timewarp's native retiming path deliberately samples the unprocessed source.
-    let source_effects = if pmb { usize::MAX } else { 0 };
+    // Keep Timewarp's established source sampling for existing projects. Opting in
+    // samples the processed prefix at each source time, as PMB already does. The
+    // renderer host clamps MAX to this effect's index, excluding it and later effects.
+    let source_effects = if pmb || ctx.params.b("processPreviousEffects") { usize::MAX } else { 0 };
     let mut raw_bytes = 0;
     let mut sources = Vec::with_capacity(keys.len());
     for key in &keys {
@@ -1028,6 +1029,29 @@ mod tests {
         assert_eq!(plan.frames.len(), 2);
         assert_eq!(plan.flows.len(), 1);
         assert_eq!(plan.render_cpu().unwrap().img.data, collected_reference(&plan).data);
+    }
+
+    #[test]
+    fn timewarp_processed_input_is_explicit_and_rejects_wrong_types_before_source_reads() {
+        for method in 0..=2 {
+            for processed in [None, Some(false), Some(true)] {
+                let host = Host { expected_effects: if processed == Some(true) { usize::MAX } else { 0 }, ..Default::default() };
+                let mut parameters = parameters(1, method);
+                parameters.values.remove("processPreviousEffects");
+                if let Some(value) = processed {
+                    parameters.values.insert("processPreviousEffects".into(), Value::Bool(value));
+                }
+                let plan = timewarp_plan(&context(&parameters, &host)).unwrap().unwrap();
+                assert!(host.source_reads.load(Ordering::Relaxed) > 0);
+                assert!(plan.render_cpu().is_ok());
+            }
+        }
+        let host = Host::default();
+        let mut parameters = parameters(1, 0);
+        parameters.values.insert("processPreviousEffects".into(), Value::Scalar(1.0));
+        let error = timewarp_plan(&context(&parameters, &host)).err().unwrap();
+        assert!(error.contains("Process Previous Effects"), "{error}");
+        assert_eq!(host.source_reads.load(Ordering::Relaxed), 0);
     }
 
     #[test]
