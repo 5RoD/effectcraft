@@ -6,7 +6,7 @@
 //! options; the timeline draws the cached range as the green cache bar. An edit keeps the frames
 //! of every comp it doesn't touch, and undo finds the frames of the state it returns to.
 //! Switches that don't change pixels (Audio, Lock, Shy, Hide Shy Layers) keep the frames too.
-//! When the budget is full the least recently shown frames go first.
+//! While playing, both memory budgets spare the next frames; while paused they use LRU.
 //!
 //! wasm32 has no threads: jobs wait in the same priority queue and [`Frames::pump`] hands them
 //! to a [`RemoteFrames`] (the browser's frame worker, a second engine instance fed with project
@@ -152,10 +152,10 @@ impl Playhead {
         }
         let step = self.step.max(1);
         if k.frame >= self.cur {
-            return Some((k.frame - self.cur) / step);
+            return Some(k.frame.saturating_sub(self.cur) / step);
         }
         // Looping: through the end of the range and around from its start.
-        self.looping.then(|| (self.end.saturating_sub(self.cur) / step).saturating_add(1).saturating_add((k.frame - self.start) / step))
+        self.looping.then(|| (self.end.saturating_sub(self.cur) / step).saturating_add(1).saturating_add(k.frame.saturating_sub(self.start) / step))
     }
 }
 
@@ -192,10 +192,13 @@ impl Cache {
     /// evicted the frames just ahead of the playhead first (rendered a while ago, not shown yet)
     /// to keep the ones just shown, so a preview longer than the cache played into a gap that
     /// prefetch kept refilling while it evicted the next frames (#595).
-    fn victim(&self) -> Option<usize> {
-        let Some(p) = &self.playhead else { return (!self.order.is_empty()).then_some(0) };
+    fn victim(&self, gpu_only: bool) -> Option<usize> {
         let mut farthest: Option<(i64, usize)> = None;
         for (i, k) in self.order.iter().enumerate() {
+            if gpu_only && !self.map.get(k).is_some_and(FrameImage::is_gpu) {
+                continue;
+            }
+            let Some(p) = &self.playhead else { return Some(i) };
             match p.ahead(k) {
                 None => return Some(i),
                 Some(d) if farthest.is_none_or(|(f, _)| d > f) => farthest = Some((d, i)),
@@ -204,10 +207,10 @@ impl Cache {
         }
         farthest.map(|(_, i)| i)
     }
-    /// Video memory: drop the oldest GPU frames past their own budget.
+    /// Video memory uses the same playhead protection, considering only GPU frames.
     fn evict_gpu(&mut self) {
         while self.gpu_bytes > self.gpu_budget {
-            let Some(i) = self.order.iter().position(|k| self.map.get(k).is_some_and(FrameImage::is_gpu)) else { break };
+            let Some(i) = self.victim(true) else { break };
             if let Some(old) = self.order.remove(i) {
                 self.remove(&old);
             }
@@ -247,7 +250,7 @@ impl Cache {
     }
     fn evict_to_budget(&mut self) {
         while self.bytes > self.budget {
-            let Some(old) = self.victim().and_then(|i| self.order.remove(i)) else { break };
+            let Some(old) = self.victim(false).and_then(|i| self.order.remove(i)) else { break };
             self.remove(&old);
         }
     }
@@ -2031,6 +2034,81 @@ mod tests {
         f.set_playhead(None);
         insert(&f, key(1, 50, 0));
         assert!(!f.is_cached(&key(1, 13, 0)) && f.is_cached(&key(1, 50, 0)));
+    }
+
+    #[test]
+    fn playhead_distances_saturate_for_extreme_frame_ranges() {
+        let mut position = Playhead { series: key(1, 0, 0), cur: i64::MIN, start: i64::MIN, end: i64::MAX, step: 1, looping: false };
+        assert_eq!(position.ahead(&key(1, i64::MAX, 0)), Some(i64::MAX));
+        position.cur = i64::MAX;
+        position.looping = true;
+        assert_eq!(position.ahead(&key(1, 0, 0)), Some(i64::MAX));
+        assert_eq!(position.ahead(&key(1, i64::MIN, 0)), Some(1));
+        position.step = i64::MIN;
+        assert_eq!(position.ahead(&key(1, 0, 0)), Some(i64::MAX));
+        assert_eq!(position.ahead(&key(2, 0, 0)), None);
+    }
+
+    /// GPU budget pressure must not undo the RAM budget's nearest-frame protection.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn gpu_budget_keeps_next_frames_and_never_evicts_cpu_pixels() {
+        let gpu = Gpu::headless();
+        assert!(!std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|value| value == "1") || gpu.is_some());
+        let Some(gpu) = gpu else { return };
+        let image = || {
+            let texture = gpu.device().create_texture(&eframe::wgpu::TextureDescriptor {
+                label: Some("GPU cache eviction regression"),
+                size: eframe::wgpu::Extent3d { width: 2, height: 2, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: eframe::wgpu::TextureDimension::D2,
+                format: eframe::wgpu::TextureFormat::Rgba8Unorm,
+                usage: eframe::wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            FrameImage::Gpu(Arc::new(DisplayFrame { texture, width: 2, height: 2 }))
+        };
+        let mut cache = Cache { map: HashMap::new(), order: VecDeque::new(), bytes: 0, gpu_bytes: 0, budget: 10 * 16, gpu_budget: 4 * 16, playhead: None };
+        let cpu_key = key(9, 77, 0);
+        cache.insert(cpu_key, FrameImage::Cpu(Arc::new(egui::ColorImage::filled([2, 2], egui::Color32::WHITE))));
+        let gpu_frames = |cache: &Cache| {
+            let mut frames: Vec<_> = cache.map.iter().filter(|(_, image)| image.is_gpu()).map(|(key, _)| key.frame).collect();
+            frames.sort_unstable();
+            frames
+        };
+        // The next needed frame is oldest because prefetch completed before current-frame presentation.
+        for frame in [11, 12, 13, 10] {
+            cache.insert(key(1, frame, 0), image());
+        }
+        cache.playhead = Some(playhead(10, false));
+        cache.insert(key(1, 14, 0), image());
+        assert_eq!(gpu_frames(&cache), [10, 11, 12, 13]);
+        assert!(cache.map.contains_key(&cpu_key));
+        assert_eq!((cache.gpu_bytes, cache.bytes), (64, 80));
+        cache.playhead = Some(playhead(12, false));
+        cache.insert(key(1, 14, 0), image());
+        assert_eq!(gpu_frames(&cache), [10, 12, 13, 14]);
+        cache.playhead = Some(playhead(13, true));
+        cache.insert(key(1, 0, 0), image());
+        assert_eq!(gpu_frames(&cache), [0, 10, 13, 14]);
+        cache.playhead = None;
+        cache.insert(key(1, 50, 0), image());
+        assert_eq!(gpu_frames(&cache), [0, 10, 14, 50], "paused eviction remains LRU among GPU entries");
+        assert!(cache.map.contains_key(&cpu_key));
+        // An unrelated GPU series goes before the current series when all of its frames are useful.
+        cache.map.clear();
+        cache.order.clear();
+        cache.bytes = 0;
+        cache.gpu_bytes = 0;
+        cache.playhead = Some(playhead(0, false));
+        for frame in [1, 2, 3, 0] {
+            cache.insert(key(1, frame, 0), image());
+        }
+        cache.insert(key(2, 10, 0), image());
+        assert_eq!(gpu_frames(&cache), [0, 1, 2, 3]);
+        assert!(!cache.map.contains_key(&key(2, 10, 0)));
+        assert_eq!(cache.gpu_bytes, 64);
     }
 
     /// #595: prefetch renders the frames the preview reaches first, whatever order they were
