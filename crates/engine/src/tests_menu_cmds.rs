@@ -676,6 +676,86 @@ fn animation_menu_keys_presets_text() {
     assert_eq!(layer(&s, t).props.group("text/animators").unwrap().children.len(), 1);
 }
 
+/// A preset carrying both animation and an effect, so layer locks protect the complete target.
+fn opacity_and_effect_preset(s: &mut Session) -> Value {
+    let source = solid(s, "#ff0000");
+    s.execute("time.set", json!({"time": 0})).unwrap();
+    s.execute("prop.set", json!({"layer": source, "path": "transform/opacity", "value": 20})).unwrap();
+    s.execute("prop.toggleAnimation", json!({"layer": source, "path": "transform/opacity"})).unwrap();
+    s.execute("time.set", json!({"time": 1})).unwrap();
+    s.execute("prop.set", json!({"layer": source, "path": "transform/opacity", "value": 80})).unwrap();
+    s.execute("effect.apply", json!({"layer": source, "effect": "Fill"})).unwrap();
+    let source = layer(s, source);
+    let opacity = source.props.prop("transform/opacity").unwrap();
+    let effect = source.effects().unwrap().groups().next().unwrap();
+    json!({
+        "effectcraftAnimationPreset": 1,
+        "properties": [{"path": "transform/opacity", "value": opacity.value, "keys": opacity.keys, "expression": null}],
+        "effects": [effect],
+    })
+}
+
+#[test]
+fn animation_presets_reject_locked_targets_without_document_history_or_preference_changes() {
+    for explicit in [false, true] {
+        let mut s = comp();
+        let preset = opacity_and_effect_preset(&mut s);
+        let path = tmp("locked-target.ecpreset");
+        std::fs::write(&path, serde_json::to_vec(&preset).unwrap()).unwrap();
+        let target = solid(&mut s, "#00ff00");
+        s.execute("layer.setSwitch", json!({"layer": target, "switch": "lock", "value": true})).unwrap();
+        // A stale selection and explicit agent targets must enforce the same lock.
+        s.state.selected_layers = vec![effectcraft_project::LayerId(target)];
+        let project = s.project.clone();
+        let history = s.history_tree();
+        let merge_key = s.history.merge_key.clone();
+        let needs_save = s.needs_save();
+        let prefs = s.prefs.to_json();
+        let revision = s.prefs_revision;
+        let params = if explicit { json!({"path": path, "layers": [target]}) } else { json!({"path": path}) };
+        let error = s.execute("anim.applyPreset", params).unwrap_err().to_string();
+        assert!(error.contains("locked") && error.contains("Unlock All Layers"), "{error}");
+        assert!(std::sync::Arc::ptr_eq(&project, &s.project));
+        assert_eq!(s.history_tree(), history);
+        assert_eq!(s.history.merge_key, merge_key);
+        assert_eq!(s.needs_save(), needs_save);
+        assert_eq!(s.prefs.to_json(), prefs, "a rejected application must not enter the recent list");
+        assert_eq!(s.prefs_revision, revision);
+    }
+}
+
+#[test]
+fn animation_presets_skip_locked_layers_and_apply_editable_targets_in_one_undo_step() {
+    for explicit in [false, true] {
+        let mut s = comp();
+        let preset = opacity_and_effect_preset(&mut s);
+        let editable = solid(&mut s, "#00ff00");
+        let locked = solid(&mut s, "#0000ff");
+        s.execute("layer.setSwitch", json!({"layer": locked, "switch": "lock", "value": true})).unwrap();
+        s.execute("time.set", json!({"time": 3})).unwrap();
+        s.state.selected_layers = vec![effectcraft_project::LayerId(editable), effectcraft_project::LayerId(locked)];
+        let editable_before = layer(&s, editable);
+        let locked_before = layer(&s, locked);
+        let steps = s.history.undo.len();
+        let params = if explicit { json!({"preset": preset, "layers": [editable, locked]}) } else { json!({"preset": preset}) };
+        let result = s.execute("anim.applyPreset", params).unwrap();
+        assert_eq!(result["applied"], 2, "one property and one effect, on the editable layer only");
+        assert_eq!(s.history.undo.len(), steps + 1);
+        let editable_after = layer(&s, editable);
+        assert_ne!(editable_after, editable_before);
+        assert_eq!(layer(&s, locked), locked_before);
+        let keys = &editable_after.props.prop("transform/opacity").unwrap().keys;
+        assert_eq!(keys.iter().map(|key| key.time).collect::<Vec<_>>(), [Tick::from_seconds_f64(3.0), Tick::from_seconds_f64(4.0)]);
+        assert_eq!(editable_after.effects().unwrap().groups().count(), editable_before.effects().unwrap().groups().count() + 1);
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(layer(&s, editable), editable_before);
+        assert_eq!(layer(&s, locked), locked_before);
+        s.execute("edit.redo", json!({})).unwrap();
+        assert_eq!(layer(&s, editable), editable_after);
+        assert_eq!(layer(&s, locked), locked_before);
+    }
+}
+
 #[test]
 fn reveal_properties() {
     let mut s = comp();

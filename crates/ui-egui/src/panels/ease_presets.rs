@@ -8,6 +8,8 @@
 //! Automation ids: `easePresets.graph`, `easePresets.handle.out` / `.in`, `easePresets.apply`,
 //! `easePresets.fromKeys`, `easePresets.name`, `easePresets.save`, `easePresets.rename`,
 //! `easePresets.delete`, `easePresets.preset.<n>` (1-based, labelled with the preset's name).
+//! Precise editors: `easePresets.handle.x1` / `.y1` / `.x2` / `.y2`, `.bezierText`,
+//! `.copy`, `.paste`, `.useCurve`, and `.curveError` when validation fails.
 
 use effectcraft_engine::ease_presets;
 use effectcraft_engine::keyframe::EaseCurve;
@@ -30,22 +32,122 @@ pub struct EasePanelState {
     pub selected: Option<String>,
     /// Name for Save Current and Rename.
     pub name: String,
+    /// Pending edits stay separate from the last valid curve until committed.
+    pub handle_text: [String; 4],
+    pub bezier_text: String,
+    pub curve_error: Option<String>,
+    synced_curve: Option<EaseCurve>,
+    numbers_dirty: bool,
 }
 
 impl Default for EasePanelState {
     fn default() -> Self {
-        EasePanelState { curve: EaseCurve::LINEAR, selected: None, name: String::new() }
+        let mut state = EasePanelState {
+            curve: EaseCurve::LINEAR,
+            selected: None,
+            name: String::new(),
+            handle_text: Default::default(),
+            bezier_text: String::new(),
+            curve_error: None,
+            synced_curve: None,
+            numbers_dirty: false,
+        };
+        state.sync_fields();
+        state
     }
 }
 
-/// Value range of the graph: room for handles above and below the keys.
-const V_MIN: f64 = -0.35;
-const V_MAX: f64 = 1.35;
+impl EasePanelState {
+    fn sync_fields(&mut self) {
+        self.handle_text = self.curve.handles().map(|value| value.to_string());
+        self.bezier_text = bezier_text(&self.curve);
+        self.synced_curve = Some(self.curve);
+        self.numbers_dirty = false;
+    }
+
+    fn accept(&mut self, curve: Result<EaseCurve, String>) {
+        match curve {
+            Ok(curve) => {
+                self.curve = curve;
+                self.selected = None;
+                self.curve_error = None;
+                self.sync_fields();
+            }
+            Err(error) => self.curve_error = Some(error),
+        }
+    }
+}
+
+fn bezier_text(curve: &EaseCurve) -> String {
+    let [x1, y1, x2, y2] = curve.handles();
+    // Display uses round-trippable f64 text, rather than the summary's rounded values.
+    format!("cubic-bezier({x1}, {y1}, {x2}, {y2})")
+}
+
+fn checked_handles(handles: [f64; 4]) -> Result<EaseCurve, String> {
+    if handles.iter().any(|value| !value.is_finite()) {
+        return Err("Use four finite numbers.".into());
+    }
+    let [x1, _, x2, _] = handles;
+    if !(0.001..=1.0).contains(&x1) || !(0.0..=0.999).contains(&x2) {
+        return Err("X1 must be 0.001–1 and X2 0–0.999.".into());
+    }
+    let curve = EaseCurve::from_handles(handles).ok_or("Use four finite numbers.")?;
+    // The engine sanitizes unsupported slopes. Entry reports that bound rather than
+    // silently changing a pasted curve; ordinary floating-point roundoff is allowed.
+    if curve.handles().iter().zip(handles).any(|(actual, requested)| (actual - requested).abs() > 16.0 * f64::EPSILON * requested.abs().max(1.0)) {
+        return Err("Y handles exceed relative speeds −100–100.".into());
+    }
+    Ok(curve)
+}
+
+fn parse_numbers<'a>(mut parts: impl Iterator<Item = &'a str>) -> Result<EaseCurve, String> {
+    let mut handles = [0.0; 4];
+    for value in &mut handles {
+        *value = parts.next().ok_or("Enter exactly four numbers.")?.trim().parse::<f64>().map_err(|_| "Use four finite numbers.")?;
+    }
+    if parts.next().is_some() {
+        return Err("Enter exactly four numbers.".into());
+    }
+    checked_handles(handles)
+}
+
+fn parse_bezier(text: &str) -> Result<EaseCurve, String> {
+    if text.len() > 512 {
+        return Err("Curve text is limited to 512 bytes.".into());
+    }
+    let text = text.trim().strip_suffix(';').unwrap_or(text.trim()).trim();
+    let body = if let Some(rest) = text.strip_prefix("cubic-bezier") {
+        rest.trim().strip_prefix('(').and_then(|rest| rest.strip_suffix(')')).ok_or("Use cubic-bezier(x1, y1, x2, y2).")?
+    } else if let Some(rest) = text.strip_prefix('[') {
+        rest.strip_suffix(']').ok_or("Close the four-number array with ].")?
+    } else {
+        text
+    };
+    parse_numbers(body.split(','))
+}
+
+/// Include both keys and handles, with room for the complete pointer hit targets.
+fn graph_range(curve: &EaseCurve) -> [f64; 2] {
+    let [_, y1, _, y2] = curve.handles();
+    let lo = y1.min(y2).min(0.0);
+    let hi = y1.max(y2).max(1.0);
+    let pad = (hi - lo) * 0.15;
+    [lo - pad, hi + pad]
+}
+
+#[derive(Clone)]
+struct GraphDrag {
+    range: [f64; 2],
+    plot: Rect,
+    origin: Pos2,
+    handles: [f64; 4],
+}
 const TILE: egui::Vec2 = vec2(84.0, 64.0);
 const GAP: f32 = 6.0;
 const ROW: f32 = 30.0;
 /// Height of the controls under the graph (numbers, three button rows, status, "Presets").
-const CONTROLS: f32 = 184.0;
+const CONTROLS: f32 = 342.0;
 /// Panels at least this wide put the presets beside the graph and controls.
 const SIDE_BY_SIDE: f32 = 560.0;
 
@@ -64,6 +166,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let t = app.tokens;
     let p = ui.painter().with_clip_rect(rect);
     let mut st = app.ui.ease_presets.clone();
+    st.curve = st.curve.sanitized().unwrap_or(EaseCurve::LINEAR);
+    if st.synced_curve != Some(st.curve) {
+        st.sync_fields();
+    }
     let pairs = ease_presets::selected_pairs(&app.session).len();
     let x0 = rect.min.x + 10.0;
     // Wide panels: graph and controls on the left, presets on the right; else presets below,
@@ -81,12 +187,20 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let scroll = widgets::PanelScroll::begin(ui, egui::Id::new("ease-presets-scroll"), rect);
     let content = Rect::from_min_size(rect.min - vec2(0.0, scroll.offset), vec2(rect.width(), rect.height().max(content_height)));
     let g = Rect::from_min_size(pos2(x0, content.min.y + 10.0), vec2(w, graph_height));
+    let before = st.curve;
     graph(app, ui, g, &mut st.curve);
-    let c = st.curve;
+    if st.curve != before {
+        st.selected = None;
+        st.curve_error = None;
+        st.sync_fields();
+    }
     let mut y = g.max.y + 4.0;
+    let c = st.curve;
     let numbers = format!("Out {:.1} % · {:.2}      In {:.1} % · {:.2}", c.out_influence, c.out_speed, c.in_influence, c.in_speed);
     p.text(pos2(x0, y + 8.0), Align2::LEFT_CENTER, numbers, Tokens::mono(11.0), t.text_faint);
     y += 22.0;
+    y = precise_controls(app, ui, &mut st, x0, y, w);
+    let c = st.curve;
     let at = |x: f32, y: f32, width: f32| Rect::from_min_size(pos2(x, y), vec2(width, 24.0));
     if kit::button(app, ui, at(x0, y, 90.0), "easePresets.apply", "Apply", pairs > 0) {
         apply(app, json!({"curve": c}), pairs, "the curve");
@@ -97,6 +211,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     {
         st.curve = curve;
         st.selected = None;
+        st.curve_error = None;
+        st.sync_fields();
     }
     y += ROW;
     let field = at(x0, y, (w - 116.0).max(80.0));
@@ -154,6 +270,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let list = Rect::from_min_max(head + vec2(0.0, 22.0), pos2(content.max.x - 10.0, content.max.y - 6.0));
     if let Some((name, curve)) = grid(app, ui, list, st.selected.as_deref()) {
         st.curve = curve;
+        st.curve_error = None;
+        st.sync_fields();
         if pairs > 0 {
             apply(app, json!({"preset": name}), pairs, &format!("“{name}”"));
         }
@@ -163,6 +281,62 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         app.ui.ease_presets = st;
     }
     scroll.end(ui, &mut app.auto, "easePresets.scroll", content_height, &t);
+}
+
+fn precise_controls(app: &mut EffectcraftApp, ui: &mut egui::Ui, st: &mut EasePanelState, x: f32, mut y: f32, width: f32) -> f32 {
+    let t = app.tokens;
+    let column = (width - GAP) * 0.5;
+    let mut commit = false;
+    for (index, (name, text)) in ["x1", "y1", "x2", "y2"].into_iter().zip(st.handle_text.iter_mut()).enumerate() {
+        let at = pos2(x + (index % 2) as f32 * (column + GAP), y + (index / 2) as f32 * ROW);
+        kit::label(ui, at, name, &t);
+        let rect = Rect::from_min_size(at + vec2(22.0, 0.0), vec2(column - 22.0, 24.0));
+        let response = ui.push_id(("easePresets.number", name), |ui| widgets::text_field(ui, rect, text, name, &t)).inner;
+        app.auto.add(&format!("easePresets.handle.{name}"), rect, text);
+        st.numbers_dirty |= response.changed();
+        commit |= response.lost_focus() || (response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+    }
+    if commit && st.numbers_dirty {
+        st.accept(parse_numbers(st.handle_text.iter().map(String::as_str)));
+    }
+    y += 2.0 * ROW;
+    let rect = Rect::from_min_size(pos2(x, y), vec2(width, 24.0));
+    let field = ui.push_id("easePresets.bezierText", |ui| widgets::text_field(ui, rect, &mut st.bezier_text, "cubic-bezier(x1, y1, x2, y2)", &t)).inner;
+    app.auto.add("easePresets.bezierText", rect, &st.bezier_text);
+    if (field.has_focus() || field.lost_focus()) && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+        st.accept(parse_bezier(&st.bezier_text));
+    }
+    y += ROW;
+    let button_width = (width - 2.0 * GAP) / 3.0;
+    let at = |column: f32| Rect::from_min_size(pos2(x + column * (button_width + GAP), y), vec2(button_width, 24.0));
+    if kit::button(app, ui, at(0.0), "easePresets.copy", "Copy Curve", false) {
+        ui.ctx().copy_text(bezier_text(&st.curve));
+        app.ui.status = "Copied the working cubic-bezier curve".into();
+    }
+    if kit::button(app, ui, at(1.0), "easePresets.paste", "Paste Curve", false) {
+        let clipboard = app.hooks.clipboard_text.as_ref().and_then(|read| read());
+        match clipboard {
+            Some(text) => {
+                st.accept(parse_bezier(&text));
+            }
+            None => {
+                field.request_focus();
+                app.ui.status = "Paste into the curve field, then press Enter or Use Curve".into();
+            }
+        }
+    }
+    if kit::button(app, ui, at(2.0), "easePresets.useCurve", "Use Curve", false) {
+        st.accept(parse_bezier(&st.bezier_text));
+    }
+    y += ROW;
+    if let Some(error) = &st.curve_error {
+        let rect = Rect::from_min_size(pos2(x, y), vec2(width, 38.0));
+        let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+        let galley = painter.layout(error.clone(), Tokens::ui(11.0), t.danger, width);
+        painter.galley(rect.min, galley, t.danger);
+        app.auto.add("easePresets.curveError", rect, error);
+    }
+    y + 38.0
 }
 
 fn apply(app: &mut EffectcraftApp, params: serde_json::Value, pairs: usize, what: &str) {
@@ -182,7 +356,13 @@ fn graph(app: &mut EffectcraftApp, ui: &mut egui::Ui, g: Rect, curve: &mut EaseC
     p.rect_stroke(g, 3.0, Stroke::new(1.0, t.field_border), StrokeKind::Inside);
     app.auto.add("easePresets.graph", g, "Ease curve");
     let plot = g.shrink2(vec2(16.0, 6.0));
-    let at = |x: f64, v: f64| to_screen(plot, V_MIN, V_MAX, x, v);
+    let drag_id = egui::Id::new("easePresets.graph.drag");
+    if !ui.input(|input| input.pointer.primary_down()) {
+        ui.data_mut(|data| data.remove::<GraphDrag>(drag_id));
+    }
+    let dragging = ui.data(|data| data.get_temp::<GraphDrag>(drag_id));
+    let [lo, hi] = dragging.as_ref().map(|drag| drag.range).unwrap_or_else(|| graph_range(curve));
+    let at = |x: f64, v: f64| to_screen(plot, lo, hi, x, v);
     for v in [0.0, 1.0] {
         p.line_segment([at(0.0, v), at(1.0, v)], Stroke::new(1.0, t.separator));
     }
@@ -201,11 +381,27 @@ fn graph(app: &mut EffectcraftApp, ui: &mut egui::Ui, g: Rect, curve: &mut EaseC
             ui.ctx().set_cursor_icon(if resp.dragged() { CursorIcon::Grabbing } else { CursorIcon::Grab });
         }
         p.circle_filled(h, if hot { 5.5 } else { 4.5 }, if hot { t.keyframe_selected } else { t.text });
-        if resp.dragged() {
-            let to = h + resp.drag_delta();
-            let x = f64::from((to.x - plot.min.x) / plot.width()).clamp(0.0, 1.0);
-            let v = (V_MIN + f64::from((plot.max.y - to.y) / plot.height()) * (V_MAX - V_MIN)).clamp(V_MIN, V_MAX);
-            next = EaseCurve::from_handles(if out { [x, v, x2, y2] } else { [x1, y1, x, v] });
+        if resp.drag_started()
+            && let Some(origin) = ui.input(|input| input.pointer.press_origin())
+        {
+            ui.data_mut(|data| data.insert_temp(drag_id, GraphDrag { range: [lo, hi], plot, origin, handles: curve.handles() }));
+        }
+        if resp.dragged_by(egui::PointerButton::Primary)
+            && let Some(pointer) = resp.interact_pointer_pos()
+            && let Some(drag) = ui.data(|data| data.get_temp::<GraphDrag>(drag_id))
+        {
+            // The starting range and pointer offset are fixed for the entire gesture.
+            // Re-fitting on every update would change the units per pixel mid-drag.
+            let delta = pointer - drag.origin;
+            let mut handles = drag.handles;
+            let (xi, yi) = if out { (0, 1) } else { (2, 3) };
+            if let Some(x) = handles.get_mut(xi) {
+                *x = (*x + f64::from(delta.x / drag.plot.width())).clamp(if out { 0.001 } else { 0.0 }, if out { 1.0 } else { 0.999 });
+            }
+            if let Some(y) = handles.get_mut(yi) {
+                *y -= f64::from(delta.y / drag.plot.height()) * (drag.range[1] - drag.range[0]);
+            }
+            next = EaseCurve::from_handles(handles);
         }
     }
     if let Some(c) = next {
@@ -261,4 +457,58 @@ fn grid(app: &mut EffectcraftApp, ui: &mut egui::Ui, list: Rect, selected: Optio
         }
     }
     clicked
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn precise_curve_text_round_trips_overshoot_and_rejects_unrepresentable_input() {
+        let handles = [0.4, 3.0, 0.6, -2.0];
+        let expected = checked_handles(handles).unwrap();
+        assert_eq!(expected.handles(), handles);
+        for input in ["cubic-bezier(0.4, 3, 0.6, -2)", " cubic-bezier (4e-1, 3, 6e-1, -2); ", "[0.4, 3, 0.6, -2]", "0.4,3,0.6,-2"] {
+            let curve = parse_bezier(input).unwrap();
+            assert_eq!(curve, expected, "{input}");
+            assert_eq!(parse_bezier(&bezier_text(&curve)).unwrap(), curve);
+        }
+        let mut state = EasePanelState::default();
+        state.accept(Ok(expected));
+        let valid_text = state.bezier_text.clone();
+        for input in [
+            "",
+            "0.4,3,0.6",
+            "0.4,3,0.6,-2,7",
+            "cubic-bezier(0.4,NaN,0.6,-2)",
+            "0.4,inf,0.6,-2",
+            "0.4,1e309,0.6,-2",
+            "cubic-bezier(0.4,3,0.6,-2",
+            "cubic-bezier(0.4,3,0.6,-2) junk",
+            "0,0,0.6,-2",
+            "0.4,3,1,1",
+            "0.4,41,0.6,-2",
+        ] {
+            state.accept(parse_bezier(input));
+            assert!(state.curve_error.is_some(), "{input}");
+            assert_eq!(state.curve, expected, "invalid text changed the working curve: {input}");
+            assert_eq!(state.bezier_text, valid_text, "rejected clipboard input must not replace usable curve text");
+        }
+        state.accept(parse_bezier(&" ".repeat(513)));
+        assert!(state.curve_error.is_some());
+        assert_eq!(state.curve, expected);
+    }
+
+    #[test]
+    fn graph_range_includes_extreme_valid_handles_and_full_hit_targets() {
+        for handles in [[0.4, 3.0, 0.6, -2.0], [1.0, 100.0, 0.0, -99.0], [0.001, -0.1, 0.999, 1.1]] {
+            let curve = checked_handles(handles).unwrap();
+            let [lo, hi] = graph_range(&curve);
+            let graph = Rect::from_min_size(Pos2::ZERO, vec2(210.0, 90.0));
+            let plot = graph.shrink2(vec2(16.0, 6.0));
+            for [x, y] in [[handles[0], handles[1]], [handles[2], handles[3]]] {
+                assert!(graph.contains_rect(Rect::from_center_size(to_screen(plot, lo, hi, x, y), vec2(14.0, 14.0))));
+            }
+        }
+    }
 }

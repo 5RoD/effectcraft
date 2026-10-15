@@ -23,6 +23,9 @@ The result is ordinary keyframes. Keys inside the requested interval are replace
 it remain. An enabled expression on a target property gives an error because it would override
 the new animation. Generated properties and keys are selected for editing or **Save Animation
 Preset…**, which reuses EffectCraft's existing portable `.ecpreset` format.
+These are absolute keyframe snapshots: applying one replaces the target property's entire key
+list. To regenerate relative motion around a different layer's existing animation, run the native
+action with the same settings. A portable library of action settings remains open work.
 
 Agents use `anim.nativeAction` with optional `layers`, `layer`, `comp`, `action`, `time`, `duration`,
 `stagger`, `reverse`, `axis`, `distance`, `scalePercent`, `angle`, `overshoot`, and `ease`. A `curve`
@@ -45,7 +48,10 @@ Shake is added to the existing keyframed motion and stored once per composition 
 keys. Reopening does not require a noise generator or expression runtime. The same layer,
 original animation, settings, and seed produce the same result. Reapplying adds another shake;
 undo first to regenerate it from the same original motion. Save the selected properties through
-**Save Animation Preset…** to reuse or share the result.
+**Save Animation Preset…** to share an absolute keyframe snapshot. To add the same configured
+shake around another layer's original motion, run Seeded Shake there with the same settings.
+Locked layers are skipped when applying animation presets; an all-locked target is rejected
+before changing the project, history or recent-preset preferences.
 
 Agents use `anim.nativeShake` with `layers`, `layer`, `comp`, `time`, `duration`, `frequency`,
 `decay`, `x`, `y`, `z`, `rotation`, `scale`, and `seed`. One command may produce at most 200,000
@@ -159,10 +165,36 @@ lookup cost separately; it does not measure decoding, optical flow or full playb
 This fixes a native retiming behavior, not commercial Twixtor algorithm compatibility
 or complete After Effects Timewarp fidelity (including its fractional-frame phase).
 
+## Precise easing curves
+
+**Window → Ease Presets** edits a working curve without changing project keyframes. The four
+numeric fields are the normalized Bézier handles **x1, y1, x2, y2**; commit a number with Enter
+or by leaving its field. Values retain full floating-point precision rather than the rounded
+influence/speed summary above them.
+
+The text field accepts `cubic-bezier(0.4, 3, 0.6, -2)`, a four-number array, or four comma-separated
+numbers. Press Enter or **Use Curve** to load it. **Copy Curve** copies the current valid curve;
+**Paste Curve** reads the desktop clipboard. When clipboard reading is unavailable, paste into
+the field with the platform paste shortcut and commit it there. Invalid input shows an error
+and retains the last usable curve. Rejected clipboard input also retains the previous text;
+an invalid typed draft stays available for correction.
+
+The existing engine supports x1 from `0.001` to `1`, x2 from `0` to `0.999`, and relative endpoint
+speeds from `-100` to `100`. Valid CSS curves outside those engine bounds are reported as
+unsupported rather than silently altered. Overshoot within the supported range is allowed.
+The graph fits both handles, including large overshoot, and keeps one scale throughout each
+pointer drag; it fits the result again after release. All editors and library controls share
+the panel's vertical scroll area.
+
+**Apply** changes the selected editable keyframe pairs in one undo step. Capture, named presets
+and portable library import/export use the same engine curves. These are original editing
+controls, not commercial Flow binary or preset compatibility. The new controls require the
+combined repository gate and desktop validation before release acceptance.
+
 ## Remaining requested workflows
 
-Flow-style curve editing and libraries use the existing Ease Presets panel; this work does not
-duplicate it. Applying a curve skips locked layers in a mixed selection and creates one undo
+Flow-style curve editing and libraries use the Ease Presets panel. Applying a curve skips
+locked layers in a mixed selection and creates one undo
 step for the editable pairs. An all-locked selection returns an unlock instruction without
 changing the project or history; read-only curve capture remains available. KeyFast-style Trim Paths macros, dedicated action libraries and modifier shortcuts
 remain. Shake preset sharing uses editable animation presets, not a separate settings library or

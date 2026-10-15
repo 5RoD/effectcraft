@@ -10,7 +10,7 @@ use effectcraft_project::{GroupKind, Layer, LayerId, LayerSource, Node, Project,
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
-use super::{CommandSpec, bad, frontend, has_comp, has_keys, has_layers, layer_mut, layers_p, match_path_of, selected_leaf_props, str_p};
+use super::{CommandSpec, bad, frontend, has_comp, has_keys, has_layers, layer_mut, layers_p, match_path_of, selected_leaf_props, str_p, unlocked};
 use crate::{EngineError, KeyRef, Result, Session, cmd};
 
 /// Preset file format version tag (`*.ecpreset`, JSON).
@@ -104,6 +104,7 @@ fn apply_preset(s: &mut Session, p: &Value) -> Result<Value> {
     if ids.is_empty() {
         return Err(bad("anim.applyPreset", "select a layer"));
     }
+    let ids = unlocked(s, cid, ids, "anim.applyPreset")?;
     // Animation ▸ Recent Animation Presets.
     if let Some(path) = str_p(p, "path") {
         s.prefs.push_recent_preset(path);

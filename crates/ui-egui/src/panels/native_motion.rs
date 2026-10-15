@@ -45,7 +45,10 @@ pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
                 Field::num("angle", "Rotation offset (degrees)", -90.0),
                 Field::num("overshoot", "Slide/Scale/Rotate overshoot (%)", 0.0),
                 Field::choice("ease", "Easing curve", &names, selected),
-                Field::note("help", "Selected unlocked layers; one undo step. Replaces keys inside the interval. Reuse with Save Animation Preset."),
+                Field::note(
+                    "help",
+                    "Selected unlocked layers; one undo step. Replaces keys inside the interval. Save Animation Preset stores an absolute keyframe snapshot.",
+                ),
             ],
         )
     } else {
@@ -62,7 +65,10 @@ pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
                 Field::num("rotation", "Rotation amplitude (degrees)", 2.0),
                 Field::num("scale", "Scale amplitude (percentage points)", 0.0),
                 Field::num("seed", "Random seed (nonnegative integer)", 1.0),
-                Field::note("help", "Adds reproducible motion. Endpoints unchanged; one undo step. Reuse with Save Animation Preset."),
+                Field::note(
+                    "help",
+                    "Adds reproducible motion. Endpoints unchanged; one undo step. Rerun these settings to shake another animation; Save Animation Preset stores absolute keys.",
+                ),
             ],
         )
     };

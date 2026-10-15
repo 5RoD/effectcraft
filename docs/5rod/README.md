@@ -241,6 +241,12 @@ establish production speed. Their scope is recorded in [edit recovery](edit-reco
 
 ## Playback and export acceptance targets
 
+The latest 0.10 production comparison measured uncached viewer cadence at
+94.11 → 110.46 textures/s and shorter export durations, with the same output
+settings. The full 120 fps target and final installation remain open. See
+[video upload and export processing measurements](video-staging-performance.md)
+for paired runs, frame-time spikes, memory, validation and measurement limits.
+
 The requested working footage is primarily **2560×1440 at 120 fps**, with 60 fps also used and
 144 fps reserved for optional stress testing. Playback acceptance must measure
 decoded video in the actual timeline: cold and cached startup, sustained presentation, dropped
