@@ -6,6 +6,9 @@ The desktop app exposes a control channel for agents, tests and the MCP bridge:
 effectcraft --control 9877        # or EFFECTCRAFT_CONTROL_PORT=9877
 ```
 
+The port must be a number from 1 to 65535, and `--control` overrides the variable. A bad port or an
+unknown option prints an error and the app exits with status 1 before it opens a window.
+
 - **Transport:** TCP on `127.0.0.1` only, one JSON object per line in each direction. Connections are
   persistent; requests on one connection are answered in order.
 - **Request:** `{"id": 1, "method": "engine.execute", "params": {...}}` (`id` is echoed back, `params`
@@ -114,6 +117,12 @@ errors. Unreadable, invalid or newer files leave the default workspace available
 preserved for the entire session, including after later layout changes. Load and save errors
 appear in the status message and the nullable
 `workspaceStorageError` field; a failed write remains eligible for retry.
+`window.saveWorkspace`, `window.saveWorkspaceAs` and `window.editWorkspaces` (rename, delete)
+write the file immediately. Through `ui.menu.invoke` they return an error when it isn't written
+(a failed write, a file preserved after a failed load, or no configuration store);
+`engine.execute` hands them to the UI and returns `{frontend}` first, so check
+`workspaceStorageError` there. The changed workspaces still apply for the session, and a later
+save retries them.
 
 ## Input
 
@@ -147,6 +156,21 @@ uniformly. Rotation snaps to one degree, Shift to five, and Ctrl/Command keeps f
 precision. A drag merges its checked transform batches into one undo step. See the
 [3D compatibility limits](5rod/after-effects-parity.md).
 
+`W` selects the Rotation tool and its XYZ rotation rings for 3D content. The toolbar's
+`tools.rotation.target` selector (compact rows `tools.rotation.orientation` and `.rotation`)
+chooses Orientation or authored X/Y/Z Rotation. The equivalent command is
+`view.gizmo.rotationTarget {target: "orientation"|"rotation"}`; invalid values leave state
+unchanged. `rotation_target` is saved in viewer state and defaults to `orientation`.
+With W, Shift snaps to 15 degrees. Rotation mode retains full revolutions and the authored
+Orientation. Bounding-box corners rotate Z, top/bottom midpoints X, and left/right midpoints Y.
+
+Shortcut presets also accept `Physical+<shortcut>` for a keyboard position, using egui's
+US-position names (for example `Physical+6` and `Physical+Minus` distinguish AZERTY's
+`-` and `)` keys). Physical bindings take precedence over logical bindings for that key
+press. `ui.key` accepts the same notation to test them. Ordinary shortcuts remain layout-aware.
+`time.workAreaStart` and `time.workAreaEnd` navigate to the first and last included work-area
+frames and can be assigned through `shortcuts.set`.
+
 ## Locating things
 
 | Method | Params | Result |
@@ -168,7 +192,8 @@ one), `panel.tab.Viewer(<n>)` and `viewers.<n>` (View ▸ New Viewer's other Com
 renames it), `viewer.comp`, `viewer.handle.<layer>.<i>`,
 `timeline.layer.<id>.bar`, `timeline.layer.<id>.nestedMarker.<i>` (a precomp's comp markers), `timeline.layer.<id>.twirl`, `timeline.layer.<id>.row` (click selects,
 Enter or a double-click renames, drag reorders), `timeline.prop.<uid>.stopwatch`,
-`timeline.key.<uid>.<frame>`, `timeline.cti`, `effectControls.prop.<uid>.value` (an angle's
+`timeline.key.<uid>.<frame>` (and `timeline.keyAt.<uid>.<ticks>`, exact in layer-time ticks, for
+keys on subframes), `timeline.cti`, `effectControls.prop.<uid>.value` (an angle's
 revolutions are `timeline.prop.<uid>.revolutions`, `effectControls.prop.<uid>.revolutions` and
 `properties.prop.<uid>.revolutions`) and `effects.item.<name>`. The Composition viewer adds `viewer.magnification`, `viewer.resolution`,
 `viewer.roi`, `viewer.grid`, `viewer.channel`, `viewer.exposure`, `viewer.snapshot`,
@@ -184,8 +209,14 @@ Viewer state that agents drive headless too: `view.snapping`, `view.snappingOpti
 `header.snappingOptions`: After Effects' Snap Edges Extended and Snap to Features in Collapsed
 Compositions and Text Layers), `view.channel {channel, colorized?}`,
 `view.exposure {stops | delta}`, `view.resetExposure`, `view.takeSnapshot`, `view.showSnapshot`,
-`view.fastPreviewMode {mode}`, `view.setRegionOfInterest {rect}`, `view.addGuide`,
-`view.moveGuide`, `view.removeGuide`; editing: `shape.newPath` (Pen on shape layers),
+`view.fastPreviewMode {mode}` (one mode each, for shortcuts:
+`view.fastPreviews.off|adaptive|draft|fastDraft|wireframe`, and for the channels
+`view.channel.red|green|blue|alpha|redColorized|greenColorized|blueColorized|rgbStraight`), `view.res.full|half|third|quarter|auto {comp?}` and
+`view.res.custom {factor, comp?}` (the comp's Resolution, saved with the project but no undo
+step; `ui.set {viewer: {res}}` sets the active comp's, and `ui.inspect` reports it as
+`ui.viewer.res`), `view.setRegionOfInterest {rect}`, `view.addGuide {percent?}`,
+`view.addPercentGuide`, `view.convertGuides {to: percent|pixels, index?}`,
+`view.moveGuide` (comp pixels, whatever the guide's unit), `view.removeGuide`, `effect.setLabel {layer?, effect, label}`; editing: `shape.newPath` (Pen on shape layers),
 `shape.newShape` (the shape tools: a new group in the selected shape layer, else a new shape layer),
 `shape.toolOptions` (the Tools bar's Tool Creates Shape / Mask and Fill and Stroke Options),
 `mask.insertVertex`, `mask.convertVertex`, `mask.deleteVertices`, `path.freeTransform` (masks and

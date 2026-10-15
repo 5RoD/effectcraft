@@ -242,16 +242,15 @@ pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
     let lt = layer.map(|l| l.layer_time(t)).unwrap_or(t);
     let base = p.clone();
     let (title, fields): (String, Vec<Field>) = match id {
-        // Photoshop files: Import Kind (Footage / Composition / – Retain Layer Sizes).
-        "file.import" if !has(p, &["importAs"]) && is_layered(p) => (
-            "Import Photoshop File".into(),
-            vec![Field::choice(
-                "importAs",
-                "Import Kind",
-                &[("Footage", json!("footage")), ("Composition", json!("composition")), ("Composition - Retain Layer Sizes", json!("compositionLayerSizes"))],
-                1,
-            )],
-        ),
+        // Photoshop files: Import Kind (Footage / Composition / – Retain Layer Sizes). Dropped
+        // files start at Settings ▸ Import ▸ Default Drag Import As.
+        "file.import" if !has(p, &["importAs"]) && is_layered(p) => {
+            let kinds =
+                [("Footage", json!("footage")), ("Composition", json!("composition")), ("Composition - Retain Layer Sizes", json!("compositionLayerSizes"))];
+            let drag = p.get("drag").and_then(Value::as_bool).unwrap_or(false);
+            let sel = if drag { kinds.iter().position(|(_, v)| v.as_str() == Some(s.prefs.drag_import_as())).unwrap_or(0) } else { 1 };
+            ("Import Photoshop File".into(), vec![Field::choice("importAs", "Import Kind", &kinds, sel)])
+        }
         // PDF / Illustrator files: Import Kind and the page.
         "file.import" if !has(p, &["importAs", "page"]) && is_pdf(p) => (
             "Import PDF / Illustrator File".into(),
@@ -385,6 +384,13 @@ pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
                 ],
             )
         }
+        "view.addPercentGuide" if !has(p, &["position"]) => (
+            "Add Percentage Guide".into(),
+            vec![
+                Field::choice("orientation", "Orientation", &[("Vertical", json!("vertical")), ("Horizontal", json!("horizontal"))], 0),
+                Field::num("position", "Position (percent of the composition)", 50.0),
+            ],
+        ),
         // Several items selected: After Effects' New Composition from Selection dialog.
         "file.newCompFromSelection"
             if s.state.project_selection.len() > 1 && !has(p, &["single", "dimensionsFrom", "duration", "sequence", "addToRenderQueue"]) =>
@@ -778,84 +784,116 @@ pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
     true
 }
 
+/// The label and control rows of a form: the part of [`show_form`] that scrolls.
+fn form_grid(ui: &mut egui::Ui, f: &mut Form, regs: &mut Vec<(String, egui::Rect, String)>, browse: &mut Option<usize>, focused: &mut bool) {
+    let action = f.native_action().map(str::to_string);
+    let control_width = if action.is_some() { (ui.available_width() - 214.0).clamp(60.0, 240.0) } else { 240.0 };
+    egui::Grid::new("form-grid").num_columns(2).spacing([14.0, 10.0]).show(ui, |ui| {
+        for (i, fl) in f.fields.iter_mut().enumerate() {
+            if matches!(fl.kind, FieldKind::Note(_)) {
+                continue;
+            }
+            let enabled = action_field_enabled(action.as_deref(), &fl.key);
+            let label = egui::RichText::new(tr(&fl.label));
+            ui.label(if enabled { label } else { label.weak() });
+            let r = ui
+                .add_enabled_ui(enabled, |ui| match &mut fl.kind {
+                    FieldKind::Number { value, speed } => {
+                        let dec = if *speed < 0.01 { 5 } else { 3 };
+                        let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(value).speed(*speed).max_decimals(dec)));
+                        // The first field takes the keyboard when the form opens. (A number edits
+                        // as text once focused; the selection is clamped to what it shows.)
+                        if enabled && !std::mem::replace(focused, true) {
+                            crate::widgets::focus_on_open(ui.ctx(), &r, &" ".repeat(64));
+                        }
+                        r.rect
+                    }
+                    FieldKind::Text(s) => {
+                        let r = ui.add(egui::TextEdit::singleline(s).desired_width(control_width));
+                        if enabled && !std::mem::replace(focused, true) {
+                            crate::widgets::focus_on_open(ui.ctx(), &r, s);
+                        }
+                        r.rect
+                    }
+                    FieldKind::Path { value, .. } => {
+                        ui.horizontal(|ui| {
+                            let r = ui.add(egui::TextEdit::singleline(value).desired_width(150.0)).rect;
+                            let b = ui.button(tr("Browse…"));
+                            regs.push((format!("form.field.{}.browse", fl.key), b.rect, "Browse…".into()));
+                            if b.clicked() {
+                                *browse = Some(i);
+                            }
+                            r
+                        })
+                        .inner
+                    }
+                    FieldKind::SavePath(value) => {
+                        ui.horizontal(|ui| {
+                            let r = ui.add(egui::TextEdit::singleline(value).desired_width(150.0)).rect;
+                            let b = ui.button(tr("Browse…"));
+                            regs.push((format!("form.field.{}.browse", fl.key), b.rect, "Browse…".into()));
+                            if b.clicked() {
+                                *browse = Some(i);
+                            }
+                            r
+                        })
+                        .inner
+                    }
+                    // A fixed width: in the grid's value column a wrapping label would otherwise
+                    // shrink to a word per line.
+                    FieldKind::Note(text) => {
+                        ui.scope(|ui| {
+                            ui.set_width(220.0);
+                            ui.add(egui::Label::new(egui::RichText::new(tr(text.as_str())).small()).wrap())
+                        })
+                        .inner
+                        .rect
+                    }
+                    FieldKind::Bool(b) => ui.checkbox(b, "").rect,
+                    FieldKind::Choice { options, sel } => {
+                        let cur = options.get(*sel).map(|o| o.0.clone()).unwrap_or_default();
+                        // The column keeps its width: a long choice (a GPU adapter's name) ends in an
+                        // ellipsis instead of widening the form past the dialog (#978).
+                        egui::ComboBox::from_id_salt(("form", fl.key.as_str()))
+                            .selected_text(tr(&cur))
+                            .width(control_width)
+                            .truncate()
+                            .show_ui(ui, |ui| {
+                                for (i, (l, _)) in options.iter().enumerate() {
+                                    ui.selectable_value(sel, i, tr(l));
+                                }
+                            })
+                            .response
+                            .rect
+                    }
+                })
+                .inner;
+            regs.push((format!("form.field.{}", fl.key), r, fl.label.clone()));
+            ui.end_row();
+        }
+    });
+    for field in &f.fields {
+        if let FieldKind::Note(text) = &field.kind {
+            ui.add_space(10.0);
+            let response = ui.add(egui::Label::new(egui::RichText::new(tr(text.as_str())).small()).wrap());
+            regs.push((format!("form.field.{}", field.key), response.rect, field.label.clone()));
+        }
+    }
+}
+
 pub fn show_form(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let mut f = app.dialog_state.form.clone();
     let (mut ok, mut close) = (false, false);
     let h = 160.0 + f.fields.len() as f32 * 34.0;
     let mut regs: Vec<(String, egui::Rect, String)> = vec![];
     let mut browse: Option<usize> = None;
-    let action = f.native_action().map(str::to_string);
-    let bounds = super::dialogs::modal_no_scroll(ctx, &f.title.clone(), vec2(600.0, h), t, |ui| {
-        let field_height = (h.min((ctx.content_rect().height() - 48.0).max(80.0)) - 120.0).max(40.0);
-        let control_width = (ui.available_width() - 214.0).clamp(60.0, 240.0);
-        egui::ScrollArea::vertical().id_salt("form-fields").max_height(field_height).auto_shrink([false, true]).show(ui, |ui| {
-            egui::Grid::new("form-grid").num_columns(2).spacing([14.0, 10.0]).show(ui, |ui| {
-                for (i, fl) in f.fields.iter_mut().enumerate() {
-                    if matches!(fl.kind, FieldKind::Note(_)) {
-                        continue;
-                    }
-                    let enabled = action_field_enabled(action.as_deref(), &fl.key);
-                    let label = egui::RichText::new(&fl.label);
-                    ui.label(if enabled { label } else { label.weak() });
-                    let r = ui
-                        .add_enabled_ui(enabled, |ui| match &mut fl.kind {
-                            FieldKind::Number { value, speed } => {
-                                let dec = if *speed < 0.01 { 5 } else { 3 };
-                                ui.add(egui::DragValue::new(value).speed(*speed).max_decimals(dec)).rect
-                            }
-                            FieldKind::Text(s) => ui.add(egui::TextEdit::singleline(s).desired_width(control_width)).rect,
-                            FieldKind::Path { value, .. } => {
-                                ui.horizontal(|ui| {
-                                    let r = ui.add(egui::TextEdit::singleline(value).desired_width(150.0)).rect;
-                                    let b = ui.button(tr("Browse…"));
-                                    regs.push((format!("form.field.{}.browse", fl.key), b.rect, "Browse…".into()));
-                                    if b.clicked() {
-                                        browse = Some(i);
-                                    }
-                                    r
-                                })
-                                .inner
-                            }
-                            FieldKind::SavePath(value) => {
-                                ui.horizontal(|ui| {
-                                    let r = ui.add(egui::TextEdit::singleline(value).desired_width(150.0)).rect;
-                                    let b = ui.button(tr("Browse…"));
-                                    regs.push((format!("form.field.{}.browse", fl.key), b.rect, "Browse…".into()));
-                                    if b.clicked() {
-                                        browse = Some(i);
-                                    }
-                                    r
-                                })
-                                .inner
-                            }
-                            FieldKind::Note(text) => ui.add(egui::Label::new(egui::RichText::new(text.as_str()).small()).wrap()).rect,
-                            FieldKind::Bool(b) => ui.checkbox(b, "").rect,
-                            FieldKind::Choice { options, sel } => {
-                                let cur = options.get(*sel).map(|o| o.0.clone()).unwrap_or_default();
-                                egui::ComboBox::from_id_salt(("form", fl.key.as_str()))
-                                    .selected_text(cur)
-                                    .width(control_width)
-                                    .show_ui(ui, |ui| {
-                                        for (i, (l, _)) in options.iter().enumerate() {
-                                            ui.selectable_value(sel, i, l);
-                                        }
-                                    })
-                                    .response
-                                    .rect
-                            }
-                        })
-                        .inner;
-                    regs.push((format!("form.field.{}", fl.key), r, fl.label.clone()));
-                    ui.end_row();
-                }
-            });
-            for fl in &f.fields {
-                if let FieldKind::Note(text) = &fl.kind {
-                    ui.add_space(10.0);
-                    let r = ui.add(egui::Label::new(egui::RichText::new(text).small()).wrap());
-                    regs.push((format!("form.field.{}", fl.key), r.rect, fl.label.clone()));
-                }
-            }
+    let mut focused = false;
+    let width = if f.native_action().is_some() { 600.0 } else { 480.0 };
+    let bounds = super::dialogs::modal_fit_rect(ctx, &f.title.clone(), vec2(width, h), t, |ui, height| {
+        let footer = 14.0 + ui.spacing().interact_size.y + 2.0 * ui.spacing().item_spacing.y;
+        let max_height = (height - footer).max(40.0);
+        egui::ScrollArea::vertical().id_salt("form-fields").max_height(max_height).auto_shrink([false, true]).show(ui, |ui| {
+            form_grid(ui, &mut f, &mut regs, &mut browse, &mut focused);
         });
         ui.add_space(14.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -919,8 +957,10 @@ pub(crate) fn close_info(app: &mut EffectcraftApp) {
 
 pub fn show_info(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let (title, body) = app.dialog_state.info.clone();
-    let mut close = false;
-    super::dialogs::modal(ctx, &title, vec2(440.0, 160.0), t, |ui| {
+    // Enter presses OK, the default (and only) button.
+    let mut close = !ctx.egui_wants_keyboard_input() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+    // The text wraps within this small dialog; avoid a horizontal scrollbar changing its height.
+    super::dialogs::modal_vertical(ctx, &title, vec2(440.0, 160.0), t, |ui| {
         ui.label(tr(&body));
         ui.add_space(16.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -974,6 +1014,37 @@ mod tests {
             ],
         };
         assert_eq!(f.params(), json!({"prop": "position", "value": [10.0, 20.0], "mode": "b"}));
+    }
+
+    /// A numeric form (Layer ▸ Transform ▸ Position…) opens with its first number being edited
+    /// and selected: typing replaces it, and one Enter confirms.
+    #[test]
+    fn a_numeric_form_opens_with_its_first_number_selected() {
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx, &app.tokens, crate::i18n::language(&app));
+        app.dialog_state.form = Form {
+            title: "Position".into(),
+            command: "layer.setTransform".into(),
+            base: json!({"prop": "position"}),
+            fields: vec![Field::num("value[0]", "X", 960.0), Field::num("value[1]", "Y", 540.0)],
+        };
+        app.dialog = Some(Dialog::Form);
+        let frame = |app: &mut EffectcraftApp, events: Vec<egui::Event>| {
+            let raw = egui::RawInput { events, ..Default::default() };
+            ctx.run_ui(raw, |ui| {
+                app.auto.begin_frame();
+                crate::panels::dialogs::show(app, ui.ctx());
+            })
+            .textures_delta
+            .clear();
+        };
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![egui::Event::Text("42".into())]);
+        assert_eq!(app.dialog_state.form.params()["value"], json!([42.0, 540.0]));
+        frame(&mut app, vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }]);
+        assert!(app.dialog.is_none(), "one Enter confirms");
     }
 
     /// File ▸ Export ▸ Adobe Premiere Pro Project… opens a form that says it writes Final Cut Pro

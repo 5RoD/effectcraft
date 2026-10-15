@@ -8,6 +8,7 @@
 
 use effectcraft_project::{AlphaMode, Footage};
 use effectcraft_raster::{Image, Px};
+use effectcraft_render::FloatCurve;
 use filmcraft_color::{Matrix, Range};
 use filmcraft_frame::{Chroma, PixelData, VideoFrame};
 use rayon::prelude::*;
@@ -73,24 +74,33 @@ pub(crate) fn validate_frame(f: &VideoFrame) -> Result<usize> {
 pub(crate) struct AlphaOp {
     mode: AlphaMode,
     matte: [f32; 3],
-    /// Interpret Footage ▸ Preserve RGB: float values stay as the file stores them (not
-    /// sRGB-encoded).
-    preserve_rgb: bool,
+    /// How float values (linear light) are encoded: sRGB by default, a pure 2.4 power curve
+    /// (Working Gamma 2.4), or not at all (Preserve RGB, Interpret As Linear Light).
+    float: FloatCurve,
 }
 
 impl AlphaOp {
     pub(crate) fn new(mode: AlphaMode, matte: [f32; 3]) -> Self {
-        Self { mode, matte, preserve_rgb: false }
+        Self { mode, matte, float: FloatCurve::Srgb }
     }
-    /// The interpretation of footage `f`.
-    pub(crate) fn of(f: &Footage) -> Self {
-        Self { preserve_rgb: f.preserve_rgb, ..Self::new(f.alpha, f.premul_color) }
+    /// The interpretation of footage `f`, float values handed over as `float` says (as stored
+    /// under Preserve RGB, whatever it says).
+    pub(crate) fn of(f: &Footage, float: FloatCurve) -> Self {
+        let float = if f.preserve_rgb { FloatCurve::Linear } else { float };
+        Self { float, ..Self::new(f.alpha, f.premul_color) }
     }
-    /// A linear float value as the compositor takes it: sRGB-encoded, or the file's own value
-    /// under Preserve RGB.
+    /// How float values are encoded.
+    pub(crate) fn float_curve(self) -> FloatCurve {
+        self.float
+    }
+    /// A linear float value as the compositor takes it.
     #[inline(always)]
     fn float(self, v: f32) -> f32 {
-        if self.preserve_rgb { v } else { encode(v) }
+        match self.float {
+            FloatCurve::Srgb => encode(v),
+            FloatCurve::Gamma24 => v.abs().powf(1.0 / 2.4).copysign(v),
+            FloatCurve::Linear => v,
+        }
     }
     /// `c` is the file's colour (straight or premultiplied as the mode says), `a` its alpha.
     #[inline(always)]
@@ -540,7 +550,7 @@ mod tests {
     fn hostile_frame_dimensions_and_non_finite_float_pixels_are_bounded_errors() {
         let op = AlphaOp::new(AlphaMode::Straight, [0.0; 3]);
         let mut f = yuv_frame(126, 128, 128, filmcraft_color::ColorInfo::REC709);
-        for (width, height) in [(u32::MAX, u32::MAX), (16_385, 1), (8192, 8192), (0, 1)] {
+        for (width, height) in [(u32::MAX, u32::MAX), (effectcraft_render::raster_bounds::MAX_DIMENSION + 1, 1), (8192, 8192), (0, 1)] {
             f.width = width;
             f.height = height;
             assert!(frame_to_image_in(&f, op, Vec::new()).is_err());

@@ -4,7 +4,7 @@
 use super::viewer::{ViewerMap, project_segment};
 use crate::{
     EffectcraftApp,
-    state::{GizmoMode, GizmoSpace, Tool},
+    state::{GizmoMode, GizmoSpace, RotationTarget, Tool},
 };
 use effectcraft_engine::geom::{Mat4, Vec3, vec3};
 use effectcraft_engine::project::{AutoOrient, LayerId};
@@ -17,6 +17,17 @@ use std::collections::BTreeSet;
 const RING_STEPS: usize = 48;
 const MAX_LAYERS: usize = 4096;
 const EPS: f64 = 1e-9;
+
+pub(crate) fn mode(app: &EffectcraftApp) -> Option<GizmoMode> {
+    match app.ui.tool {
+        Tool::Selection => Some(app.ui.viewer.gizmo),
+        Tool::Rotate => Some(GizmoMode::Rotation),
+        _ => None,
+    }
+}
+fn target(app: &EffectcraftApp) -> RotationTarget {
+    if app.ui.tool == Tool::Rotate { app.ui.viewer.rotation_target } else { RotationTarget::Orientation }
+}
 
 fn finite(v: Vec3) -> bool {
     [v.x, v.y, v.z].iter().all(|v| v.is_finite() && v.abs() <= 1e12)
@@ -96,6 +107,7 @@ struct Pose {
     scale: [f64; 3],
     orientation: [f64; 3],
     rotations: [f64; 3],
+    rotation_reference: [f64; 3],
     rotation: Mat4,
     auto: bool,
 }
@@ -260,7 +272,18 @@ impl Geometry {
             }
             let rotation =
                 Mat4::orientation(Vec3::from(orientation)) * Mat4::rotate_z(rotations[2]) * Mat4::rotate_y(rotations[1]) * Mat4::rotate_x(rotations[0]);
-            poses.push(Pose { id: *id, anchor, parent, inv, scale, orientation, rotations, rotation, auto: l.auto_orient != AutoOrient::Off });
+            poses.push(Pose {
+                id: *id,
+                anchor,
+                parent,
+                inv,
+                scale,
+                orientation,
+                rotations,
+                rotation_reference: rotations,
+                rotation,
+                auto: l.auto_orient != AutoOrient::Off,
+            });
         }
         Ok(poses)
     }
@@ -304,9 +327,21 @@ impl Geometry {
             last_value: None,
             comp: ctx.comp_id,
             time: ctx.time,
-            mode: None,
+            context: None,
             selection: Vec::new(),
         })
+    }
+    pub(crate) fn begin_free(&self, ctx: &EvalCtx, press: Pos2) -> Result<Drag, String> {
+        let mut geometry = self.clone();
+        geometry.basis = [
+            unit(self.camera.right()).ok_or("Invalid camera right axis")?,
+            unit(self.camera.down()).ok_or("Invalid camera down axis")?,
+            unit(self.camera.forward()).ok_or("Invalid camera forward axis")?,
+        ];
+        geometry.begin(ctx, Hit { kind: Kind::Rotation, axis: 2, from: press, to: press, angle: 0. }, press)
+    }
+    pub(crate) fn begin_axis(&self, ctx: &EvalCtx, axis: usize, press: Pos2) -> Result<Drag, String> {
+        self.begin(ctx, Hit { kind: Kind::Rotation, axis, from: press, to: press, angle: 0. }, press)
     }
     fn plane_angle(&self, screen: Pos2, normal: Vec3, u: Vec3, v: Vec3) -> Option<f64> {
         let p = self.map.to_comp(screen);
@@ -350,7 +385,7 @@ pub(crate) struct Drag {
     last_value: Option<(f64, bool)>,
     comp: effectcraft_engine::project::ItemId,
     time: Tick,
-    mode: Option<GizmoMode>,
+    context: Option<(Tool, GizmoMode, RotationTarget)>,
     selection: Vec<LayerId>,
 }
 
@@ -396,6 +431,7 @@ fn orientation(matrix: Mat4, reference: [f64; 3]) -> Result<[f64; 3], String> {
 impl Drag {
     pub(crate) fn apply(&mut self, app: &mut EffectcraftApp, current: Option<&Geometry>, pos: Pos2, mods: egui::Modifiers, merge: &str) -> Result<(), String> {
         let original = &self.geometry;
+        let context = mode(app).map(|mode| (app.ui.tool, mode, target(app)));
         let same_view = current.is_some_and(|current| {
             current.ids == original.ids
                 && current.map.origin == original.map.origin
@@ -408,15 +444,15 @@ impl Drag {
         });
         if app.session.state.active_comp != Some(self.comp)
             || app.session.time() != self.time
-            || app.ui.tool != Tool::Selection
+            || context.is_none()
             || app.ui.viewer.gizmo_space != self.geometry.space
-            || self.mode.is_some_and(|mode| app.ui.viewer.gizmo != mode)
-            || (self.mode.is_some() && app.session.state.selected_layers != self.selection)
+            || self.context.is_some_and(|previous| Some(previous) != context)
+            || (self.context.is_some() && app.session.state.selected_layers != self.selection)
             || !same_view
         {
             return Err("3D gesture ended because its composition, time, tool, selection, view or axis space changed".into());
         }
-        self.mode = Some(app.ui.viewer.gizmo);
+        self.context = context;
         if self.selection.is_empty() {
             self.selection = app.session.state.selected_layers.clone();
         }
@@ -436,7 +472,7 @@ impl Drag {
                 if mods.command {
                     degrees
                 } else {
-                    let step = if mods.shift { 5. } else { 1. };
+                    let step = if mods.shift { if app.ui.tool == Tool::Rotate { 15. } else { 5. } } else { 1. };
                     (degrees / step).round() * step
                 }
             }
@@ -450,7 +486,7 @@ impl Drag {
         }
         let rotation = rotate(self.direction, value);
         let mut changes = Vec::with_capacity(self.poses.len());
-        for pose in &self.poses {
+        for pose in &mut self.poses {
             let mut change = json!({"layer":pose.id.0});
             let anchor = match self.hit.kind {
                 Kind::Position => pose.anchor + self.direction * value,
@@ -476,8 +512,15 @@ impl Drag {
                 }
                 Kind::Rotation => {
                     let local = pose.inv * rotation * pose.parent * pose.rotation;
-                    let authored = Mat4::rotate_z(pose.rotations[2]) * Mat4::rotate_y(pose.rotations[1]) * Mat4::rotate_x(pose.rotations[0]);
-                    change["orientation"] = json!(orientation(local * authored.transpose(), pose.orientation)?);
+                    if target(app) == RotationTarget::Rotation {
+                        let authored_orientation = Mat4::orientation(Vec3::from(pose.orientation));
+                        let angles = orientation(authored_orientation.transpose() * local, pose.rotation_reference)?;
+                        pose.rotation_reference = angles;
+                        change["rotation"] = json!(angles);
+                    } else {
+                        let authored = Mat4::rotate_z(pose.rotations[2]) * Mat4::rotate_y(pose.rotations[1]) * Mat4::rotate_x(pose.rotations[0]);
+                        change["orientation"] = json!(orientation(local * authored.transpose(), pose.orientation)?);
+                    }
                 }
             }
             changes.push(change);
@@ -514,22 +557,41 @@ fn space_choices(app: &mut EffectcraftApp, ui: &mut egui::Ui) -> Option<&'static
     selected
 }
 
+fn target_choices(app: &mut EffectcraftApp, ui: &mut egui::Ui) -> Option<&'static str> {
+    let mut selected = None;
+    for (target, id) in [(RotationTarget::Orientation, "orientation"), (RotationTarget::Rotation, "rotation")] {
+        let response = ui.selectable_label(app.ui.viewer.rotation_target == target, format!("{target:?}"));
+        app.auto.add_response(&format!("tools.rotation.{id}"), &response, &format!("Set {target:?}"));
+        if response.clicked() {
+            selected = Some(id);
+            ui.close();
+        }
+    }
+    selected
+}
+
 pub(crate) fn toolbar(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) -> bool {
-    if app.ui.tool != Tool::Selection
+    if mode(app).is_none()
         || !app.session.active_comp().is_some_and(|c| app.session.state.selected_layers.iter().any(|id| c.layer(*id).is_some_and(|l| l.is_3d())))
     {
         return false;
     }
     let mut selected = None;
     let mut space = None;
+    let mut rotation_target = None;
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
         if rect.width() < 100. {
             let response = egui::ComboBox::from_id_salt("gizmo-compact")
                 .selected_text("3D")
                 .width(44.)
                 .show_ui(ui, |ui| {
-                    ui.label("Transform gizmo");
-                    selected = mode_choices(app, ui);
+                    if app.ui.tool == Tool::Rotate {
+                        ui.label("Set");
+                        rotation_target = target_choices(app, ui);
+                    } else {
+                        ui.label("Transform gizmo");
+                        selected = mode_choices(app, ui);
+                    }
                     ui.separator();
                     ui.label("Axis space");
                     space = space_choices(app, ui);
@@ -540,11 +602,20 @@ pub(crate) fn toolbar(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) -
             return;
         }
         ui.horizontal(|ui| {
-            let mode = app.ui.viewer.gizmo;
-            let response = egui::ComboBox::from_id_salt("gizmo-mode").selected_text(format!("{mode:?}")).width(92.).show_ui(ui, |ui| mode_choices(app, ui));
-            selected = response.inner.flatten();
-            app.auto.add_response("tools.gizmo.mode", &response.response, "3D transform gizmo");
-            response.response.on_hover_text("3D transform gizmo (4/5/6; V for Universal)");
+            if app.ui.tool == Tool::Rotate {
+                let response = egui::ComboBox::from_id_salt("rotation-target")
+                    .selected_text(format!("Set: {:?}", app.ui.viewer.rotation_target))
+                    .width(116.)
+                    .show_ui(ui, |ui| target_choices(app, ui));
+                rotation_target = response.inner.flatten();
+                app.auto.add_response("tools.rotation.target", &response.response, "Set Orientation or Rotation");
+            } else {
+                let mode = app.ui.viewer.gizmo;
+                let response = egui::ComboBox::from_id_salt("gizmo-mode").selected_text(format!("{mode:?}")).width(92.).show_ui(ui, |ui| mode_choices(app, ui));
+                selected = response.inner.flatten();
+                app.auto.add_response("tools.gizmo.mode", &response.response, "3D transform gizmo");
+                response.response.on_hover_text("3D transform gizmo (4/5/6; V for Universal)");
+            }
             let current = app.ui.viewer.gizmo_space;
             let response =
                 egui::ComboBox::from_id_salt("gizmo-space").selected_text(format!("{current:?}")).width(70.).show_ui(ui, |ui| space_choices(app, ui));
@@ -559,6 +630,11 @@ pub(crate) fn toolbar(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) -
     }
     if let Some(space) = space
         && let Err(error) = crate::menus::invoke(app, ui.ctx(), "view.gizmo.space", json!({"space":space}))
+    {
+        app.ui.status = error;
+    }
+    if let Some(target) = rotation_target
+        && let Err(error) = crate::menus::invoke(app, ui.ctx(), "view.gizmo.rotationTarget", json!({"target":target}))
     {
         app.ui.status = error;
     }

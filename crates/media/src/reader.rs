@@ -2,9 +2,12 @@
 //! Containers retain a file handle and their index, never the complete compressed file.
 
 use std::fs::File;
+#[cfg(not(any(unix, windows)))]
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(not(any(unix, windows)))]
+use std::sync::Mutex;
 
 use filmcraft_media::{ByteReader, SharedReader, SharedSource};
 
@@ -16,6 +19,9 @@ const MAX_BUFFERED_BYTES: u64 = 512 << 20;
 const MAX_READ_BYTES: usize = 64 << 20;
 
 struct FileReader {
+    #[cfg(any(unix, windows))]
+    file: File,
+    #[cfg(not(any(unix, windows)))]
     file: Mutex<File>,
     path: PathBuf,
     len: u64,
@@ -32,10 +38,20 @@ impl FileReader {
         if !metadata.is_file() {
             return Err(MediaError::Unsupported(format!("{}: media input must be a regular file", path.display())));
         }
-        Ok(Self { file: Mutex::new(file), path: path.to_path_buf(), len: metadata.len() })
+        Ok(Self {
+            #[cfg(any(unix, windows))]
+            file,
+            #[cfg(not(any(unix, windows)))]
+            file: Mutex::new(file),
+            path: path.to_path_buf(),
+            len: metadata.len(),
+        })
     }
 
     fn check_length(&self) -> Result<()> {
+        #[cfg(any(unix, windows))]
+        let file = &self.file;
+        #[cfg(not(any(unix, windows)))]
         let file = self.file.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let len = file.metadata().map_err(|e| MediaError::Io(format!("{}: {e}", self.path.display())))?.len();
         if len != self.len {
@@ -62,9 +78,33 @@ impl ByteReader for FileReader {
         if buf.len() > MAX_READ_BYTES {
             return Err(bad(std::io::ErrorKind::InvalidInput, "one media read exceeds the 64 MiB input limit"));
         }
-        let mut file = self.file.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        file.seek(SeekFrom::Start(offset)).map_err(|e| bad(e.kind(), &e.to_string()))?;
-        file.read_exact(buf).map_err(|e| bad(e.kind(), &e.to_string()))
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::FileExt::read_exact_at(&self.file, buf, offset).map_err(|e| bad(e.kind(), &e.to_string()))
+        }
+        #[cfg(windows)]
+        {
+            let (mut done, mut at) = (0usize, offset);
+            while done < buf.len() {
+                let rest = buf.get_mut(done..).ok_or_else(|| bad(std::io::ErrorKind::InvalidInput, "invalid read buffer offset"))?;
+                match std::os::windows::fs::FileExt::seek_read(&self.file, rest, at) {
+                    Ok(0) => return Err(bad(std::io::ErrorKind::UnexpectedEof, "unexpected end of media file")),
+                    Ok(n) => {
+                        done = done.checked_add(n).ok_or_else(|| bad(std::io::ErrorKind::InvalidInput, "read count overflow"))?;
+                        at = at.checked_add(n as u64).ok_or_else(|| bad(std::io::ErrorKind::InvalidInput, "read position overflow"))?;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(bad(e.kind(), &e.to_string())),
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let mut file = self.file.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            file.seek(SeekFrom::Start(offset)).map_err(|e| bad(e.kind(), &e.to_string()))?;
+            file.read_exact(buf).map_err(|e| bad(e.kind(), &e.to_string()))
+        }
     }
 }
 
@@ -117,7 +157,7 @@ pub(crate) fn read_bounded(path: &Path) -> Result<Vec<u8>> {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[allow(clippy::unwrap_used, clippy::panic)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::Cursor;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -143,7 +183,7 @@ mod tests {
         }
     }
 
-    fn movie() -> Vec<u8> {
+    pub(crate) fn movie() -> Vec<u8> {
         let mut config = filmcraft_h264enc::EncoderConfig::new(16, 16, 120, 1);
         config.format = filmcraft_h264enc::PacketFormat::LengthPrefixed;
         config.aud = false;
@@ -272,6 +312,26 @@ mod tests {
         assert!(reader.read_at(3, &mut bytes).is_err());
         assert!(reader.check_length().unwrap_err().to_string().contains("file size changed"));
         assert!(FileReader::open(file.0.parent().unwrap()).is_err());
+    }
+
+    #[test]
+    fn positional_reads_keep_independent_offsets_under_contention() {
+        let bytes: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
+        let file = TempFile::new("bin", &bytes);
+        let reader = FileReader::open(&file.0).unwrap();
+        std::thread::scope(|scope| {
+            for lane in 0..8usize {
+                let (reader, bytes) = (&reader, &bytes);
+                scope.spawn(move || {
+                    for round in 0..128usize {
+                        let offset = (lane * 907 + round * 31) % (bytes.len() - 97);
+                        let mut read = [0; 97];
+                        reader.read_at(offset as u64, &mut read).unwrap();
+                        assert_eq!(read, bytes[offset..offset + read.len()]);
+                    }
+                });
+            }
+        });
     }
 
     #[test]

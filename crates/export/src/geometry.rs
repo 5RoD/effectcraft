@@ -92,11 +92,16 @@ mod tests {
         output.resize = Resize { enabled: true, width: 8, height: 8, lock_aspect: false, ..Default::default() };
         assert!(Geometry::new(64, 48, 1.0, &output).is_err());
         output.crop = Crop::default();
-        for (width, height) in [(30_000, 30_000), (8192, 8192), (u32::MAX, 1)] {
+        for (width, height) in [(30_000, 30_000), (8192, 8192)] {
             output.resize.width = width;
             output.resize.height = height;
             assert!(Geometry::new(64, 48, 1.0, &output).is_err());
         }
+        // The project size query clamps oversized dimensions before allocation; a narrow
+        // strip remains within the CPU raster budget after that repair.
+        output.resize.width = u32::MAX;
+        output.resize.height = 1;
+        assert_eq!(Geometry::new(64, 48, 1.0, &output).unwrap().resized, [30_000, 1]);
         for roi in [[-f64::MAX, 0.0, 1.0, 1.0], [0.0, f64::NAN, 1.0, 1.0], [0.0, 0.0, f64::INFINITY, 1.0], [0.0, 0.0, -1.0, 1.0]] {
             output.crop = Crop { enabled: true, use_roi: true, roi: Some(roi), ..Default::default() };
             assert!(Geometry::new(64, 48, 1.0, &output).is_err());

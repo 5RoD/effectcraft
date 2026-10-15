@@ -4,6 +4,7 @@
 //! |---|---|---|---|---|
 //! | H.264 | MP4 | FilmCraft H.264 High, or opt-in Windows system encoding; 8-bit 4:2:0 BT.709 limited | no | AAC-LC (FilmCraft or Windows), mono/stereo |
 //! | ProRes | QuickTime MOV | FilmCraft ProRes 422 Proxy/LT/422/HQ, 10-bit; 4444/4444 XQ 4:4:4 | 4444 (16-bit alpha coding) | PCM 16/24-bit or 32-bit float, mono/stereo |
+//! | Uncompressed | QuickTime MOV (`raw `) | 8-bit RGB (depth 24, rows padded to even bytes) or ARGB (depth 32) | RGB + Alpha (straight or premultiplied) | PCM 16/24-bit or 32-bit float, mono/stereo |
 //! | PNG / JPEG / TIFF sequence | one file per frame | 8-bit | PNG, TIFF | — |
 //! | OpenEXR sequence | one file per frame | 32-bit float, linear light, premultiplied | yes | — |
 //! | Animated GIF | GIF89a | 256-colour palette per frame (NeuQuant) | 1-bit | — |
@@ -39,6 +40,7 @@ mod hevc_av1;
 mod native_windows;
 mod out;
 mod pipeline;
+mod uncompressed;
 mod webm;
 mod webm_av1;
 
@@ -209,7 +211,9 @@ async fn export_with(cx: &Cx<'_>, progress: &mut dyn FnMut(&Progress) -> bool, t
     let mut st = State { t0, total, done: 0, progress };
     st.advance(0)?;
     let mut report = match cx.output.format {
-        OutputFormat::H264 | OutputFormat::Hevc | OutputFormat::Av1 | OutputFormat::ProRes => encode::movie(cx, comp, w, h, &mut st).await?,
+        OutputFormat::H264 | OutputFormat::Hevc | OutputFormat::Av1 | OutputFormat::ProRes | OutputFormat::Uncompressed => {
+            encode::movie(cx, comp, w, h, &mut st).await?
+        }
         OutputFormat::Gif => gif_export(cx, comp, w, h, &mut st).await?,
         OutputFormat::WebM => webm::webm(cx, comp, w, h, &mut st).await?,
         OutputFormat::Wav => webm::audio_file(cx, comp, false, &mut st)?,

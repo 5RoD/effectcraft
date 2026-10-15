@@ -106,6 +106,37 @@ fn saved_history_shares_unchanged_compositions() {
 }
 
 #[test]
+fn saved_composition_tabs_and_branching_history_survive_the_same_file() {
+    let mut session = Session::default();
+    session.execute("comp.new", json!({"name":"First", "width":16, "height":16})).unwrap();
+    let first = session.active_comp_id().unwrap();
+    session.execute("comp.new", json!({"name":"Second", "width":16, "height":16})).unwrap();
+    let second = session.active_comp_id().unwrap();
+    solid(&mut session, "Original future");
+    session.undo();
+    solid(&mut session, "Alternative future");
+    session.state.open_comps = vec![second, first];
+    session.state.active_comp = Some(first);
+    let view = session.saved_view();
+    let tree = session.history_tree();
+    for compact in [false, true] {
+        let text = crate::history_file::encode_with_view(&session.project, &session.history, compact, &view).unwrap();
+        assert_eq!(effectcraft_project::saved_view(&text), view);
+        let project = Arc::new(Project::from_json(&text).unwrap());
+        let history = crate::history_file::decode(&text, &project).unwrap().unwrap();
+        let mut reopened = Session { project, history, ..Default::default() };
+        reopened.restore_view(&effectcraft_project::saved_view(&text));
+        assert_eq!(reopened.saved_view(), view);
+        let restored = reopened.history_tree();
+        assert_eq!(tree.len(), restored.len());
+        for (before, after) in tree.iter().zip(restored) {
+            assert_eq!((&before.label, before.parent, before.current, before.future), (&after.label, after.parent, after.current, after.future));
+        }
+        assert!(!reopened.history.branches.is_empty());
+    }
+}
+
+#[test]
 fn damaged_history_does_not_damage_the_current_project() {
     use std::sync::Arc;
     let mut s = Session::default();

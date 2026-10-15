@@ -3,7 +3,7 @@ use effectcraft_color::Label;
 use effectcraft_project::{Comp, ItemId, ItemKind, LayerId, LayerSource, Project, Solid, build};
 use effectcraft_time::{FrameRate, Tick};
 
-use crate::{FrameDiagnostics, Image, LayerCache, NoFootage, RenderOpts, Renderer};
+use crate::{FrameDiagnostics, Image, LayerCache, NoFootage, RenderOpts, Renderer, raster_bounds};
 
 fn scene() -> (Project, ItemId, LayerId, ItemId) {
     let mut project = Project::default();
@@ -127,7 +127,7 @@ fn checked_raster_nested_and_collapsed_sources_keep_the_failing_comp_context() {
     }
     // Preserve Resolution validates the actual nested scale, even if the outer scale fits.
     let (mut project, inner, _, _) = scene();
-    project.comp_mut(inner).unwrap().width = 20_000;
+    project.comp_mut(inner).unwrap().width = raster_bounds::MAX_DIMENSION + 1;
     project.comp_mut(inner).unwrap().preserve_resolution = true;
     let outer = Comp::new(24, 16, FrameRate::FPS_30, Tick::from_seconds_f64(1.0));
     let cid = project.add_item("Outer", Label::Sandstone, None, ItemKind::Comp(outer.clone().into()));

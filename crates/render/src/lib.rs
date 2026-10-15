@@ -27,6 +27,7 @@ pub mod three_d;
 pub mod video;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use auto::{AutoKey, AutoPick};
 pub use cache::{CacheStats, LayerCache, LayerStore, PrefetchStore};
@@ -40,6 +41,21 @@ use effectcraft_time::{FrameRate, TICKS_PER_SECOND, Tick};
 pub use eval::{EvalCtx, ExprHost, effect_bounds, source_size};
 use rayon::prelude::*;
 
+/// How a [`FootageSource`] hands over float footage (OpenEXR, float TIFF), whose values are
+/// linear light: encoded with a curve, as the compositor takes footage, or as stored. Other
+/// footage is decoded the same way whatever it says. Interpret Footage ▸ Preserve RGB always
+/// reads the values as stored.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum FloatCurve {
+    /// The sRGB curve (managed projects, and Working Gamma 2.2).
+    #[default]
+    Srgb,
+    /// A pure 2.4 power curve (no working space, Working Gamma 2.4).
+    Gamma24,
+    /// The linear values as stored (Interpret As Linear Light encodes them afterwards).
+    Linear,
+}
+
 /// Supplies decoded footage frames (implemented by the media layer).
 pub trait FootageSource: Send + Sync {
     /// Optional compact opaque video source. `Ok(None)` uses the ordinary image path;
@@ -52,7 +68,7 @@ pub trait FootageSource: Send + Sync {
     /// Checked media boundary: unavailable footage is `Ok(None)`, a failed decode is `Err`.
     /// Sources without a fallible decoder retain their existing frame implementation.
     fn frame_checked(&self, item: ItemId, footage: &Footage, t: Tick) -> Result<Option<Arc<Image>>, String> {
-        Ok(self.frame(item, footage, t))
+        Ok(self.frame_with(item, footage, t, None, FloatCurve::Srgb))
     }
     /// [`FootageSource::frame`] for a render that shows it at `width` × `height`, at most half its
     /// size: either that frame or, when the source can make it more cheaply than the whole frame
@@ -62,7 +78,29 @@ pub trait FootageSource: Send + Sync {
         self.frame(item, footage, t)
     }
     fn frame_at_size_checked(&self, item: ItemId, footage: &Footage, t: Tick, width: u32, height: u32) -> Result<Option<Arc<Image>>, String> {
-        Ok(self.frame_at_size(item, footage, t, width, height))
+        Ok(self.frame_with(item, footage, t, Some((width, height)), FloatCurve::Srgb))
+    }
+    /// [`FootageSource::frame`] (`size: None`) or [`FootageSource::frame_at_size`] with float
+    /// footage handed over as `float` says ([`FootageSource::frame`] uses [`FloatCurve::Srgb`]).
+    /// Sources without float footage can leave the default, which ignores `float`.
+    fn frame_with(&self, item: ItemId, footage: &Footage, t: Tick, size: Option<(u32, u32)>, float: FloatCurve) -> Option<Arc<Image>> {
+        let _ = float;
+        match size {
+            Some((w, h)) => self.frame_at_size(item, footage, t, w, h),
+            None => self.frame(item, footage, t),
+        }
+    }
+    /// Color-aware checked read. Native sources override this to decode only once; the
+    /// compatibility default retains errors reported by older checked source implementations.
+    fn frame_with_checked(&self, item: ItemId, footage: &Footage, t: Tick, size: Option<(u32, u32)>, float: FloatCurve) -> Result<Option<Arc<Image>>, String> {
+        let checked = match size {
+            Some((w, h)) => self.frame_at_size_checked(item, footage, t, w, h),
+            None => self.frame_checked(item, footage, t),
+        }?;
+        if float == FloatCurve::Srgb || checked.is_none() {
+            return Ok(checked);
+        }
+        Ok(self.frame_with(item, footage, t, size, float))
     }
     /// `frames` interleaved stereo sample frames of `item`'s audio from source time `t` at
     /// `rate` Hz (`None` when unavailable). The first sample is `t.to_units_floor(rate)`;
@@ -101,6 +139,118 @@ pub trait FootageSource: Send + Sync {
     /// `None` when the footage is not vector or cannot be read.
     fn vector_frame(&self, _item: ItemId, _footage: &Footage, _scale: f64) -> Option<Arc<Image>> {
         None
+    }
+    /// Run `f`, which reads frames from this source, as work that can be called off: once
+    /// `cancel` is set, long decodes it starts (a movie seeking back to a keyframe and decoding
+    /// forward) stop early and their frames come back `None`. Sources that can't stop a decode
+    /// just run `f`. See [`CancellableFootage`].
+    fn cancellable(&self, _cancel: &Arc<AtomicBool>, f: &mut dyn FnMut()) {
+        f()
+    }
+    /// Reads through this source have been called off: frames may have come back `None` that
+    /// exist, so what was made from them must not be kept.
+    fn called_off(&self) -> bool {
+        false
+    }
+    /// Why `footage` shows no picture although its file is there: a read of it failed because
+    /// no decoder handles its codec, profile, chroma format or bit depth, or the stream is damaged
+    /// (e.g. "H.264 (High 4:2:2) isn't supported by the built-in decoder: ..."). `None` while it
+    /// decodes, and for sources that don't track failures. Stays set until the file is forgotten.
+    fn problem(&self, _footage: &Footage) -> Option<String> {
+        None
+    }
+}
+
+/// A render's view of a [`FootageSource`] whose frame reads can be called off with `cancel`
+/// (a viewer frame nobody waits for any more, #329). Every read goes through
+/// [`FootageSource::cancellable`] on its own, so reads made for this render on another thread
+/// (a parallel loop) answer to this render's flag, and reads for other renders never do.
+pub struct CancellableFootage<'a> {
+    pub inner: &'a dyn FootageSource,
+    pub cancel: Arc<AtomicBool>,
+}
+
+impl CancellableFootage<'_> {
+    fn read_checked<R>(&self, f: impl FnOnce() -> Result<Option<R>, String>) -> Result<Option<R>, String> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let (mut f, mut out) = (Some(f), None);
+        self.inner.cancellable(&self.cancel, &mut || out = f.take().map(|f| f()));
+        out.unwrap_or_else(|| Err("The footage source did not execute its cancellable read".into()))
+    }
+
+    fn read<R>(&self, f: impl FnOnce() -> Option<R>) -> Option<R> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let (mut f, mut out) = (Some(f), None);
+        self.inner.cancellable(&self.cancel, &mut || out = f.take().and_then(|f| f()));
+        out
+    }
+}
+
+impl FootageSource for CancellableFootage<'_> {
+    fn yuv420_frame_checked(&self, item: ItemId, footage: &Footage, t: Tick) -> Result<Option<Arc<video::Yuv420Frame>>, String> {
+        self.read_checked(|| self.inner.yuv420_frame_checked(item, footage, t))
+    }
+
+    fn frame_checked(&self, item: ItemId, footage: &Footage, t: Tick) -> Result<Option<Arc<Image>>, String> {
+        self.read_checked(|| self.inner.frame_checked(item, footage, t))
+    }
+
+    fn frame_at_size_checked(&self, item: ItemId, footage: &Footage, t: Tick, width: u32, height: u32) -> Result<Option<Arc<Image>>, String> {
+        self.read_checked(|| self.inner.frame_at_size_checked(item, footage, t, width, height))
+    }
+
+    fn frame_with_checked(&self, item: ItemId, footage: &Footage, t: Tick, size: Option<(u32, u32)>, float: FloatCurve) -> Result<Option<Arc<Image>>, String> {
+        self.read_checked(|| self.inner.frame_with_checked(item, footage, t, size, float))
+    }
+
+    fn frame(&self, item: ItemId, footage: &Footage, t: Tick) -> Option<Arc<Image>> {
+        self.read(|| self.inner.frame(item, footage, t))
+    }
+    fn frame_at_size(&self, item: ItemId, footage: &Footage, t: Tick, width: u32, height: u32) -> Option<Arc<Image>> {
+        self.read(|| self.inner.frame_at_size(item, footage, t, width, height))
+    }
+    fn audio(&self, item: ItemId, footage: &Footage, t: Tick, frames: usize, rate: u32) -> Option<Vec<f32>> {
+        self.inner.audio(item, footage, t, frames, rate)
+    }
+    fn aux(&self, item: ItemId, footage: &Footage, t: Tick) -> Option<Arc<effectcraft_raster::AuxChannels>> {
+        self.inner.aux(item, footage, t)
+    }
+    fn model(&self, item: ItemId, footage: &Footage) -> Option<Arc<effectcraft_model::Model>> {
+        self.inner.model(item, footage)
+    }
+    fn set_cache_budget(&self, bytes: usize) {
+        self.inner.set_cache_budget(bytes)
+    }
+    fn purge(&self) {
+        self.inner.purge()
+    }
+    fn forget(&self, path: &str) {
+        self.inner.forget(path)
+    }
+    fn set_conform_folder(&self, folder: Option<std::path::PathBuf>) {
+        self.inner.set_conform_folder(folder)
+    }
+    fn cache_budget(&self) -> Option<usize> {
+        self.inner.cache_budget()
+    }
+    fn vector_frame(&self, item: ItemId, footage: &Footage, scale: f64) -> Option<Arc<Image>> {
+        self.inner.vector_frame(item, footage, scale)
+    }
+    fn cancellable(&self, cancel: &Arc<AtomicBool>, f: &mut dyn FnMut()) {
+        self.inner.cancellable(cancel, f)
+    }
+    fn called_off(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed) || self.inner.called_off()
+    }
+    fn problem(&self, footage: &Footage) -> Option<String> {
+        self.inner.problem(footage)
+    }
+    fn frame_with(&self, item: ItemId, footage: &Footage, t: Tick, size: Option<(u32, u32)>, float: FloatCurve) -> Option<Arc<Image>> {
+        self.read(|| self.inner.frame_with(item, footage, t, size, float))
     }
 }
 
@@ -520,6 +670,16 @@ pub trait FxTarget {
     /// A checked CPU kernel. `Ok(false)` means a deferred readback is still pending; no
     /// kernel ran and the existing frame-pass loop must retry. Actual failures return Err.
     fn cpu_checked(&mut self, f: &mut dyn FnMut(Buf) -> Result<Buf, String>) -> Result<bool, String>;
+    /// Grow the buffer to cover its whole layer rectangle (`size` layer pixels from its own
+    /// corner, the `layer_size` handed to effects), as [`effectcraft_effects::Buf::cover`].
+    /// Authored buffers (text, shapes) only span their painted content; this gives the stack
+    /// the room a sized source's buffer already has (#659).
+    fn cover(&mut self, size: [f64; 2]) {
+        self.cpu(&mut |mut buf| {
+            buf.cover(size);
+            buf
+        });
+    }
 }
 
 /// The CPU effect target (GPU chains go through [`Accelerator::effects`]: upload, readback).
@@ -746,6 +906,12 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// The layer cache to keep this render's buffers in: none once its footage reads were
+    /// called off, as they may have come back empty ([`FootageSource::called_off`], #329).
+    fn cache_to_keep(&self) -> Option<&'a LayerCache> {
+        self.cache.filter(|_| !self.footage.called_off() && self.cache_allowed())
+    }
+
     /// A layer's Quality switch, limited by the precomp layers above it when
     /// [`RenderOpts::nested_switches`] is on.
     pub fn quality(&self, layer: &Layer) -> Quality {
@@ -942,15 +1108,27 @@ impl<'a> Renderer<'a> {
         Region::Full
     }
 
-    /// Rasterisation scale of a layer's source: the output scale, or — for text layers, which are
-    /// always continuously rasterised, and Continuously Rasterize shape layers and vector footage —
-    /// the output scale times the layer's on-screen scale (quarter-octave steps, rounded up, so
-    /// vector content is drawn at its final size and stays sharp when scaled up).
+    /// Whether `layer`'s processed buffer (source → masks → effects) is cached and the same as
+    /// one frame earlier: drawing it from the layer cache (an accelerator uploads it once) beats
+    /// re-running its effects every frame.
+    pub fn layer_is_static(&self, ctx: &EvalCtx, layer: &Layer) -> bool {
+        if self.cache.is_none() {
+            return false;
+        }
+        let (scale, draft, blur) = (self.raster_scale(ctx, layer), self.opts.draft, self.mb_on(ctx, layer));
+        let prev = ctx.time - ctx.comp.frame_rate.frame_duration();
+        let now = cache::layer_key(ctx, layer, scale, draft, blur);
+        now.is_some() && now == cache::layer_key(&ctx.at(prev), layer, scale, draft, blur)
+    }
+
+    /// Rasterisation scale of a layer's source: the output scale, or — for text and shape layers,
+    /// which are always continuously rasterised (#390, #751), and Continuously Rasterize vector
+    /// footage — the output scale times the layer's on-screen scale (quarter-octave steps, rounded
+    /// up, so vector content is drawn at its final size and stays sharp when scaled up).
     pub fn raster_scale(&self, ctx: &EvalCtx, layer: &Layer) -> f64 {
         let s = self.opts.scale;
         let continuous = match layer.source {
-            LayerSource::Text => true,
-            LayerSource::Shape => layer.switches.collapse,
+            LayerSource::Text | LayerSource::Shape => true,
             LayerSource::Footage { item } => {
                 layer.switches.collapse && matches!(self.project.item(item).map(|i| &i.kind), Some(ItemKind::Footage(f)) if is_vector_footage(f))
             }
@@ -1314,6 +1492,15 @@ impl<'a> Renderer<'a> {
         let Some(fx) = layer.effects() else { return };
         let lt = layer.layer_time(ctx.time);
         let layer_size = ctx.effect_bounds(layer).0;
+        // #659: an authored layer's buffer spans only its painted content while the stack works
+        // on the layer's whole region (`layer_size`): give the buffer the room a sized source
+        // already has, so tiling or displacement can place pixels outside the content instead
+        // of losing them at its edge. Only when something will actually run, and not for an
+        // adjustment layer, whose buffer is the comp below and already spans it.
+        if !adjustment
+            && fx.groups().any(|g| g.enabled && matches!(&g.kind, GroupKind::Effect { effect } if effectcraft_effects::find(effect).is_some_and(|s| !effectcraft_effects::audio_fx::is_audio_effect(s.id)))) {
+            target.cover(layer_size);
+        }
         let mut mask_shapes = masks::shapes(ctx, layer);
         if origin != [0.0; 2] {
             for q in mask_shapes.iter_mut().flat_map(|m| m.points.iter_mut()) {
@@ -1469,7 +1656,7 @@ impl<'a> Renderer<'a> {
                 if let Some(pf) = self.proxy_for(*item)
                     && let Some(nc) = self.project.comp(*item)
                 {
-                    let img = self.read_footage_frame(ctx, layer, *item, pf, lt, None)?;
+                    let img = self.read_footage_frame(ctx, layer, *item, pf, lt, None, self.pipe.float_encoding())?;
                     return Some(self.footage_buf(&img, pf, nc.width, nc.height));
                 }
                 // Essential Properties overrides render the nested comp with this instance's
@@ -1587,7 +1774,7 @@ impl<'a> Renderer<'a> {
             )?;
             let field_rate = FrameRate::new(num, f.frame_rate.den);
             let i = field_rate.frame_at(t).max(0);
-            let img = self.read_footage_frame(ctx, layer, item, f, f.frame_rate.tick_of(i / 2), None)?;
+            let img = self.read_footage_frame(ctx, layer, item, f, f.frame_rate.tick_of(i / 2), None, self.pipe.float_curve(f))?;
             let dominant_upper = f.fields == effectcraft_project::FieldOrder::UpperFirst;
             // Upper field = even lines (0, 2, …).
             let parity = if (i % 2 == 0) == dominant_upper { 0 } else { 1 };
@@ -1601,6 +1788,7 @@ impl<'a> Renderer<'a> {
 
     fn footage_frame_raw(&self, ctx: &EvalCtx, layer: &Layer, item: ItemId, f: &Footage, t: Tick, size: Option<(u32, u32)>) -> Option<Arc<Image>> {
         let mode = frame_blend_mode(ctx, layer);
+        let float = self.pipe.float_curve(f);
         if mode != FrameBlend::Off && matches!(f.kind, FootageKind::Video | FootageKind::Sequence) {
             let (i, w) = frame_position(t, f.frame_rate);
             if w > 1e-6 {
@@ -1608,7 +1796,7 @@ impl<'a> Renderer<'a> {
                 let key = self.cache.map(|_| {
                     use std::hash::{Hash, Hasher};
                     let mut h = std::collections::hash_map::DefaultHasher::new();
-                    (0x00f8_a3e5_u64, item, i, (w as f32).to_bits(), mode as u8, f.frame_rate.num, f.frame_rate.den, &f.path).hash(&mut h);
+                    (0x00f8_a3e5_u64, item, i, (w as f32).to_bits(), mode as u8, f.frame_rate.num, f.frame_rate.den, &f.path, float).hash(&mut h);
                     h.finish()
                 });
                 if let (Some(c), Some(k)) = (self.cache, key)
@@ -1616,7 +1804,7 @@ impl<'a> Renderer<'a> {
                 {
                     return Some(Arc::new(b.img.clone()));
                 }
-                let a = self.read_footage_frame(ctx, layer, item, f, f.frame_rate.tick_of(i), None);
+                let a = self.read_footage_frame(ctx, layer, item, f, f.frame_rate.tick_of(i), None, float);
                 let next = self.checked_raster(
                     i.checked_add(1).ok_or_else(|| "blended frame index overflow".to_string()),
                     ctx.comp_id,
@@ -1624,10 +1812,10 @@ impl<'a> Renderer<'a> {
                     ctx.time,
                     "footage blending",
                 )?;
-                let b = self.read_footage_frame(ctx, layer, item, f, f.frame_rate.tick_of(next), None);
+                let b = self.read_footage_frame(ctx, layer, item, f, f.frame_rate.tick_of(next), None, float);
                 if let (Some(a), Some(b)) = (a, b) {
                     let img = blend_frames(mode, &a, &b, w as f32);
-                    if let (Some(c), Some(k)) = (self.cache, key)
+                    if let (Some(c), Some(k)) = (self.cache_to_keep(), key)
                         && self.cache_allowed()
                     {
                         c.insert(k, Arc::new(Buf { img: img.clone(), offset: [0.0; 2], scale: 1.0 }));
@@ -1636,15 +1824,20 @@ impl<'a> Renderer<'a> {
                 }
             }
         }
-        self.read_footage_frame(ctx, layer, item, f, t, size)
+        self.read_footage_frame(ctx, layer, item, f, t, size, float)
     }
 
-    fn read_footage_frame(&self, ctx: &EvalCtx, layer: &Layer, item: ItemId, f: &Footage, t: Tick, size: Option<(u32, u32)>) -> Option<Arc<Image>> {
-        let result = match size {
-            Some((w, h)) => self.footage.frame_at_size_checked(item, f, t, w, h),
-            None => self.footage.frame_checked(item, f, t),
-        }
-        .and_then(|image| {
+    fn read_footage_frame(
+        &self,
+        ctx: &EvalCtx,
+        layer: &Layer,
+        item: ItemId,
+        f: &Footage,
+        t: Tick,
+        size: Option<(u32, u32)>,
+        float: FloatCurve,
+    ) -> Option<Arc<Image>> {
+        let result = self.footage.frame_with_checked(item, f, t, size, float).and_then(|image| {
             if let Some(image) = &image {
                 raster_bounds::solid(image.width, image.height, 1.0)?;
                 let pixels = u64::from(image.width).saturating_mul(u64::from(image.height));
@@ -1723,9 +1916,7 @@ impl<'a> Renderer<'a> {
         let mut nb = (*b).clone();
         color::convert(&mut nb.img, &c);
         let nb = Arc::new(nb);
-        if let (Some(cache), Some(k)) = (self.cache, key)
-            && self.cache_allowed()
-        {
+        if let (Some(cache), Some(k)) = (self.cache_to_keep(), key) {
             cache.insert(k, nb.clone());
         }
         nb
@@ -1743,9 +1934,7 @@ impl<'a> Renderer<'a> {
             return Some((b, key));
         }
         let flat = Arc::new(styles::Styled { passes: st.passes.iter().map(|(b, m)| ((**b).clone(), *m)).collect(), body: (*st.body).clone() }.flatten());
-        if let (Some(c), Some(k)) = (self.cache, key)
-            && self.cache_allowed()
-        {
+        if let (Some(c), Some(k)) = (self.cache_to_keep(), key) {
             c.insert(k, flat.clone());
         }
         Some((flat, key))
@@ -1783,9 +1972,7 @@ impl<'a> Renderer<'a> {
         }
         let buf = self.masked_source(ctx, layer)?;
         let buf = Arc::new(self.apply_effects_timed(ctx, layer, buf, false, usize::MAX, timing.map(|t| &mut t.effects)));
-        if let (Some(c), Some(k)) = (self.cache, key)
-            && self.cache_allowed()
-        {
+        if let (Some(c), Some(k)) = (self.cache_to_keep(), key) {
             c.insert(k, buf.clone());
         }
         Some((buf, key))
@@ -1814,9 +2001,7 @@ impl<'a> Renderer<'a> {
             buf = self.effect_space_stack(ctx, layer, buf, false, effects, None, origin);
         }
         let buf = Arc::new(buf);
-        if let (Some(c), Some(k)) = (self.cache, key)
-            && self.cache_allowed()
-        {
+        if let (Some(c), Some(k)) = (self.cache_to_keep(), key) {
             c.insert(k, buf.clone());
         }
         Some(buf)
@@ -1848,10 +2033,8 @@ impl<'a> Renderer<'a> {
         }
         let body = Arc::new(st.body);
         let passes: Vec<_> = st.passes.into_iter().map(|(b, m)| (Arc::new(b), m)).collect();
-        if let (Some(c), Some(k)) = (self.cache, key) {
-            if self.cache_allowed() {
-                c.insert(k, body.clone());
-            }
+        if let (Some(c), Some(k)) = (self.cache_to_keep(), key) {
+            c.insert(k, body.clone());
             for (i, (b, _)) in passes.iter().enumerate() {
                 if self.cache_allowed() {
                     c.insert(cache::derive(k, i as u64 + 1), b.clone());
@@ -2259,13 +2442,26 @@ impl<'a> Renderer<'a> {
     /// [`Self::composite_iso`] with the track matte's pixels already drawn (`matte`, e.g. a 3D
     /// matte seen through the camera); otherwise the matte layer is placed in 2D.
     pub(crate) fn composite_iso_with(&self, ctx: &EvalCtx, layer: &Layer, mut iso: Image, canvas: &mut Image, opacity: f32, matte_img: Option<Image>) {
+        self.apply_track_matte(ctx, layer, &mut iso, matte_img);
+        if layer.preserve_transparency {
+            iso.data.par_iter_mut().zip(canvas.data.par_iter()).for_each(|(p, q)| {
+                for c in p.iter_mut() {
+                    *c *= q[3];
+                }
+            });
+        }
+        canvas.blend_from(&iso, layer.blend_mode, opacity, layer.id.0 as u32);
+    }
+
+    /// Multiply `img` (comp-sized) by the layer's track matte, if it has one; `matte_img` as in
+    /// [`Self::composite_iso_with`].
+    fn apply_track_matte(&self, ctx: &EvalCtx, layer: &Layer, img: &mut Image, matte_img: Option<Image>) {
         let matte = layer.track_matte.and_then(|tm| ctx.comp.layer(tm.layer).filter(|m| m.id != layer.id).map(|m| (m, tm.kind)));
-        let preserve = layer.preserve_transparency;
         if let Some((m, kind)) = matte {
             let mimg = match matte_img {
-                Some(i) if i.width == canvas.width && i.height == canvas.height => i,
+                Some(i) if i.width == img.width && i.height == img.height => i,
                 _ => {
-                    let mut mimg = Image::new(canvas.width, canvas.height);
+                    let mut mimg = Image::new(img.width, img.height);
                     if m.is_active_at(ctx.time)
                         && let Some(mb) = self.layer_buf(ctx, m)
                     {
@@ -2275,7 +2471,7 @@ impl<'a> Renderer<'a> {
                     mimg
                 }
             };
-            iso.data.par_iter_mut().zip(mimg.data.par_iter()).for_each(|(p, q)| {
+            img.data.par_iter_mut().zip(mimg.data.par_iter()).for_each(|(p, q)| {
                 let k = match kind {
                     MatteKind::Alpha => q[3],
                     MatteKind::AlphaInverted => 1.0 - q[3],
@@ -2288,22 +2484,16 @@ impl<'a> Renderer<'a> {
                 }
             });
         }
-        if preserve {
-            iso.data.par_iter_mut().zip(canvas.data.par_iter()).for_each(|(p, q)| {
-                for c in p.iter_mut() {
-                    *c *= q[3];
-                }
-            });
-        }
-        canvas.blend_from(&iso, layer.blend_mode, opacity, layer.id.0 as u32);
     }
 
-    /// Adjustment layer: effects applied to the comp below, limited to the layer's footprint.
+    /// Adjustment layer: effects applied to the comp below, limited to the layer's footprint
+    /// and its track matte.
     fn draw_adjustment(&self, ctx: &EvalCtx, layer: &Layer, canvas: &mut Image, opacity: f32) {
         let Some(mut foot) = self.source(ctx, layer) else { return };
         let _ = masks::apply(ctx, layer, &mut foot, self.mask_blur(ctx, layer));
         let mut matte = Image::new(canvas.width, canvas.height);
         self.place(ctx, layer, &foot, &mut matte, BlendMode::Normal, 1.0);
+        self.apply_track_matte(ctx, layer, &mut matte, None);
         let o = self.roi_offset().map(|(x, y, _, _)| [-x, -y]).unwrap_or([0.0; 2]);
         let mut below = Buf { img: canvas.clone(), offset: o, scale: self.opts.scale };
         // Effects run in the working space, not the linear blending space.
@@ -2488,9 +2678,7 @@ impl<'a> Renderer<'a> {
         let mut foot = self.source(ctx, layer)?;
         let _ = masks::apply(ctx, layer, &mut foot, self.mask_blur(ctx, layer));
         let foot = Arc::new(foot);
-        if let (Some(c), Some(k)) = (self.cache, key)
-            && self.cache_allowed()
-        {
+        if let (Some(c), Some(k)) = (self.cache_to_keep(), key) {
             c.insert(k, foot.clone());
         }
         Some(foot)

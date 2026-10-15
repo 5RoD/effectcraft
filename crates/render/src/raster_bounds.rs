@@ -1,7 +1,9 @@
 //! Checked composition, ROI and solid sizes, before a CPU image or GPU canvas allocation.
 //! These are per-image limits, not a total renderer/decoder/effect memory budget.
 
-pub const MAX_DIMENSION: u32 = 16_384;
+/// CPU rasters follow project dimensions; a GPU's smaller texture limit is checked by its
+/// uploader. The separate pixel/byte cap still rejects large square allocations.
+pub const MAX_DIMENSION: u32 = effectcraft_project::limits::MAX_SIZE;
 pub const MAX_PIXELS: u64 = 32 * 1024 * 1024;
 pub const MAX_ROI_OFFSET: f64 = 1e12;
 
@@ -109,6 +111,8 @@ mod tests {
         }
         assert_eq!(frame(7680, 4320, 1.0, None).unwrap().size, [7680, 4320]);
         assert_eq!(frame(8192, 4096, 1.0, None).unwrap().size, [8192, 4096]);
+        assert_eq!(frame(30_000, 1, 1.0, None).unwrap().size, [30_000, 1]);
+        assert_eq!(solid(1, 30_000, 1.0).unwrap(), [1, 30_000]);
         assert_eq!(frame(1, 1, f64::MIN_POSITIVE, Some([0.0, 0.0, 0.1, 0.1])).unwrap().output_size(), [1, 1]);
         assert_eq!(roi([-MAX_ROI_OFFSET, MAX_ROI_OFFSET, 1.0, 1.0], 1.0).unwrap().size, [1, 1]);
     }

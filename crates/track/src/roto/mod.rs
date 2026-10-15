@@ -59,6 +59,9 @@ pub enum StrokeKind {
     Refine,
     /// Refine Edge tool with Alt: remove from the band.
     RefineErase,
+    /// A box around the object (Object Matte): two opposite corners in `points`. Trained models
+    /// get it as their box prompt; the graph cut ignores it.
+    Box,
 }
 
 impl StrokeKind {
@@ -268,30 +271,51 @@ impl FrameSeg {
 
     /// Inverse of [`FrameSeg::to_bytes`] (`None` for malformed input).
     pub fn from_bytes(b: &[u8]) -> Option<FrameSeg> {
-        if b.len() < 16 || &b[..4] != b"ECSG" {
+        const MAX_DIMENSION: usize = 16_384;
+        const MAX_PIXELS: usize = 32 * 1024 * 1024;
+        const MAX_MODELS_BYTES: usize = 1024 * 1024;
+        if b.get(..4)? != b"ECSG" || b.len() > MAX_PIXELS * 6 + MAX_MODELS_BYTES + 16 {
             return None;
         }
-        let u = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]) as usize;
-        let (w, h, ml) = (u(4), u(8), u(12));
+        let u = |i: usize| -> Option<usize> { usize::try_from(u32::from_le_bytes(b.get(i..i.checked_add(4)?)?.try_into().ok()?)).ok() };
+        let (w, h, ml) = (u(4)?, u(8)?, u(12)?);
         let n = w.checked_mul(h)?;
-        let models = b.get(16..16 + ml)?;
+        if w == 0 || h == 0 || w > MAX_DIMENSION || h > MAX_DIMENSION || n > MAX_PIXELS || ml > MAX_MODELS_BYTES {
+            return None;
+        }
+        let end = 16usize.checked_add(ml)?;
+        let models = b.get(16..end)?;
         let (fg, bg): (Gmm, Gmm) = serde_json::from_slice(models).ok()?;
-        let mut rest = &b[16 + ml..];
+        if [&fg, &bg].iter().any(|model| {
+            model.comps.len() > 128
+                || model.comps.iter().any(|component| {
+                    !component.weight.is_finite()
+                        || component.weight < 0.0
+                        || !component.log_norm.is_finite()
+                        || component.mean.iter().chain(component.inv.iter().flatten()).any(|value| !value.is_finite())
+                })
+        }) {
+            return None;
+        }
+        let mut rest = b.get(end..)?;
         let mut plane = || -> Option<Vec<u8>> {
-            let mut v = Vec::with_capacity(n);
+            let mut v = Vec::new();
+            v.try_reserve_exact(n).ok()?;
             while v.len() < n {
-                if rest.len() < 3 {
+                let record = rest.get(..3)?;
+                let run = usize::from(u16::from_le_bytes(record.get(..2)?.try_into().ok()?));
+                let end = v.len().checked_add(run)?;
+                if run == 0 || end > n {
                     return None;
                 }
-                let run = u16::from_le_bytes([rest[0], rest[1]]) as usize;
-                v.resize(v.len() + run, rest[2]);
-                rest = &rest[3..];
+                v.resize(end, *record.get(2)?);
+                rest = rest.get(3..)?;
             }
-            (v.len() == n).then_some(v)
+            Some(v)
         };
         let matte = plane()?;
         let refine = plane()?;
-        Some(FrameSeg { w, h, matte, refine, fg, bg })
+        rest.is_empty().then_some(FrameSeg { w, h, matte, refine, fg, bg })
     }
 }
 
@@ -830,8 +854,9 @@ fn points_along(s: &Stroke, scale: f64, max: usize) -> Vec<[f32; 2]> {
     out
 }
 
-/// A model's prompt from the strokes: points along the foreground and background strokes.
-fn stroke_prompt(strokes: &[&Stroke], scale: f64) -> Prompt {
+/// A model's prompt from the strokes: points along the foreground and background strokes, and
+/// the box of a [`StrokeKind::Box`] stroke (matte pixels).
+pub fn stroke_prompt(strokes: &[&Stroke], scale: f64) -> Prompt {
     let mut points = vec![];
     for (kind, fg) in [(StrokeKind::Fg, true), (StrokeKind::Bg, false)] {
         let ss: Vec<&&Stroke> = strokes.iter().filter(|s| s.kind == kind).collect();
@@ -840,11 +865,20 @@ fn stroke_prompt(strokes: &[&Stroke], scale: f64) -> Prompt {
             points.extend(points_along(s, scale, per).into_iter().map(|p| (p, fg)));
         }
     }
-    Prompt { points, ..Default::default() }
+    let bbox = strokes.iter().filter(|s| s.kind == StrokeKind::Box).find_map(|s| box_of(s, scale));
+    Prompt { points, bbox, ..Default::default() }
 }
 
-/// Add a prior matte to a prompt: its box (a little larger), up to four points spread through
-/// its core, and the matte itself.
+/// The box `[x0, y0, x1, y1]` (matte pixels) of a box stroke: its first two points as opposite
+/// corners; `None` when they are missing, not finite or the box is empty.
+fn box_of(s: &Stroke, scale: f64) -> Option<[f32; 4]> {
+    let (a, c) = (s.points.first()?, s.points.get(1)?);
+    let v = [a[0].min(c[0]), a[1].min(c[1]), a[0].max(c[0]), a[1].max(c[1])].map(|v| (v * scale) as f32);
+    (v.iter().all(|x| x.is_finite()) && v[2] > v[0] && v[3] > v[1]).then_some(v)
+}
+
+/// Add a prior matte to a prompt: its box (a little larger; unless the prompt has one), up to
+/// four points spread through its core, and the matte itself.
 fn add_prior_prompt(prompt: &mut Prompt, soft: &[f32], w: usize, h: usize) -> bool {
     let bin: Vec<u8> = soft.iter().map(|v| (*v >= 0.5) as u8).collect();
     let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0usize, 0usize);
@@ -858,7 +892,10 @@ fn add_prior_prompt(prompt: &mut Prompt, soft: &[f32], w: usize, h: usize) -> bo
         return false;
     }
     let (mx, my) = (((x1 - x0) as f32 * 0.05).max(4.0), ((y1 - y0) as f32 * 0.05).max(4.0));
-    prompt.bbox = Some([(x0 as f32 - mx).max(0.0), (y0 as f32 - my).max(0.0), (x1 as f32 + 1.0 + mx).min(w as f32), (y1 as f32 + 1.0 + my).min(h as f32)]);
+    // A box the user drew on this frame wins over the prior's.
+    if prompt.bbox.is_none() {
+        prompt.bbox = Some([(x0 as f32 - mx).max(0.0), (y0 as f32 - my).max(0.0), (x1 as f32 + 1.0 + mx).min(w as f32), (y1 as f32 + 1.0 + my).min(h as f32)]);
+    }
     // Farthest-point picks among the core (deep inside), starting from the deepest pixel.
     let sd = matting::signed_distance(&bin, w, h);
     let deep = sd.iter().copied().fold(0.0f32, f32::max);
@@ -944,3 +981,43 @@ pub fn iou(a: &[u8], b: &[u8]) -> f64 {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod serialized_segmentation_tests {
+    use super::FrameSeg;
+
+    #[test]
+    fn hostile_geometry_and_model_lengths_are_rejected_before_plane_allocation() {
+        let seg = FrameSeg { w: 2, h: 2, matte: vec![1; 4], refine: vec![0; 4], ..Default::default() };
+        let bytes = seg.to_bytes();
+        assert_eq!(FrameSeg::from_bytes(&bytes), Some(seg));
+        for dimensions in [[u32::MAX, 1], [1, u32::MAX], [1 << 30, 1 << 30], [0, 2], [2, 0], [8192, 8192]] {
+            let mut invalid = bytes.clone();
+            invalid[4..8].copy_from_slice(&dimensions[0].to_le_bytes());
+            invalid[8..12].copy_from_slice(&dimensions[1].to_le_bytes());
+            assert!(FrameSeg::from_bytes(&invalid).is_none(), "{dimensions:?}");
+        }
+        let mut invalid = bytes.clone();
+        invalid[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(FrameSeg::from_bytes(&invalid).is_none());
+        for end in 0..bytes.len() {
+            assert!(FrameSeg::from_bytes(&bytes[..end]).is_none(), "truncated at {end}");
+        }
+    }
+
+    #[test]
+    fn zero_oversized_and_trailing_rle_records_are_rejected() {
+        let bytes = FrameSeg { w: 2, h: 2, matte: vec![1; 4], refine: vec![0; 4], ..Default::default() }.to_bytes();
+        let models = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        for at in [16 + models, 19 + models] {
+            for run in [0u16, 5, u16::MAX] {
+                let mut invalid = bytes.clone();
+                invalid[at..at + 2].copy_from_slice(&run.to_le_bytes());
+                assert!(FrameSeg::from_bytes(&invalid).is_none(), "run={run}, offset={at}");
+            }
+        }
+        let mut trailing = bytes;
+        trailing.extend_from_slice(&[1, 0, 1]);
+        assert!(FrameSeg::from_bytes(&trailing).is_none());
+    }
+}

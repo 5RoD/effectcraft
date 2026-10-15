@@ -107,7 +107,7 @@ fn readback_buf(r: crate::deferred::Readback) -> Option<Buf> {
 /// A checked effect over host pixels: validate before uploading or consulting deferred
 /// results. A pending keyed readback returns the input placeholder and raises the miss gate.
 pub(crate) fn run_checked(e: &mut Enc, step: &FxStep, input: &Buf, levels: Option<f32>) -> Result<Option<Buf>, String> {
-    if ![effectcraft_effects::bloom::ID, effectcraft_effects::timewarp::ID].contains(&step.spec.id) {
+    if ![effectcraft_effects::bloom::ID, effectcraft_effects::timewarp::ID, effectcraft_effects::timewarp::PMB_ID].contains(&step.spec.id) {
         return Ok(None);
     }
     let deferred = e.g.deferred.clone();
@@ -121,10 +121,10 @@ pub(crate) fn run_checked(e: &mut Enc, step: &FxStep, input: &Buf, levels: Optio
         effectcraft_effects::timewarp::validate_input(input)?;
         None
     };
-    let warp = if step.spec.id == effectcraft_effects::timewarp::ID {
-        effectcraft_effects::timewarp::plan_for_input(&step.ctx, [input.img.width, input.img.height])?
-    } else {
-        None
+    let warp = match step.spec.id {
+        effectcraft_effects::timewarp::ID => effectcraft_effects::timewarp::plan_for_input(&step.ctx, [input.img.width, input.img.height])?,
+        effectcraft_effects::timewarp::PMB_ID => effectcraft_effects::timewarp::pmb_plan_for_input(&step.ctx, [input.img.width, input.img.height])?,
+        _ => None,
     };
     let (size, offset, scale) = match (&bloom, &warp) {
         (Some(plan), _) => (plan.output, input.offset.map(|value| value + plan.pad as f64), input.scale),
@@ -258,7 +258,7 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
         if self.resident_only && self.b.is_none() {
             return Ok(false);
         }
-        if ![effectcraft_effects::bloom::ID, effectcraft_effects::timewarp::ID].contains(&step.spec.id) {
+        if ![effectcraft_effects::bloom::ID, effectcraft_effects::timewarp::ID, effectcraft_effects::timewarp::PMB_ID].contains(&step.spec.id) {
             return Ok(false);
         }
         let input = self.b.as_ref().ok_or("checked effect has no resident input")?;
@@ -267,7 +267,7 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
             let mut output = if step.spec.id == effectcraft_effects::bloom::ID {
                 crate::bloom::resident(self.e, &step.ctx, input).map_err(|error| error.to_string())?
             } else {
-                crate::fx_time::checked(self.e, &step.ctx, input)?
+                crate::fx_time::checked(self.e, step.spec.id, &step.ctx, input)?
             };
             if let Some(levels) = self.levels {
                 output.img = ops::quantize(self.e, &output.img, levels);
@@ -303,6 +303,21 @@ impl effectcraft_render::FxTarget for GpuFx<'_, '_> {
         let image = self.e.g.upload_image(&output.img).ok_or("checked effect cannot upload its completed output")?;
         self.b = Some(GBuf { img: image, offset: output.offset, scale: output.scale });
         Ok(true)
+    }
+
+    /// GBuf::cover, like `pad`: a bigger texture with the old one copied into place, no
+    /// readback. A region the device can't allocate leaves the buffer as it is.
+    fn cover(&mut self, size: [f64; 2]) {
+        let Some(b) = self.b.take() else { return };
+        let out = match effectcraft_effects::cover_plan(b.offset, b.scale, size, b.img.width, b.img.height) {
+            Some((dx, dy, w, h)) if self.e.g.fits(w, h) => {
+                let img = self.e.image(w, h);
+                self.e.copy_into(&b.img, &img, dx, dy);
+                GBuf { img, offset: [b.offset[0] + dx as f64, b.offset[1] + dy as f64], scale: b.scale }
+            }
+            _ => b,
+        };
+        self.b = Some(out);
     }
 }
 

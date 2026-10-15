@@ -45,13 +45,7 @@ pub(crate) fn apply(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<G
             let fd = 1.0 / ctx.fps();
             mean_of(e, ctx, b, &(-back..=fwd).map(|k| ctx.time + k as f64 * fd).collect::<Vec<_>>())
         }
-        "ec.time.pixelmotionblur" => {
-            let angle = if ctx.params.e("shutterControl") == 1 { ctx.params.f("shutterAngle") } else { 180.0 };
-            let n = ctx.params.f("shutterSamples").round().clamp(1.0, 64.0) as usize;
-            let span = angle.clamp(0.0, 720.0) / 360.0 / ctx.fps();
-            let times: Vec<f64> = (0..n).map(|i| ctx.time - span * 0.5 + if n > 1 { span * i as f64 / (n - 1) as f64 } else { span * 0.5 }).collect();
-            mean_of(e, ctx, b, &times)
-        }
+
         _ => None,
     }
 }
@@ -226,11 +220,16 @@ impl WarpGpu {
 /// Run a checked Timewarp over resident pixels. An unavailable host retains the input;
 /// missing retimed samples with available current geometry are transparent.
 /// rejected controls/plans/kernels remain errors rather than legacy Option pass-through.
-pub(crate) fn checked(e: &mut Enc, ctx: &EffectCtx, input: GBuf) -> Result<GBuf, String> {
+pub(crate) fn checked(e: &mut Enc, id: &str, ctx: &EffectCtx, input: GBuf) -> Result<GBuf, String> {
     if !input.scale.is_finite() || input.scale <= 0.0 || input.offset.iter().any(|value| !value.is_finite() || value.abs() > 1e12) {
         return Err("Timewarp GPU: resident input geometry is invalid".into());
     }
-    let plan = effectcraft_effects::timewarp::plan_for_input(ctx, [input.img.width, input.img.height])?;
+    let size = [input.img.width, input.img.height];
+    let plan = if id == effectcraft_effects::timewarp::PMB_ID {
+        effectcraft_effects::timewarp::pmb_plan_for_input(ctx, size)?
+    } else {
+        effectcraft_effects::timewarp::plan_for_input(ctx, size)?
+    };
     prepared(e, input, plan.as_ref())
 }
 

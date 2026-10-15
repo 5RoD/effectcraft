@@ -90,6 +90,16 @@ with Ctrl/Command. A single layer's unchanged Position is retained, including it
 Changing the composition, time, selection, tool, view or axis space, or losing window focus, ends
 the gesture. The controls do not read pixels back from the GPU or poll while idle.
 
+The Rotation tool (`W`) also exposes the 3D rings. Its **Set** selector chooses Orientation
+or the authored X/Y/Z Rotation properties. Orientation is the default; Rotation preserves
+the authored Orientation and retains full turns across successive drag samples. Shift snaps
+to 15 degrees in this tool. Bounding-box corners rotate Z, top/bottom midpoints X, and
+left/right midpoints Y. Dragging a layer with hidden layer controls still rotates it. The
+2D tool retains upstream's accumulated turn tracking across the angle seam. These controls
+are original code-drawn artwork; the behavioral sources are Adobe's public
+[3D layer documentation](https://helpx.adobe.com/after-effects/desktop/work-with-layers/3d-layers/3d-layers.html)
+and [3D transform gizmo documentation](https://helpx.adobe.com/after-effects/desktop/work-with-3d-composition/work-in-3d-design-space/3d-transform-gizmo.html).
+
 Current limits: camera/light layers keep their existing camera navigation and property
 controls; the new transform handles apply to 3D content layers. Auto-oriented rotation
 requires disabling Auto-Orient. A rotation requiring shear under a nonuniformly scaled

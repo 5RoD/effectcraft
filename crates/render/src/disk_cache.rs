@@ -8,7 +8,9 @@
 //!   project therefore never reads stale pixels: its keys simply change.
 //! * Payloads are LZ4-compressed (`lz4_flex`, MIT): frames as 8-bit premultiplied RGBA, layer
 //!   buffers as `f32` RGBA with the bytes shuffled into planes (exact, so cached and fresh
-//!   renders are bit-identical). Every file ends in a checksum; damaged files read as misses and
+//!   renders are bit-identical), Roto Brush / Object Matte segmentations as
+//!   `FrameSeg::to_bytes` (keyed by their content-keyed chain key and scale, so they are
+//!   reused whenever the same frames, settings and prompt come back, also after a restart). Every file ends in a checksum; damaged files read as misses and
 //!   are deleted.
 //! * Size limit with least-recently-used eviction. The in-memory index is rebuilt from the
 //!   folder when the cache opens (file modification times order it), so the cache survives
@@ -33,6 +35,8 @@ const MAGIC: &[u8; 4] = b"ECDC";
 /// The largest supported f32 raster plus LZ4 overhead and the entry headers. Check disk
 /// lengths before reading and decoded geometry before allocating; cache bytes are untrusted.
 const MAX_ENTRY_BYTES: u64 = crate::raster_bounds::MAX_PIXELS * 16 * 101 / 100 + 64;
+/// Two worst-case three-byte RLE records per pixel plus bounded model JSON and header.
+const MAX_SEGMENT_BYTES: u64 = crate::raster_bounds::MAX_PIXELS * 6 + 1024 * 1024 + 16;
 /// Pending writes before new ones are dropped.
 #[cfg(not(target_arch = "wasm32"))]
 const QUEUE_LIMIT: usize = 64;
@@ -41,6 +45,8 @@ const QUEUE_LIMIT: usize = 64;
 pub enum Kind {
     Frame,
     Layer,
+    /// A Roto Brush / Object Matte segmentation.
+    Matte,
 }
 
 impl Kind {
@@ -49,12 +55,14 @@ impl Kind {
         match self {
             Kind::Frame => "frames",
             Kind::Layer => "layers",
+            Kind::Matte => "mattes",
         }
     }
     fn tag(self) -> u8 {
         match self {
             Kind::Frame => 1,
             Kind::Layer => 2,
+            Kind::Matte => 3,
         }
     }
 }
@@ -323,7 +331,7 @@ impl DiskCache {
     /// Rebuild the index from the folder (oldest files first).
     pub fn rescan(&self) {
         let mut found: Vec<(std::time::SystemTime, Kind, u128, u64)> = vec![];
-        for kind in [Kind::Frame, Kind::Layer] {
+        for kind in [Kind::Frame, Kind::Layer, Kind::Matte] {
             let Ok(shards) = std::fs::read_dir(self.dir.join(kind.dir())) else { continue };
             for shard in shards.flatten() {
                 let Ok(files) = std::fs::read_dir(shard.path()) else { continue };
@@ -407,7 +415,7 @@ impl DiskCache {
         if let Ok(mut g) = self.index.lock() {
             g.clear();
         }
-        for kind in [Kind::Frame, Kind::Layer] {
+        for kind in [Kind::Frame, Kind::Layer, Kind::Matte] {
             let _ = std::fs::remove_dir_all(self.dir.join(kind.dir()));
         }
     }
@@ -557,6 +565,27 @@ impl DiskCache {
         self.write_now(Kind::Layer, key, &encode_layer(buf));
     }
 
+    /// A segmentation (chain key, scale) written by [`DiskCache::put_seg`].
+    pub fn get_seg(&self, key: u64, scale: f64) -> Option<effectcraft_effects::roto::FrameSeg> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return None;
+        }
+        self.read(Kind::Matte, seg_key(key, scale), decode_seg)
+    }
+
+    /// Queue a segmentation for writing.
+    pub fn put_seg(&self, key: u64, scale: f64, seg: &effectcraft_effects::roto::FrameSeg) {
+        let Some(pixels) = u32::try_from(seg.w).ok().zip(u32::try_from(seg.h).ok()).and_then(|(w, h)| cache_pixels(w, h)) else { return };
+        if !scale.is_finite() || scale <= 0.0 || seg.matte.len() != pixels || seg.refine.len() != pixels {
+            return;
+        }
+        let k = seg_key(key, scale);
+        if self.contains(Kind::Matte, k) {
+            return;
+        }
+        self.enqueue(Kind::Matte, k, lz4_flex::compress_prepend_size(&seg.to_bytes()));
+    }
+
     /// Write a frame synchronously (tests).
     pub fn put_frame_now(&self, key: u128, width: u32, height: u32, rgba: &[u8]) {
         self.write_now(Kind::Frame, key, &encode_frame(width, height, rgba));
@@ -629,6 +658,24 @@ pub fn read_layer_entry(data: &[u8]) -> Option<Buf> {
     decode_layer(verify(data, Kind::Layer)?)
 }
 
+/// The disk key of a segmentation: its chain key and scale.
+fn seg_key(key: u64, scale: f64) -> u128 {
+    let mut h = Hash128::default();
+    h.write(b"segmentation-v1");
+    h.write_u64(key);
+    h.write_u64(scale.to_bits());
+    h.finish()
+}
+
+impl effectcraft_effects::roto::SegStore for DiskCache {
+    fn get_seg(&self, key: u64, scale: f64) -> Option<effectcraft_effects::roto::FrameSeg> {
+        DiskCache::get_seg(self, key, scale)
+    }
+    fn put_seg(&self, key: u64, scale: f64, seg: &effectcraft_effects::roto::FrameSeg) {
+        DiskCache::put_seg(self, key, scale, seg);
+    }
+}
+
 impl crate::cache::LayerStore for DiskCache {
     fn get_layer(&self, key: u128) -> Option<Arc<Buf>> {
         DiskCache::get_layer(self, key).map(Arc::new)
@@ -698,6 +745,15 @@ fn decompress_exact(bytes: &[u8], expected: usize) -> Option<Vec<u8>> {
     decoded.try_reserve_exact(expected).ok()?;
     decoded.resize(expected, 0);
     (lz4_flex::block::decompress_into(bytes.get(4..)?, &mut decoded).ok()? == expected).then_some(decoded)
+}
+
+fn decode_seg(bytes: &[u8]) -> Option<effectcraft_effects::roto::FrameSeg> {
+    let size = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?);
+    if !(16..=MAX_SEGMENT_BYTES).contains(&u64::from(size)) {
+        return None;
+    }
+    let raw = decompress_exact(bytes, usize::try_from(size).ok()?)?;
+    effectcraft_effects::roto::FrameSeg::from_bytes(&raw)
 }
 
 fn encode_frame(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
@@ -895,6 +951,14 @@ pub fn frame_key(content: u128, frame: i64, scale_milli: u32, view: u64) -> u128
 mod tests {
     use super::*;
 
+    fn invalid_entry(kind: Kind, entry: &[u8]) -> bool {
+        match kind {
+            Kind::Frame => read_frame_entry(entry).is_none(),
+            Kind::Layer => read_layer_entry(entry).is_none(),
+            Kind::Matte => verify(entry, kind).and_then(decode_seg).is_none(),
+        }
+    }
+
     fn tmpdir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("effectcraft-disk-cache-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -944,6 +1008,66 @@ mod tests {
         assert_eq!(parse_entry_name(&format!("{key:032x}.tmp.1")), None);
     }
 
+    /// Segmentations round-trip by (chain key, scale), survive a reopen (rescan), are bounded by
+    /// the size limit like every entry, and a damaged file is a miss.
+    #[test]
+    fn segmentations_round_trip_and_reopen() {
+        use effectcraft_effects::roto::FrameSeg;
+        let dir = tmpdir("seg");
+        let dc = DiskCache::open(&dir, 1 << 30).unwrap();
+        let seg = FrameSeg { w: 7, h: 5, matte: (0..35).map(|i| (i % 3 == 0) as u8).collect(), refine: vec![0; 35], ..Default::default() };
+        assert!(dc.get_seg(42, 1.0).is_none());
+        dc.put_seg(42, 1.0, &seg);
+        dc.flush();
+        assert_eq!(dc.get_seg(42, 1.0), Some(seg.clone()));
+        assert!(dc.get_seg(42, 0.5).is_none() && dc.get_seg(43, 1.0).is_none());
+        assert_eq!(dc.keys(Kind::Matte).len(), 1);
+        drop(dc);
+        let dc = DiskCache::open(&dir, 1 << 30).unwrap();
+        assert_eq!(dc.get_seg(42, 1.0), Some(seg.clone()));
+        // Damaged on disk: a miss, and the entry is forgotten.
+        let path = dc.path(Kind::Matte, seg_key(42, 1.0));
+        let mut d = std::fs::read(&path).unwrap();
+        d[18] ^= 0x55;
+        std::fs::write(&path, d).unwrap();
+        assert!(dc.get_seg(42, 1.0).is_none());
+        assert!(!dc.contains(Kind::Matte, seg_key(42, 1.0)));
+        // The size limit evicts segmentations too.
+        dc.put_seg(1, 1.0, &seg);
+        dc.flush();
+        dc.set_max_bytes(1);
+        assert!(dc.keys(Kind::Matte).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checksummed_mattes_reject_bombs_and_invalid_geometry_and_can_be_rebuilt() {
+        let dir = tmpdir("matte-damage");
+        let dc = DiskCache::open(&dir, 1 << 30).unwrap();
+        let seg = effectcraft_effects::roto::FrameSeg { w: 2, h: 2, matte: vec![1; 4], refine: vec![0; 4], ..Default::default() };
+        let valid = seg.to_bytes();
+        let mut huge_geometry = valid.clone();
+        huge_geometry[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+        let models = u32::from_le_bytes(valid[12..16].try_into().unwrap()) as usize;
+        let mut bad_run = valid;
+        bad_run[16 + models..18 + models].copy_from_slice(&u16::MAX.to_le_bytes());
+        for payload in [u32::MAX.to_le_bytes().to_vec(), lz4_flex::compress_prepend_size(&huge_geometry), lz4_flex::compress_prepend_size(&bad_run)] {
+            dc.put_seg(7, 1.0, &seg);
+            dc.flush();
+            let key = seg_key(7, 1.0);
+            let path = dc.path(Kind::Matte, key);
+            std::fs::write(&path, seal(Kind::Matte, &payload)).unwrap();
+            assert!(dc.get_seg(7, 1.0).is_none());
+            assert!(!dc.contains(Kind::Matte, key) && !path.exists());
+        }
+        dc.put_seg(7, 1.0, &seg);
+        dc.flush();
+        assert_eq!(dc.get_seg(7, 1.0), Some(seg));
+        dc.clear();
+        drop(dc);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn a_53_byte_layer_entry_cannot_overflow_image_capacity() {
         let mut payload = Vec::new();
@@ -973,45 +1097,32 @@ mod tests {
         let original = buf(17, 3, 2);
         let layer = encode_layer(&original);
         let frame = encode_frame(3, 2, &[7; 24]);
+        let seg = effectcraft_effects::roto::FrameSeg { w: 3, h: 2, matte: vec![1; 6], refine: vec![0; 6], ..Default::default() };
+        let matte = lz4_flex::compress_prepend_size(&seg.to_bytes());
         for size in [[0, 1], [1, 0], [u32::MAX, 1], [1, u32::MAX], [8192, 8192]] {
             for (kind, valid) in [(Kind::Layer, &layer), (Kind::Frame, &frame)] {
                 let mut payload = valid.clone();
                 payload[..4].copy_from_slice(&size[0].to_le_bytes());
                 payload[4..8].copy_from_slice(&size[1].to_le_bytes());
                 let entry = seal(kind, &payload);
-                assert!(match kind {
-                    Kind::Layer => read_layer_entry(&entry).is_none(),
-                    Kind::Frame => read_frame_entry(&entry).is_none(),
-                });
+                assert!(invalid_entry(kind, &entry));
             }
         }
-        for (kind, valid, prefix) in [(Kind::Layer, &layer, 32), (Kind::Frame, &frame, 8)] {
+        for (kind, valid, prefix) in [(Kind::Layer, &layer, 32), (Kind::Frame, &frame, 8), (Kind::Matte, &matte, 0)] {
             for size in [0u32, 1, u32::MAX] {
                 let mut payload = valid.clone();
                 payload[prefix..prefix + 4].copy_from_slice(&size.to_le_bytes());
                 let entry = seal(kind, &payload);
-                assert!(match kind {
-                    Kind::Layer => read_layer_entry(&entry).is_none(),
-                    Kind::Frame => read_frame_entry(&entry).is_none(),
-                });
+                assert!(invalid_entry(kind, &entry));
             }
             for end in 0..prefix + 4 {
                 let entry = seal(kind, &valid[..end]);
-                assert!(
-                    match kind {
-                        Kind::Layer => read_layer_entry(&entry).is_none(),
-                        Kind::Frame => read_frame_entry(&entry).is_none(),
-                    },
-                    "truncation at {end}"
-                );
+                assert!(invalid_entry(kind, &entry), "truncation at {end}");
             }
             let mut malformed = valid[..prefix + 4].to_vec();
             malformed.push(0xff);
             let entry = seal(kind, &malformed);
-            assert!(match kind {
-                Kind::Layer => read_layer_entry(&entry).is_none(),
-                Kind::Frame => read_frame_entry(&entry).is_none(),
-            });
+            assert!(invalid_entry(kind, &entry));
         }
         for (at, value) in [(8, f64::NAN), (16, f64::INFINITY), (8, f64::MAX), (24, 0.0), (24, -1.0), (24, f64::NAN), (24, f64::from_bits(1))] {
             let mut payload = layer.clone();
@@ -1038,24 +1149,34 @@ mod tests {
         let b = buf(5, 2, 2);
         dc.put_frame_now(1, 2, 2, &[9; 16]);
         dc.put_layer_now(2, &b);
-        for (kind, key, mut payload) in [(Kind::Frame, 1, encode_frame(2, 2, &[9; 16])), (Kind::Layer, 2, encode_layer(&b))] {
+        let seg = effectcraft_effects::roto::FrameSeg { w: 2, h: 2, matte: vec![1; 4], refine: vec![0; 4], ..Default::default() };
+        dc.put_seg(3, 1.0, &seg);
+        dc.flush();
+        for (kind, key, mut payload) in [
+            (Kind::Frame, 1, encode_frame(2, 2, &[9; 16])),
+            (Kind::Layer, 2, encode_layer(&b)),
+            (Kind::Matte, seg_key(3, 1.0), lz4_flex::compress_prepend_size(&seg.to_bytes())),
+        ] {
             payload[..4].copy_from_slice(&u32::MAX.to_le_bytes());
             let path = dc.path(kind, key);
             std::fs::write(&path, seal(kind, &payload)).unwrap();
             match kind {
                 Kind::Frame => assert!(dc.get_frame(key).is_none()),
                 Kind::Layer => assert!(dc.get_layer(key).is_none()),
+                Kind::Matte => assert!(dc.get_seg(3, 1.0).is_none()),
             }
             assert!(!dc.contains(kind, key));
             assert!(!path.exists());
         }
-        assert_eq!((dc.stats().hits, dc.stats().misses), (0, 2));
+        assert_eq!((dc.stats().hits, dc.stats().misses), (0, 3));
         dc.put_frame(1, 2, 2, &[9; 16]);
         dc.put_layer(2, &b);
+        dc.put_seg(3, 1.0, &seg);
         dc.flush();
         assert_eq!(dc.get_frame(1).unwrap().rgba, vec![9; 16]);
         assert_eq!(dc.get_layer(2).unwrap().img, b.img);
-        assert_eq!((dc.stats().hits, dc.stats().misses), (2, 2));
+        assert_eq!(dc.get_seg(3, 1.0), Some(seg));
+        assert_eq!((dc.stats().hits, dc.stats().misses), (3, 3));
         dc.clear();
         drop(dc);
         std::fs::remove_dir_all(dir).unwrap();

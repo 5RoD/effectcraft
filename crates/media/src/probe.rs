@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use effectcraft_project::{AlphaMode, Footage, FootageKind};
 use effectcraft_time::{FrameRate, Tick};
+use image::metadata::Orientation;
 
 use crate::{MediaError, Result, ext_of, rate_from_fc};
 
@@ -26,7 +27,7 @@ pub fn probe(path: impl AsRef<Path>) -> Result<Footage> {
     probe_bytes(&path.to_string_lossy(), bytes.into())
 }
 
-/// Probe a 3D model (glTF 2.0 / OBJ): a [`FootageKind::Model`] item whose duration is its
+/// Probe a 3D model (glTF 2.0 / OBJ / STL / FBX): a [`FootageKind::Model`] item whose duration is its
 /// longest animation. `resolve` reads sibling resources.
 pub fn probe_model(path: &str, bytes: &[u8], resolve: &dyn Fn(&str) -> Option<Vec<u8>>) -> Result<Footage> {
     let m = effectcraft_model::load(path, bytes, resolve).map_err(|e| MediaError::Decode(format!("{path}: {e}")))?;
@@ -34,6 +35,8 @@ pub fn probe_model(path: &str, bytes: &[u8], resolve: &dyn Fn(&str) -> Option<Ve
     let dur = s.animations.iter().map(|a| a.1).fold(0.0f64, f64::max);
     let codec = match effectcraft_model::format_of(path) {
         Some("obj") => "OBJ",
+        Some("stl") => "STL",
+        Some("fbx") => "FBX",
         Some("glb") => "GLB",
         _ => "glTF",
     };
@@ -61,16 +64,26 @@ pub fn probe_model(path: &str, bytes: &[u8], resolve: &dyn Fn(&str) -> Option<Ve
 
 /// Probe in-memory file contents; `path` names the footage (and is stored as `Footage::path`).
 pub fn probe_bytes(path: &str, bytes: Arc<[u8]>) -> Result<Footage> {
+    // DPX / Cineon film scans (our own reader; `image` has none).
+    if let Some(f) = crate::dpx::probe(path, &bytes)? {
+        return Ok(f);
+    }
     if let Some(f) = crate::layered::probe(path, &bytes)? {
         return Ok(f);
     }
     if crate::MODEL_EXTENSIONS.contains(&ext_of(Path::new(path)).as_str()) {
         return probe_model(path, &bytes, &|_| None);
     }
-    if let Ok(fmt) = image::guess_format(&bytes) {
+    if let Some(fmt) = crate::still_format(path, &bytes) {
         // An animated GIF is a movie; one with a single frame is a still.
         if fmt == image::ImageFormat::Gif
             && let Some(f) = crate::gif_anim::probe(path, &bytes)
+        {
+            return Ok(f);
+        }
+        // So is an animated WebP; a still WebP stays a still.
+        if fmt == image::ImageFormat::WebP
+            && let Some(f) = crate::webp_anim::probe(path, &bytes)
         {
             return Ok(f);
         }
@@ -78,6 +91,8 @@ pub fn probe_bytes(path: &str, bytes: Arc<[u8]>) -> Result<Footage> {
     }
     let name = Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string());
     let src = filmcraft_codecs::open_bytes(&name, bytes)?;
+    // FilmCraft's source API already applies the track display matrix to metadata and
+    // decoded frames. Applying it again here would undo a quarter turn.
     Ok(footage_from_info(path, src.info()))
 }
 
@@ -168,7 +183,12 @@ fn probe_still_bytes(path: &str, bytes: &[u8], fmt: image::ImageFormat) -> Resul
     }
     let reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), fmt);
     let (w, h, has_alpha) = match reader.into_decoder() {
-        Ok(dec) => (dec.dimensions().0, dec.dimensions().1, dec.color_type().has_alpha()),
+        Ok(mut dec) => {
+            // The size as displayed: an Exif orientation of a quarter turn swaps the sides.
+            let (w, h) = dec.dimensions();
+            let (w, h) = if swaps_sides(dec.orientation().unwrap_or(Orientation::NoTransforms)) { (h, w) } else { (w, h) };
+            (w, h, dec.color_type().has_alpha())
+        }
         Err(e) => {
             // A multi-layer OpenEXR file without an unnamed RGB layer.
             let img = (fmt == image::ImageFormat::OpenExr).then(|| crate::exr_channels::layered_image(bytes)).flatten();
@@ -177,4 +197,26 @@ fn probe_still_bytes(path: &str, bytes: &[u8], fmt: image::ImageFormat) -> Resul
         }
     };
     Ok(still_footage(path, w, h, fmt, has_alpha))
+}
+
+/// Whether an Exif orientation turns the picture a quarter turn (its width and height trade places).
+pub(crate) fn swaps_sides(o: Orientation) -> bool {
+    matches!(o, Orientation::Rotate90 | Orientation::Rotate270 | Orientation::Rotate90FlipH | Orientation::Rotate270FlipH)
+}
+
+/// Decode a still the way it is meant to be seen: its Exif orientation (a camera held sideways, a
+/// mirrored scan) is applied to the pixels, as image viewers do. A file without
+/// the tag, or with a broken one, decodes as stored. `fmt`: the format when the file's extension
+/// decides it (Targa has no signature to guess from), else guessed from the bytes.
+pub(crate) fn load_oriented(bytes: &[u8], fmt: Option<image::ImageFormat>) -> image::ImageResult<image::DynamicImage> {
+    use image::ImageDecoder;
+    let reader = match fmt {
+        Some(fmt) => image::ImageReader::with_format(std::io::Cursor::new(bytes), fmt),
+        None => image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?,
+    };
+    let mut dec = reader.into_decoder()?;
+    let orientation = dec.orientation().unwrap_or(Orientation::NoTransforms);
+    let mut img = image::DynamicImage::from_decoder(dec)?;
+    img.apply_orientation(orientation);
+    Ok(img)
 }

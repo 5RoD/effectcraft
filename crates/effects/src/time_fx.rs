@@ -1,13 +1,14 @@
 //! Time effects (Effect > Time): Echo, Posterize Time, Time Difference, Time Displacement,
 //! Timewarp, CC Force Motion Blur, CC Wide Time and Pixel Motion Blur.
 //!
-//! These read the layer at *other* layer times through [`EffectHost::self_at`] with zero
-//! preceding effects: like After Effects' Time effects they see the layer's source with its
-//! masks and ignore effects applied before them (precompose to include those). Without a host
-//! (tests, thumbnails) they pass their input through.
+//! These read the layer at *other* layer times through [`EffectHost::self_at`]: its source with
+//! its masks and the effects applied before them, as After Effects renders them (SceneYard:
+//! Echo after CC Particle Systems II echoes the fireworks, not the black solid under them;
+//! Posterize Time after Turbulent Displace steps the displacement). Without a host (tests,
+//! thumbnails) they pass their input through.
 //!
 //! Timewarp's Pixel Motion estimates block-matching optical flow between neighbouring frames
-//! ([`effectcraft_raster::flow`]); Pixel Motion Blur averages sub-frame samples.
+//! ([`effectcraft_raster::flow`]); Pixel Motion Blur averages synthesized sub-frame samples.
 //!
 //! [`EffectHost::self_at`]: crate::EffectHost::self_at
 
@@ -143,7 +144,7 @@ pub fn specs() -> Vec<EffectSpec> {
             ],
             wide_time,
         ),
-        spec(
+        checked_spec(
             "ec.time.pixelmotionblur",
             "Pixel Motion Blur",
             vec![
@@ -152,7 +153,7 @@ pub fn specs() -> Vec<EffectSpec> {
                 p("shutterSamples", "Shutter Samples", num(16.0), slider(1.0, 64.0, 1.0, 32.0, 0)),
                 p("vectorDetail", "Vector Detail", num(20.0), slider(0.0, 100.0, 0.0, 100.0, 1)),
             ],
-            pixel_motion_blur,
+            crate::timewarp::pmb_render_checked,
         ),
     ]
 }
@@ -173,7 +174,8 @@ fn fetch(ctx: &EffectCtx, times: &[f64]) -> Option<Frames> {
     let mut uniq: Vec<i64> = times.iter().map(|t| (t * 1e6).round() as i64).collect();
     uniq.sort_unstable();
     uniq.dedup();
-    let bufs: Vec<(i64, Option<Buf>)> = uniq.iter().map(|&k| (k, host.self_at(k as f64 / 1e6, 0))).collect();
+    // Every effect before this one (the host bounds the count to them).
+    let bufs: Vec<(i64, Option<Buf>)> = uniq.iter().map(|&k| (k, host.self_at(k as f64 / 1e6, usize::MAX))).collect();
     let first = bufs.iter().find_map(|(_, b)| b.as_ref())?;
     let scale = first.scale;
     // Union of every frame's extent in layer pixels (offset = where layer (0,0) sits).
@@ -586,6 +588,13 @@ fn smooth_flow(flow: &mut Flow, pm: &PixelMotion) {
 
 /// The motion field from frame `a` to frame `b` (or from the warp layer's frames).
 pub fn timewarp_flow(a: &Image, b: &Image, pm: &PixelMotion) -> Result<Flow, String> {
+    timewarp_flow_search(a, b, pm, 4)
+}
+
+/// [`timewarp_flow`] with an explicit coarse search radius: Timewarp's own resampling needs
+/// little (motion between adjacent source frames at near-100% speed), but Pixel Motion Blur
+/// must find fast full-frame displacements (#535).
+pub(super) fn timewarp_flow_search(a: &Image, b: &Image, pm: &PixelMotion, radius: i32) -> Result<Flow, String> {
     let ga = motion_grey(&crop_edges(a, pm.crops), pm.weights, 1.0);
     let gain = if pm.correct_luminance {
         let (ma, mb) = (mean_grey(&ga), mean_grey(&motion_grey(b, pm.weights, 1.0)));
@@ -606,7 +615,7 @@ pub fn timewarp_flow(a: &Image, b: &Image, pm: &PixelMotion) -> Result<Flow, Str
         return Err("Timewarp: non-finite luminance correction gain".into());
     }
     let gb = motion_grey(&crop_edges(b, pm.crops), pm.weights, gain);
-    let mut flow = effectcraft_raster::flow::block_flow_window_checked(&ga, &gb, pm.tile, pm.window, 4).map_err(|error| format!("Timewarp: {error}"))?;
+    let mut flow = effectcraft_raster::flow::block_flow_window_checked(&ga, &gb, pm.tile, pm.window, radius).map_err(|error| format!("Timewarp: {error}"))?;
     smooth_flow(&mut flow, pm);
     Ok(flow)
 }
@@ -754,14 +763,6 @@ fn wide_time(ctx: &EffectCtx, b: Buf) -> Buf {
     mean_of(ctx, b, &times)
 }
 
-fn pixel_motion_blur(ctx: &EffectCtx, b: Buf) -> Buf {
-    let angle = if ctx.params.e("shutterControl") == 1 { ctx.params.f("shutterAngle") } else { 180.0 };
-    let n = ctx.params.f("shutterSamples").round().clamp(1.0, 64.0) as usize;
-    let span = angle.clamp(0.0, 720.0) / 360.0 / ctx.fps();
-    let times: Vec<f64> = (0..n).map(|i| ctx.time - span * 0.5 + if n > 1 { span * i as f64 / (n - 1) as f64 } else { span * 0.5 }).collect();
-    mean_of(ctx, b, &times)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -844,6 +845,7 @@ mod tests {
     /// A layer whose every pixel at layer time `t` is grey `t` (clamped), alpha 1, on a 6×4 grid.
     struct Clock {
         static_layer: bool,
+        expected_effects: usize,
     }
     impl EffectHost for Clock {
         fn layer(&self, _: u64, _: bool) -> Option<LayerPixels> {
@@ -853,7 +855,7 @@ mod tests {
             None
         }
         fn self_at(&self, t: f64, effects: usize) -> Option<Buf> {
-            assert_eq!(effects, 0);
+            assert_eq!(effects, self.expected_effects);
             let v = if self.static_layer { 0.4 } else { t as f32 };
             Some(Buf { img: Image::filled(6, 4, [v, v, v, 1.0]), offset: [0.0; 2], scale: 1.0 })
         }
@@ -866,7 +868,7 @@ mod tests {
 
     #[test]
     fn posterize_time_holds_frames() {
-        let h = Clock { static_layer: false };
+        let h = Clock { static_layer: false, expected_effects: usize::MAX };
         for (t, held) in [(0.0, 0.0), (0.1, 0.0), (0.24, 0.0), (0.25, 0.25), (0.49, 0.25), (0.5, 0.5)] {
             let out = run("ec.time.posterizetime", &[("frameRate", num(4.0))], t, &h);
             assert!((out.img.data[0][0] - held).abs() < 1e-5, "t={t}: {}", out.img.data[0][0]);
@@ -875,7 +877,7 @@ mod tests {
 
     #[test]
     fn echo_blends_known_frames_with_decay() {
-        let h = Clock { static_layer: false };
+        let h = Clock { static_layer: false, expected_effects: usize::MAX };
         let vals = [("echoTime", num(-0.1)), ("numberOfEchoes", num(2.0)), ("startingIntensity", num(1.0)), ("decay", num(0.5))];
         let out = run("ec.time.echo", &vals, 0.8, &h);
         // Add: f(0.8) + 0.5 f(0.7) + 0.25 f(0.6)
@@ -895,11 +897,11 @@ mod tests {
 
     #[test]
     fn time_difference_of_static_layer_is_black() {
-        let h = Clock { static_layer: true };
+        let h = Clock { static_layer: true, expected_effects: usize::MAX };
         let out = run("ec.time.timedifference", &[("timeOffset", num(-0.5))], 1.0, &h);
         assert!(out.img.data.iter().all(|p| p[0] == 0.0 && p[1] == 0.0 && p[2] == 0.0 && p[3] == 1.0));
         // A changing layer is not black: |1.0 - 0.5| = 0.5.
-        let h = Clock { static_layer: false };
+        let h = Clock { static_layer: false, expected_effects: usize::MAX };
         let out = run("ec.time.timedifference", &[("timeOffset", num(-0.5))], 1.0, &h);
         assert!((out.img.data[0][0] - 0.5).abs() < 1e-5, "{}", out.img.data[0][0]);
     }
@@ -997,7 +999,7 @@ mod tests {
 
     #[test]
     fn timewarp_and_wide_time() {
-        let h = Clock { static_layer: false };
+        let h = Clock { static_layer: false, expected_effects: 0 };
         // Speed 50 % at t = 1 s shows source 0.5 s (frame-aligned at 10 fps).
         let out = run("ec.time.timewarp", &[("method", Value::Enum(0))], 1.0, &h);
         assert!((out.img.data[0][0] - 0.5).abs() < 1e-5);
@@ -1013,6 +1015,8 @@ mod tests {
         // Source Frame mode: frame 3 at 10 fps.
         let out = run("ec.time.timewarp", &[("method", Value::Enum(0)), ("adjustTimeBy", Value::Enum(1)), ("sourceFrame", num(3.0))], 2.0, &h);
         assert!((out.img.data[0][0] - 0.3).abs() < 1e-5);
+        // Shutter effects include preceding effects; native Timewarp above reads the source.
+        let h = Clock { static_layer: false, expected_effects: usize::MAX };
         // Wide Time is symmetric around t: mean of t-0.3..t+0.3 = t.
         let out = run("ec.time.ccwidetime", &[], 1.0, &h);
         assert!((out.img.data[0][0] - 1.0).abs() < 1e-4);
@@ -1027,7 +1031,7 @@ mod tests {
     #[test]
     fn time_displacement_uses_luma_as_offset() {
         // Static map from a bright self frame: luminance 1.0 → +max seconds.
-        let h = Clock { static_layer: true };
+        let h = Clock { static_layer: true, expected_effects: usize::MAX };
         let out = run("ec.time.timedisplacement", &[], 0.0, &h);
         assert!((out.img.data[0][0] - 0.4).abs() < 1e-5);
     }

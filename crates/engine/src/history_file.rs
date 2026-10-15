@@ -69,7 +69,11 @@ fn invalid(e: impl std::fmt::Display) -> EngineError {
 /// Current project plus its branching history. Old EffectCraft builds can read the current
 /// project, but ignore (and discard on saving) the optional `editHistory` extension.
 pub fn encode(project: &Arc<Project>, history: &History, compact: bool) -> Result<String> {
-    let text = project.to_file_json()?;
+    encode_with_view(project, history, compact, &effectcraft_project::SavedView::default())
+}
+
+pub fn encode_with_view(project: &Arc<Project>, history: &History, compact: bool, view: &effectcraft_project::SavedView) -> Result<String> {
+    let text = project.to_file_json_with_view(view)?;
     if history.undo.is_empty() && history.redo.is_empty() && history.branches.is_empty() {
         return if compact {
             let v: Value = serde_json::from_str(&text).map_err(invalid)?;

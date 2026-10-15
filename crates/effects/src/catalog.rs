@@ -136,9 +136,10 @@ pub fn effects_markdown() -> String {
         params
     ));
     s.push_str(&format!(
-        "- **GPU**: {gpu} effects also run on the GPU compositor with identical results.\n\
-         - **32**: {float} effects process 32-bit float (HDR, overbright) pixels without clamping.\n\
-         - **Status**: {} implemented in full, {partial} partial (what is missing is listed).\n\n",
+        "- **GPU**: {gpu} effects register a GPU implementation; CPU/GPU comparisons cover the tested cases.\n\
+         - **32**: {float} effects declare 32-bit float (HDR, overbright) support.\n\
+         - **Status**: {} registered implementations without a listed shortfall, {partial} partial. \
+         These registry counts do not measure complete After Effects compatibility.\n\n",
         r.len() - partial
     ));
     s.push_str("Effects are addressed by id (`ec.<category>.<name>`) or display name in commands, scripts and the control channel, and every parameter by its id (`effects/#1/blurriness`).\n\n");
