@@ -35,9 +35,9 @@ fn ms_rounded(rate: FrameRate, n: i64) -> Vec<u32> {
     (0..n).map(|k| u32::try_from(at(k + 1) - at(k)).expect("duration")).collect()
 }
 
-/// An H.264 MP4 (video track timescale 1000) with one frame per entry of `durations` (ms);
+/// An H.264 MP4 with one frame per duration (in `1 / timescale` seconds);
 /// frame k shows k in binary.
-fn write_movie(path: &Path, durations: &[u32]) {
+fn write_movie(path: &Path, durations: &[u32], timescale: u32) {
     let mut cfg = filmcraft_h264enc::EncoderConfig::new(W, H, 30, 1);
     cfg.format = filmcraft_h264enc::PacketFormat::LengthPrefixed;
     cfg.aud = false;
@@ -57,7 +57,7 @@ fn write_movie(path: &Path, durations: &[u32]) {
     let avcc = AvcConfig::parse(&enc.avcc()).expect("avcC");
     let file = std::fs::File::create(path).expect("create");
     let mut mux = Mp4Writer::new(file, WriterOptions::new(Brand::Mp4)).expect("mux");
-    let t = mux.add_track(TrackConfig::new(SampleEntry::avc(avcc, W as u16, H as u16), 1000)).expect("track");
+    let t = mux.add_track(TrackConfig::new(SampleEntry::avc(avcc, W as u16, H as u16), timescale)).expect("track");
     for (p, &duration) in packets.iter().zip(durations) {
         mux.write_sample(t, WriteSample { data: &p.data, duration, composition_offset: 0, is_sync: p.keyframe }).expect("sample");
     }
@@ -116,7 +116,7 @@ fn millisecond_rounded_footage_keeps_its_rate_through_comp_and_render() {
     let d = out_dir("ms_rounded");
     for (rate, frames) in [(FrameRate::FPS_30, 120), (FrameRate::FPS_60, 240)] {
         let path = d.join(format!("ms-{}.mp4", rate.num));
-        write_movie(&path, &ms_rounded(rate, frames));
+        write_movie(&path, &ms_rounded(rate, frames), 1000);
         let f = effectcraft_media::probe(&path).expect("probe");
         assert_eq!((f.frame_rate, frame_count(&f)), (rate, frames), "{rate:?} footage");
         let bytes: Arc<[u8]> = std::fs::read(&path).expect("read").into();
@@ -137,12 +137,31 @@ fn ntsc_and_variable_rate_footage_is_not_pulled_to_a_round_rate() {
     let d = out_dir("ms_rounded_controls");
     for rate in [FrameRate::FPS_23_976, FrameRate::FPS_29_97, FrameRate::FPS_59_94] {
         let path = d.join(format!("ms-{}.mp4", rate.num));
-        write_movie(&path, &ms_rounded(rate, 60));
+        write_movie(&path, &ms_rounded(rate, 60), 1000);
         assert_eq!(effectcraft_media::probe(&path).expect("probe").frame_rate, rate);
     }
     // Frames of 40, 45 and 50 ms: the reader's median (45 ms, 22.2 fps) stands.
     let path = d.join("variable.mp4");
-    write_movie(&path, &[40, 45, 50].repeat(20));
+    write_movie(&path, &[40, 45, 50].repeat(20), 1000);
     let f = effectcraft_media::probe(&path).expect("probe");
     assert!(!FrameRate::COMMON.contains(&f.frame_rate) && (f.frame_rate.as_f64() - 1000.0 / 45.0).abs() < 0.01, "{:?}", f.frame_rate);
+}
+
+#[test]
+fn constant_near_standard_rates_survive_import_comp_and_export() {
+    let directory = out_dir("constant_nonstandard_rates");
+    for (timescale, duration) in [(30_010, 1000), (1201, 10)] {
+        let rate = FrameRate::new(i64::from(timescale), i64::from(duration));
+        let path = directory.join(format!("exact-{timescale}.mp4"));
+        write_movie(&path, &[duration; 30], timescale);
+        let footage = effectcraft_media::probe(&path).expect("probe exact rate");
+        assert_eq!(footage.frame_rate, rate);
+        let bytes: Arc<[u8]> = std::fs::read(&path).expect("read exact rate").into();
+        assert_eq!(effectcraft_media::probe_bytes(&path.to_string_lossy(), bytes).expect("probe memory").frame_rate, rate);
+        let indices: Vec<u32> = (0..30).collect();
+        assert_eq!(frames_of(&footage), indices);
+        let rendered = comp_from_footage(&path, &directory.join(format!("render-{timescale}.mp4")));
+        assert_eq!((rendered.frame_rate, frame_count(&rendered)), (rate, 30));
+        assert_eq!(frames_of(&rendered), indices, "each source frame must survive exactly once");
+    }
 }

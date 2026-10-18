@@ -258,6 +258,10 @@ fn averaged_rate(timescale: u32, durations: impl Iterator<Item = u32>) -> Option
     let mut durs: Vec<u64> = durations.take(240).filter(|&d| d > 0).map(u64::from).collect();
     durs.sort_unstable();
     let median = *durs.get(durs.len() / 2)?;
+    // Identical durations already have an exact median; averaging cannot repair them.
+    if durs.first() == durs.last() {
+        return None;
+    }
     if FrameRate::COMMON.iter().any(|r| ts * i128::from(r.den) == i128::from(median) * i128::from(r.num)) {
         return None;
     }
@@ -308,6 +312,13 @@ mod tests {
         assert_eq!(averaged_rate(1000, [40, 45, 50].repeat(20).into_iter()), None);
         // A truly 30.3 fps clip is not pulled to 30 (1 % off).
         assert_eq!(averaged_rate(1000, [33; 30].into_iter()), None);
+    }
+
+    #[test]
+    fn constant_durations_near_common_rates_keep_the_readers_estimate() {
+        for (timescale, duration) in [(30_010, 1000), (1201, 10), (29_980, 1000)] {
+            assert_eq!(averaged_rate(timescale, [duration; 240].into_iter()), None, "{timescale}/{duration} is already exact");
+        }
     }
 
     #[test]

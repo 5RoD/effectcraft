@@ -256,6 +256,18 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
     }
     let rate = job.settings.rate(comp);
     let fmt = job.output.format;
+    let (Ok(rate_num), Ok(rate_den)) = (u32::try_from(rate.num), u32::try_from(rate.den)) else {
+        return Err(enc("movie frame rate must be a positive 32-bit rational"));
+    };
+    if rate_num == 0 || rate_den == 0 {
+        return Err(enc("movie frame rate must be a positive 32-bit rational"));
+    }
+    let brand = if matches!(fmt, OutputFormat::ProRes | OutputFormat::Uncompressed) { Brand::Mov } else { Brand::Mp4 };
+    let mut opts = WriterOptions::new(brand);
+    // Each frame must occupy whole movie ticks too, particularly the B-frame edit list.
+    // Retain at least the writer's default precision for the audio track's edits.
+    opts.movie_timescale =
+        rate_num.checked_mul(opts.movie_timescale.max(1).div_ceil(rate_num)).ok_or_else(|| enc("frame-aligned movie time scale is out of range"))?;
     let channels = match job.output.channels {
         Channels::Rgba if !matches!(fmt, OutputFormat::ProRes | OutputFormat::Uncompressed) => Channels::Rgb,
         c => c,
@@ -267,7 +279,6 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
         OutputFormat::Uncompressed => Box::new(crate::uncompressed::Raw::new(w, h, channels == Channels::Rgba)?),
         _ => Box::new(ProRes::new(w, h, job.output.prores_profile, if channels == Channels::Alpha { Channels::Rgb } else { channels })),
     };
-    let brand = if matches!(fmt, OutputFormat::ProRes | OutputFormat::Uncompressed) { Brand::Mov } else { Brand::Mp4 };
     let batch = batch_size();
     let render = |_: u64, img: effectcraft_raster::Image| -> Vec<u8> { job.pixels(&img, comp, channels, w, h) };
 
@@ -283,16 +294,18 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
 
     let path = job.place(job.path, 1);
     let mut file = job.create(&path)?;
-    let opts = WriterOptions::new(brand);
     let movie_ts = opts.movie_timescale.max(1) as i128;
     let mut mux: Writer = Mp4Writer::new(&mut file, opts).map_err(mux_err)?;
-    let mut vcfg = TrackConfig::new(venc.sample_entry(), rate.num as u32);
+    let mut vcfg = TrackConfig::new(venc.sample_entry(), rate_num);
     if let Some(start) = venc.media_start() {
         // An explicit edit: the convenience `media_start` edit would subtract the B-frame delay
         // from the media duration and drop the last frame.
-        let frames_ts = st.total as i128 * rate.den as i128;
-        let seg = (frames_ts * movie_ts + rate.num as i128 / 2) / rate.num as i128;
-        vcfg.edits = vec![filmcraft_isobmff::Edit { segment_duration: seg as u64, media_time: start, media_rate: 0x10000 }];
+        let frames_ts = i128::from(st.total).checked_mul(i128::from(rate_den)).ok_or_else(|| enc("movie frame duration overflow"))?;
+        let seg =
+            frames_ts.checked_mul(movie_ts).and_then(|value| value.checked_add(i128::from(rate_num) / 2)).ok_or_else(|| enc("movie edit duration overflow"))?
+                / i128::from(rate_num);
+        let segment_duration = u64::try_from(seg).map_err(|_| enc("movie edit duration is out of range"))?;
+        vcfg.edits = vec![filmcraft_isobmff::Edit { segment_duration, media_time: start, media_rate: 0x10000 }];
     }
     let vt = mux.add_track(vcfg).map_err(mux_err)?;
     let sr = job.output.audio_sample_rate.clamp(8_000, 192_000);
@@ -325,7 +338,7 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
 
     let write_video = |mux: &mut Writer, ps: Vec<Packet>| -> Result<()> {
         for p in ps {
-            mux.write_sample(vt, WriteSample { data: &p.data, duration: rate.den as u32, composition_offset: p.cto, is_sync: p.key }).map_err(mux_err)?;
+            mux.write_sample(vt, WriteSample { data: &p.data, duration: rate_den, composition_offset: p.cto, is_sync: p.key }).map_err(mux_err)?;
         }
         Ok(())
     };

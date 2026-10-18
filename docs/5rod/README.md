@@ -42,7 +42,10 @@ application and Desktop shortcut have not been removed or replaced.
   layer names. Merge reconciliation retains native counters, the existing 3D transform gizmo,
   streaming readers and decoder-applied rotation. Frame-rate correction reads bounded metadata
   only when the initial video rate is nonstandard; ordinary 60/120 fps recordings skip that
-  extra parse. Full repository validation is required before this integration is accepted.
+  extra parse. Constant sample durations retain their exact nonstandard rate. Full repository
+  validation is required before this integration is accepted.
+  Software movie exports also align movie time units to frame boundaries, preserving the exact
+  duration of B-frame edit lists at fractional rates when the result is reopened.
   Script socket writes use cancellable deadline waits when buffers fill, preserving partial
   byte counts and allowing close to interrupt a stalled peer on Windows.
 - Control responses use bounded buffered writes and flush each complete JSON line. Three
