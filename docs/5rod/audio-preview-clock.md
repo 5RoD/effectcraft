@@ -49,3 +49,19 @@ A synthetic regression covers repeated output rejection, release of the retained
 cleanup of a partially opened device. It uses no real audio device or native window. Execution
 of the full repository gate is required before this change is committed. No throughput,
 successful native launch or continuous audiovisual playback claim follows from this cleanup.
+
+## Nonblocking stop
+
+Native preview stop closes its sample queue, signals the feeder and signals the output worker.
+It does not join a decoder read or a driver's stream destructor on the UI thread. Late mixed
+blocks are discarded. A restarted output uses separate clock and latency storage, so callbacks
+from the previous stream cannot advance it. Already submitted device samples retain the
+device's buffering latency; this does not promise instant physical silence.
+
+Each native audio worker registry holds at most eight active or closing workers in fixed storage.
+Only completed threads are joined, before admitting another worker. Contention or eight stalled
+workers returns a recoverable busy error. No additional cleanup thread or render-pool job is
+created. Browser audio retains its UI-thread device lifecycle. Synthetic tests use gated reads,
+late callbacks, output rejection, full and contended registries, poisoning and worker panics.
+Repository validation and native playback acceptance remain required; this change does not
+remove the existing policy that holds audio when the every-frame preview encounters a cache miss.

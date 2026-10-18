@@ -9,15 +9,17 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
+use effectcraft_ui_egui::audio::workers::AudioWorkers;
 use effectcraft_ui_egui::audio::{AudioDevice, AudioFeed, AudioOutput};
 
 mod clock;
 use clock::PlaybackClock;
+
+static OUTPUTS: AudioWorkers = AudioWorkers::new();
 
 /// Device callback period: about 10 ms, clamped so Pulse/PipeWire/ALSA does not open a
 /// multi-hundred-millisecond default buffer that plays as silence at the start of preview (#554).
@@ -45,7 +47,7 @@ pub struct CpalOut {
     latency: Arc<AtomicU64>,
     clock: Arc<PlaybackClock>,
     stop: Option<mpsc::Sender<()>>,
-    thread: Option<JoinHandle<()>>,
+    feed: Option<Arc<AudioFeed>>,
 }
 
 /// Names of the output devices (Settings ▸ Audio).
@@ -80,14 +82,7 @@ pub fn open(out: &AudioOutput) -> Option<Box<dyn AudioDevice>> {
             .unwrap_or(false)
     };
     let rate = if out.rate > 0 && supports(out.rate) { out.rate } else { cfg.sample_rate().0 };
-    Some(Box::new(CpalOut {
-        out: out.clone(),
-        rate,
-        latency: Arc::new(AtomicU64::new(0)),
-        clock: Arc::new(PlaybackClock::new(rate)),
-        stop: None,
-        thread: None,
-    }))
+    Some(Box::new(CpalOut { out: out.clone(), rate, latency: Arc::new(AtomicU64::new(0)), clock: Arc::new(PlaybackClock::new(rate)), stop: None, feed: None }))
 }
 
 fn run<T: SizedSample + FromSample<f32>>(
@@ -156,78 +151,80 @@ impl AudioDevice for CpalOut {
         let rate = self.rate;
         let name = self.out.device.clone();
         let map = ((self.out.left.max(1) - 1) as usize, (self.out.right.max(1) - 1) as usize);
-        let thread = std::thread::Builder::new()
-            .name("ec-audio-out".into())
-            .spawn(move || {
-                let Some(dev) = device(&name) else {
-                    let _ = ready_tx.send(Err("no audio output device".into()));
+        let active_feed = feed.clone();
+        OUTPUTS.spawn("ec-audio-out", move || {
+            let Some(dev) = device(&name) else {
+                let _ = ready_tx.send(Err("no audio output device".into()));
+                return;
+            };
+            let sup = match dev.default_output_config() {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e.to_string()));
                     return;
-                };
-                let sup = match dev.default_output_config() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e.to_string()));
-                        return;
-                    }
-                };
-                let mut cfg: cpal::StreamConfig = sup.config();
-                cfg.sample_rate = cpal::SampleRate(rate);
-                // A short period only where the default one is long (ALSA/PulseAudio on Linux, #554),
-                // and only within what the device reports it takes.
-                if cfg!(target_os = "linux") {
-                    let want = preferred_buffer_frames(rate);
-                    cfg.buffer_size = match sup.buffer_size() {
-                        cpal::SupportedBufferSize::Range { min, max } if *min <= *max => cpal::BufferSize::Fixed(want.clamp(*min, *max)),
-                        _ => cpal::BufferSize::Default,
-                    };
                 }
-                let build = |cfg: &cpal::StreamConfig| match sup.sample_format() {
-                    cpal::SampleFormat::F32 => run::<f32>(&dev, cfg, feed.clone(), latency.clone(), clock.clone(), map),
-                    cpal::SampleFormat::I16 => run::<i16>(&dev, cfg, feed.clone(), latency.clone(), clock.clone(), map),
-                    cpal::SampleFormat::U16 => run::<u16>(&dev, cfg, feed.clone(), latency.clone(), clock.clone(), map),
-                    cpal::SampleFormat::I32 => run::<i32>(&dev, cfg, feed.clone(), latency.clone(), clock.clone(), map),
-                    f => Err(format!("unsupported sample format {f:?}")),
+            };
+            let mut cfg: cpal::StreamConfig = sup.config();
+            cfg.sample_rate = cpal::SampleRate(rate);
+            // A short period only where the default one is long (ALSA/PulseAudio on Linux, #554),
+            // and only within what the device reports it takes.
+            if cfg!(target_os = "linux") {
+                let want = preferred_buffer_frames(rate);
+                cfg.buffer_size = match sup.buffer_size() {
+                    cpal::SupportedBufferSize::Range { min, max } if *min <= *max => cpal::BufferSize::Fixed(want.clamp(*min, *max)),
+                    _ => cpal::BufferSize::Default,
                 };
-                let stream = match build(&cfg) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        // Some hosts reject a fixed period; a large default still plays, just later.
-                        cfg.buffer_size = cpal::BufferSize::Default;
-                        match build(&cfg) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                let _ = ready_tx.send(Err(e));
-                                return;
-                            }
+            }
+            let build = |cfg: &cpal::StreamConfig| match sup.sample_format() {
+                cpal::SampleFormat::F32 => run::<f32>(&dev, cfg, feed.clone(), latency.clone(), clock.clone(), map),
+                cpal::SampleFormat::I16 => run::<i16>(&dev, cfg, feed.clone(), latency.clone(), clock.clone(), map),
+                cpal::SampleFormat::U16 => run::<u16>(&dev, cfg, feed.clone(), latency.clone(), clock.clone(), map),
+                cpal::SampleFormat::I32 => run::<i32>(&dev, cfg, feed.clone(), latency.clone(), clock.clone(), map),
+                f => Err(format!("unsupported sample format {f:?}")),
+            };
+            let stream = match build(&cfg) {
+                Ok(s) => s,
+                Err(_) => {
+                    // Some hosts reject a fixed period; a large default still plays, just later.
+                    cfg.buffer_size = cpal::BufferSize::Default;
+                    match build(&cfg) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e));
+                            return;
                         }
                     }
-                };
-                let _ = ready_tx.send(Ok(()));
-                if !wait_to_play(&feed, &stop_rx) {
-                    return;
                 }
-                if let Err(e) = stream.play() {
-                    log::warn!("audio output: {e}");
-                    return;
-                }
-                let _ = stop_rx.recv();
-                drop(stream);
-            })
-            .map_err(|e| e.to_string())?;
+            };
+            let _ = ready_tx.send(Ok(()));
+            if !wait_to_play(&feed, &stop_rx) {
+                return;
+            }
+            if let Err(e) = stream.play() {
+                log::warn!("audio output: {e}");
+                return;
+            }
+            let _ = stop_rx.recv();
+            drop(stream);
+        })?;
         self.stop = Some(stop_tx);
-        self.thread = Some(thread);
+        self.feed = Some(active_feed);
         ready_rx.recv().map_err(|e| e.to_string())?
     }
 
     fn stop(&mut self) {
+        if let Some(feed) = self.feed.take() {
+            feed.close();
+        }
         if let Some(tx) = self.stop.take() {
             let _ = tx.send(());
+            // A late callback belongs to the old stream, including after this device restarts.
+            self.clock = Arc::new(PlaybackClock::new(self.rate));
+            self.latency = Arc::new(AtomicU64::new(0));
+        } else {
+            self.clock.clear();
+            self.latency.store(0, Ordering::Relaxed);
         }
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
-        self.clock.clear();
-        self.latency.store(0, Ordering::Relaxed);
     }
 
     fn latency_frames(&self) -> u64 {
@@ -248,6 +245,35 @@ impl Drop for CpalOut {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopping_output_silences_the_feed_and_isolates_late_callbacks() {
+        let feed = Arc::new(AudioFeed::default());
+        feed.push(&[0.5; 8]);
+        let (tx, rx) = mpsc::channel();
+        let mut output = CpalOut {
+            out: AudioOutput { device: String::new(), left: 1, right: 2, rate: 48_000 },
+            rate: 48_000,
+            latency: Arc::new(AtomicU64::new(480)),
+            clock: Arc::new(PlaybackClock::new(48_000)),
+            stop: Some(tx),
+            feed: Some(feed.clone()),
+        };
+        let previous_clock = output.clock.clone();
+        let previous_latency = output.latency.clone();
+        output.stop();
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let now = Instant::now();
+        previous_clock.record(now, now, 0, 480);
+        previous_latency.store(999, Ordering::Relaxed);
+        assert_eq!(output.played_frames(), None, "old callbacks cannot advance a stopped or restarted device");
+        assert_eq!(output.latency_frames(), 0);
+        feed.push(&[0.9; 8]);
+        let mut samples = [1.0; 8];
+        feed.pull(&mut samples);
+        assert_eq!(samples, [0.0; 8]);
+        assert_eq!(feed.queued_frames(), 0);
+    }
 
     #[test]
     fn preferred_buffer_is_about_ten_milliseconds() {

@@ -22,7 +22,11 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+
+pub mod workers;
+use workers::AudioWorkers;
+
+static FEEDERS: AudioWorkers = AudioWorkers::new();
 
 use effectcraft_engine::project::ItemId;
 use effectcraft_engine::time::{FrameRate, Tick};
@@ -36,6 +40,7 @@ pub trait AudioDevice: Send {
     /// Start pulling interleaved stereo frames from `feed` (see [`AudioFeed::pull`]).
     /// Return without waiting for samples: mixing begins once the output is ready.
     fn start(&mut self, feed: Arc<AudioFeed>) -> Result<(), String>;
+    /// Signal stop without waiting for slow decoder or device cleanup on the UI thread.
     fn stop(&mut self);
     /// Output latency in sample frames (device buffering), for A/V sync.
     fn latency_frames(&self) -> u64 {
@@ -82,11 +87,17 @@ pub struct AudioFeed {
     peak: [AtomicU32; 2],
     /// The feeder reached the end of a non-looping span.
     finished: AtomicBool,
+    /// A stopped preview never accepts late samples from its previous mixing operation.
+    closed: AtomicBool,
 }
 
 impl AudioFeed {
     /// Fill `out` (interleaved stereo) from the queue; silence where the queue runs dry.
     pub fn pull(&self, out: &mut [f32]) {
+        if self.closed.load(Ordering::Acquire) {
+            out.fill(0.0);
+            return;
+        }
         let mut real = 0usize;
         let mut pk = [0.0f32; 2];
         if let Ok(mut q) = self.queue.lock() {
@@ -115,9 +126,18 @@ impl AudioFeed {
     }
 
     pub fn push(&self, samples: &[f32]) {
-        if let Ok(mut q) = self.queue.lock() {
+        if let Ok(mut q) = self.queue.lock()
+            && !self.closed.load(Ordering::Acquire)
+        {
             q.extend(samples.iter().copied());
         }
+    }
+
+    /// Silence a stopped preview immediately; a blocked decoder may finish its last read later.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.clear();
+        self.finished.store(true, Ordering::Release);
     }
 
     /// Sample frames waiting in the queue.
@@ -187,7 +207,6 @@ pub struct AudioPlayback {
     pub feed: Arc<AudioFeed>,
     device: Box<dyn AudioDevice>,
     stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
     /// wasm32 (no threads): what the feeder thread would own, run by [`AudioPlayback::pump`].
     feeder: Option<(RenderSource, ItemId, i64, u32)>,
     pub rate: u32,
@@ -222,7 +241,7 @@ impl AudioPlayback {
         let stop = Arc::new(AtomicBool::new(false));
         if cfg!(target_arch = "wasm32") {
             // The device takes samples only in `pump`, which fills the queue first.
-            let mut p = AudioPlayback { feed: feed.clone(), device, stop, thread: None, feeder: Some((src, comp, span.start, mix)), rate, span };
+            let mut p = AudioPlayback { feed: feed.clone(), device, stop, feeder: Some((src, comp, span.start, mix)), rate, span };
             p.device.start(feed)?;
             p.pump();
             return Ok(p);
@@ -237,14 +256,20 @@ impl AudioPlayback {
         // first time opens it (a FLAC or MP3 file decodes whole), which froze the UI for as long
         // as that took (#408). The device plays silence until the first block arrives, and the
         // clock doesn't count it.
-        let thread = {
+        {
             let (feed, stop) = (feed.clone(), stop.clone());
-            std::thread::Builder::new()
-                .name("ec-audio-feed".into())
-                .spawn(move || {
+            FEEDERS
+                .spawn("ec-audio-feed", move || {
+                    struct Finish(Arc<AudioFeed>);
+                    impl Drop for Finish {
+                        fn drop(&mut self) {
+                            self.0.finished.store(true, Ordering::Release);
+                        }
+                    }
+                    let _finish = Finish(feed.clone());
                     let mut cursor = span.start;
                     let target = queue_target(rate);
-                    while !stop.load(Ordering::Relaxed) {
+                    while !stop.load(Ordering::Acquire) {
                         if feed.queued_frames() < target && !feed.finished.load(Ordering::Relaxed) {
                             cursor = feed_block(&src, comp, &feed, &span, cursor, rate, mix);
                         } else {
@@ -252,12 +277,9 @@ impl AudioPlayback {
                         }
                     }
                 })
-                .map_err(|e| {
-                    device.stop();
-                    e.to_string()
-                })?
+                .inspect_err(|_| device.stop())?
         };
-        Ok(AudioPlayback { feed, device, stop, thread: Some(thread), feeder: None, rate, span })
+        Ok(AudioPlayback { feed, device, stop, feeder: None, rate, span })
     }
 
     /// Every UI frame while playing: on wasm32 mix ahead into the feed (what the feeder thread
@@ -285,11 +307,10 @@ impl AudioPlayback {
     }
 
     pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.feed.close();
         self.device.stop();
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+        self.feeder = None;
     }
 }
 
@@ -383,6 +404,7 @@ impl AudioScrub {
 
 impl Drop for AudioScrub {
     fn drop(&mut self) {
+        self.feed.close();
         self.device.stop();
     }
 }
@@ -464,6 +486,31 @@ impl Meter {
 mod tests {
     use super::*;
 
+    fn audio_fixture(footage: Arc<dyn effectcraft_engine::render::FootageSource>) -> (RenderSource, ItemId) {
+        use effectcraft_engine::color::Label;
+        use effectcraft_engine::project::{Comp, Footage, FootageKind, ItemKind, LayerSource, Project, build};
+        use effectcraft_engine::render::cache::LayerCache;
+        let mut project = Project::default();
+        let media =
+            Footage { path: "synthetic.wav".into(), kind: FootageKind::Audio, duration: Tick::from_seconds_f64(600.0), has_audio: true, ..Default::default() };
+        let item = project.add_item("synthetic.wav", Label::SeaFoam, None, ItemKind::Footage(media));
+        let mut comp = Comp::new(64, 36, FrameRate::new(30, 1), Tick::from_seconds_f64(10.0));
+        comp.layers = vec![build::layer(&mut project, &comp, "synthetic.wav", LayerSource::Footage { item }, (0, 0), None)];
+        let cid = project.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.into()));
+        (
+            RenderSource {
+                project: Arc::new(project),
+                footage,
+                expr: None,
+                layer_cache: Arc::new(LayerCache::default()),
+                gpu: None,
+                gpu_display: false,
+                disk: None,
+            },
+            cid,
+        )
+    }
+
     #[test]
     fn clock_follows_consumed_frames_and_loops() {
         let span = PlaySpan { start: 4800, wa: 0, wb: 48000, looping: true };
@@ -516,6 +563,22 @@ mod tests {
     }
 
     #[test]
+    fn stopped_feed_never_accepts_late_mixer_samples() {
+        let feed = AudioFeed::default();
+        feed.push(&[0.5; 8]);
+        feed.close();
+        feed.push(&[0.9; 8]);
+        feed.clear();
+        feed.push(&[0.7; 8]);
+        let mut out = [1.0; 8];
+        feed.pull(&mut out);
+        assert_eq!(out, [0.0; 8]);
+        assert_eq!(feed.queued_frames(), 0);
+        assert_eq!(feed.consumed(), 0);
+        assert!(feed.finished());
+    }
+
+    #[test]
     fn device_timestamps_drive_preview_and_final_audio_drains_before_finishing() {
         struct Device(Option<u64>);
         impl AudioDevice for Device {
@@ -540,7 +603,6 @@ mod tests {
             feed,
             device: Box::new(Device(Some(1750))),
             stop: Arc::new(AtomicBool::new(false)),
-            thread: None,
             feeder: None,
             rate: 48_000,
             span: PlaySpan { start: 4800, wa: 0, wb: 48_000, looping: false },
@@ -561,10 +623,8 @@ mod tests {
     /// calling (UI) thread. The sound arrives from the feeder thread, and the clock waits for it.
     #[test]
     fn starting_audio_does_not_wait_for_slow_footage() {
-        use effectcraft_engine::color::Label;
-        use effectcraft_engine::project::{Comp, Footage, FootageKind, ItemKind, LayerSource, Project, build};
+        use effectcraft_engine::project::Footage;
         use effectcraft_engine::render::FootageSource;
-        use effectcraft_engine::render::cache::LayerCache;
         use std::time::{Duration, Instant};
 
         /// Footage audio that takes `delay` to read the first time (then a constant 0.5).
@@ -597,23 +657,7 @@ mod tests {
             fn stop(&mut self) {}
         }
 
-        let mut p = Project::default();
-        let footage =
-            Footage { path: "long.flac".into(), kind: FootageKind::Audio, duration: Tick::from_seconds_f64(600.0), has_audio: true, ..Default::default() };
-        let item = p.add_item("long.flac", Label::SeaFoam, None, ItemKind::Footage(footage));
-        let mut comp = Comp::new(64, 36, FrameRate::new(30, 1), Tick::from_seconds_f64(10.0));
-        let layer = build::layer(&mut p, &comp, "long.flac", LayerSource::Footage { item }, (0, 0), None);
-        comp.layers = vec![layer];
-        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.into()));
-        let src = RenderSource {
-            project: Arc::new(p),
-            footage: Arc::new(Slow { delay: Duration::from_secs(2), opened: Mutex::new(false) }),
-            expr: None,
-            layer_cache: Arc::new(LayerCache::default()),
-            gpu: None,
-            gpu_display: false,
-            disk: None,
-        };
+        let (src, cid) = audio_fixture(Arc::new(Slow { delay: Duration::from_secs(2), opened: Mutex::new(false) }));
         let t = Instant::now();
         let mut playback =
             AudioPlayback::start(Box::new(Device), src, cid, Tick::ZERO, Tick::ZERO, Tick::from_seconds_f64(10.0), true, 0).expect("the preview starts");
@@ -628,6 +672,62 @@ mod tests {
         playback.feed.pull(&mut out);
         assert_eq!(out, [0.5; 8]);
         playback.stop();
+    }
+
+    #[test]
+    fn stopping_audio_returns_before_a_blocked_decoder_and_discards_its_late_samples() {
+        use effectcraft_engine::project::Footage;
+        use effectcraft_engine::render::FootageSource;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        struct Blocked {
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl FootageSource for Blocked {
+            fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<effectcraft_engine::raster::Image>> {
+                None
+            }
+            fn audio(&self, _: ItemId, _: &Footage, _: Tick, frames: usize, _: u32) -> Option<Vec<f32>> {
+                self.entered.send(()).unwrap();
+                self.release.lock().unwrap().recv_timeout(Duration::from_secs(30)).unwrap();
+                Some(vec![0.5; frames * 2])
+            }
+        }
+        struct Device(Arc<AtomicBool>);
+        impl AudioDevice for Device {
+            fn sample_rate(&self) -> u32 {
+                48_000
+            }
+            fn start(&mut self, _: Arc<AudioFeed>) -> Result<(), String> {
+                Ok(())
+            }
+            fn stop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let source = Arc::new(Blocked { entered: entered_tx, release: Mutex::new(release_rx) });
+        let retained = Arc::downgrade(&source);
+        let (src, cid) = audio_fixture(source);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let mut playback =
+            AudioPlayback::start(Box::new(Device(stopped.clone())), src, cid, Tick::ZERO, Tick::ZERO, Tick::from_seconds_f64(10.0), true, 0).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        playback.stop();
+        assert!(stopped.load(Ordering::Relaxed));
+        assert!(retained.upgrade().is_some(), "stop returned while the decoder is still gated, rather than joining it");
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while retained.upgrade().is_some() {
+            assert!(Instant::now() < deadline, "stopped decoder retained its source");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(playback.feed.queued_frames(), 0);
+        let mut out = [1.0; 8];
+        playback.feed.pull(&mut out);
+        assert_eq!(out, [0.0; 8], "the final in-flight block cannot restart stopped sound");
     }
 
     #[test]
