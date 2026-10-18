@@ -36,3 +36,16 @@ bounded storage, invalid counts/timestamps, contention, lock poisoning, restart,
 work-area looping and draining the final buffer. Full repository and production performance
 validation are required before this clock change is accepted. Physical audiovisual output
 synchronization and subjective sound/image quality are not established by these tests.
+
+## Startup failure cleanup
+
+The native preview now opens its output before creating the audio feeder. Previously, an output
+error could return after the feeder started, leaving that worker running with its immutable
+project snapshot. A rejected output is explicitly stopped; failure to spawn the feeder also
+stops the already opened output. Mixing stays off the UI thread. Outputs must return without
+waiting for queued samples, as the existing audio-scrub and browser paths already require.
+
+A synthetic regression covers repeated output rejection, release of the retained project and
+cleanup of a partially opened device. It uses no real audio device or native window. Execution
+of the full repository gate is required before this change is committed. No throughput,
+successful native launch or continuous audiovisual playback claim follows from this cleanup.

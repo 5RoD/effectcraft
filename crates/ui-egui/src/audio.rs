@@ -34,6 +34,7 @@ pub trait AudioDevice: Send {
     /// Device sample rate in Hz.
     fn sample_rate(&self) -> u32;
     /// Start pulling interleaved stereo frames from `feed` (see [`AudioFeed::pull`]).
+    /// Return without waiting for samples: mixing begins once the output is ready.
     fn start(&mut self, feed: Arc<AudioFeed>) -> Result<(), String>;
     fn stop(&mut self);
     /// Output latency in sample frames (device buffering), for A/V sync.
@@ -226,6 +227,12 @@ impl AudioPlayback {
             p.pump();
             return Ok(p);
         }
+        // Open first: an output error must not leave a feeder running with the project snapshot.
+        // Like audio scrubbing, outputs return before samples arrive.
+        if let Err(e) = device.start(feed.clone()) {
+            device.stop();
+            return Err(e);
+        }
         // All mixing happens on the feeder thread, the first block too: reading footage for the
         // first time opens it (a FLAC or MP3 file decodes whole), which froze the UI for as long
         // as that took (#408). The device plays silence until the first block arrives, and the
@@ -245,9 +252,11 @@ impl AudioPlayback {
                         }
                     }
                 })
-                .map_err(|e| e.to_string())?
+                .map_err(|e| {
+                    device.stop();
+                    e.to_string()
+                })?
         };
-        device.start(feed.clone())?;
         Ok(AudioPlayback { feed, device, stop, thread: Some(thread), feeder: None, rate, span })
     }
 
@@ -619,6 +628,63 @@ mod tests {
         playback.feed.pull(&mut out);
         assert_eq!(out, [0.5; 8]);
         playback.stop();
+    }
+
+    #[test]
+    fn failed_audio_device_start_releases_project_without_leaking_a_feeder() {
+        use effectcraft_engine::project::Project;
+        use effectcraft_engine::render::{NoFootage, cache::LayerCache};
+        use std::sync::atomic::AtomicUsize;
+
+        struct Rejected {
+            feed: Arc<Mutex<Option<Arc<AudioFeed>>>>,
+            stops: Arc<AtomicUsize>,
+        }
+        impl AudioDevice for Rejected {
+            fn sample_rate(&self) -> u32 {
+                48_000
+            }
+            fn start(&mut self, feed: Arc<AudioFeed>) -> Result<(), String> {
+                *self.feed.lock().unwrap() = Some(feed);
+                Err("synthetic output unavailable".into())
+            }
+            fn stop(&mut self) {
+                *self.feed.lock().unwrap() = None;
+                self.stops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        // Repeated device failures must not accumulate workers or retained project snapshots.
+        for _ in 0..3 {
+            let project = Arc::new(Project::default());
+            let retained = Arc::downgrade(&project);
+            let src = RenderSource {
+                project,
+                footage: Arc::new(NoFootage),
+                expr: None,
+                layer_cache: Arc::new(LayerCache::default()),
+                gpu: None,
+                gpu_display: false,
+                disk: None,
+            };
+            let feed = Arc::new(Mutex::new(None));
+            let stops = Arc::new(AtomicUsize::new(0));
+            let error = AudioPlayback::start(
+                Box::new(Rejected { feed: feed.clone(), stops: stops.clone() }),
+                src,
+                ItemId(1),
+                Tick::ZERO,
+                Tick::ZERO,
+                Tick::from_seconds_f64(10.0),
+                true,
+                0,
+            )
+            .err();
+            assert_eq!(error.as_deref(), Some("synthetic output unavailable"));
+            assert!(retained.upgrade().is_none(), "a rejected preview retained its project in an orphan feeder");
+            assert!(feed.lock().unwrap().is_none(), "partially opened output was not stopped");
+            assert_eq!(stops.load(Ordering::Relaxed), 1);
+        }
     }
 
     #[test]
