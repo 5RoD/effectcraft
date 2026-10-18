@@ -7,12 +7,21 @@ of native tools, not a claim of complete Digit Fiddler, KeyFast, or Shake Sauce 
 ## Animation actions
 
 Select one or more layers and choose **Animation → Native Motion Tools → Animation Action…**.
-Choose Fade, Slide, Scale, or Rotate In/Out, a start and duration, easing, and optional overshoot.
+Choose Fade, Slide, Scale, Rotate, or Trim Paths In/Out, a start and duration, easing, and optional overshoot.
 Overshoot is available for Slide, Scale, and Rotate; opacity fades stay within their usual range.
 Slide uses the chosen X/Y/Z axis and pixel offset; Z requires a 3D layer. Scale's endpoint is a
 percentage of its original scale, and Rotation uses an angle offset. Incoming actions settle at
 the property's original value at the interval's end; outgoing actions begin at its original value
 at the interval's start.
+
+Trim Paths requires shape layers. It reuses the first Trim Paths operator in the
+layer's root Contents, adding one when missing. Trim In animates End from Start
+to its original endpoint; Trim Out animates End back to Start. Other controls,
+nested groups, and keys outside the chosen interval stay intact. Start's value
+is sampled at the hidden endpoint; enabled expressions on Start or End are
+rejected. Overshoot is unavailable for Trim. Operator creation and keyframes
+share the same undo step, and portable settings create the operator on a new
+destination layer too. Agents use `action: "trimIn"` or `"trimOut"`.
 
 Layer staggering follows Timeline order, top to bottom, or bottom to top when reversed. Start,
 duration, stagger, and overshoot times snap to composition frames, including fractional frame
@@ -124,6 +133,14 @@ choose Time, Value `60`, Use Layer Clock, Count Down, Clock Start `0`, and Clock
 Layer start time, stretch, and reverse affect clock progression and Value keyframes consistently.
 Number format can also use the layer clock for a constant-rate count.
 
+**Digit width** keeps current styling by default. **Tabular digits** requests the
+font's OpenType `tnum` feature; **Proportional digits** requests `pnum`. The choice
+applies to existing Source Text documents, style runs and styling keyframes in the
+same undo step as installation, and survives project save/reopen. The selected font
+must support the requested feature. This is not a font-independent fixed-width
+layout mode; prefixes, punctuation and the total number of digits can still alter
+the layer's width. You can change the setting later in Character → OpenType.
+
 Installing on multiple unlocked text layers is one undo step. Conflicting Source Text expressions
 (including disabled saved expressions), malformed text values, and duplicate counter rigs are
 rejected before any layer changes. Locked layers are skipped. Existing Source Text keys remain
@@ -137,7 +154,7 @@ the first Native Text Counter; the installer prevents creating that ambiguous se
 Agents install the rig with `text.nativeCounter` and optional `layers`, `layer`, `comp`, `value`,
 `format` (`number` or `time`), `decimals`, `padding`, `grouping` (`none`, `comma`, `period`, `space`),
 `prefix`, `suffix`, `currentTime`, `countDown`, `clockRate`, `clockStart`, and `timeStyle` (`hms`,
-`ms`, `seconds`). The response returns the layer, effect uid, Value uid, and its `@uid` property
+`ms`, `seconds`), and `figureWidth` (`preserve`, `tabular`, `proportional`). The response returns the layer, effect uid, Value uid, and its `@uid` property
 path, ready for `prop.set` and keyframe commands. Controls and the expression save in the project
 and branching undo history. The expression helper is an EffectCraft extension, not a portable
 After Effects script or a commercial plug-in.
@@ -242,7 +259,8 @@ locked layers in a mixed selection and creates one undo
 step for the editable pairs. An all-locked selection returns an unlock instruction without
 changing the project or history; read-only curve capture remains available. Native Action and
 Seeded Shake share portable parameters through `.ecpreset`, Apply Animation Preset and Recent
-Animation Presets. KeyFast-style Trim Paths macros and modifier shortcuts remain. No commercial
+Animation Presets. Native Trim Paths actions now cover layer-level draw-on/off;
+KeyFast-specific modifier shortcuts remain. No commercial
 preset pack is bundled. Deep Glow look/speed parity and Twixtor-quality optical-flow retiming
 need independent rendering implementations and measured validation; existing effect names do
 not prove those capabilities.

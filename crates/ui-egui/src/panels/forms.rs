@@ -130,7 +130,7 @@ fn action_field_enabled(action: Option<&str>, key: &str) -> bool {
         "axis" | "distance" => action.starts_with("slide"),
         "scalePercent" => action.starts_with("scale"),
         "angle" => action.starts_with("rotate"),
-        "overshoot" => !action.starts_with("fade"),
+        "overshoot" => action.starts_with("slide") || action.starts_with("scale") || action.starts_with("rotate"),
         _ => true,
     }
 }

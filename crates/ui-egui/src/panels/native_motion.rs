@@ -32,6 +32,8 @@ pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
                         ("Scale Out", json!("scaleOut")),
                         ("Rotate In", json!("rotateIn")),
                         ("Rotate Out", json!("rotateOut")),
+                        ("Trim Paths In", json!("trimIn")),
+                        ("Trim Paths Out", json!("trimOut")),
                     ],
                     0,
                 ),
@@ -47,7 +49,7 @@ pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
                 Field::choice("ease", "Easing curve", &names, selected),
                 Field::note(
                     "help",
-                    "Selected unlocked layers; one undo step. Replaces keys inside the interval. Save Settings reuses the parameters on another animation; Save Animation Preset stores absolute keys.",
+                    "Selected unlocked layers; one undo step. Trim requires shape layers and adds root Trim Paths if missing. Replaces keys inside the interval. Save Settings reuses parameters; Save Animation Preset stores absolute keys.",
                 ),
             ],
         )
@@ -109,6 +111,46 @@ mod tests {
     use crate::{Dialog, menus};
     use effectcraft_engine::Session;
     use egui_kittest::Harness;
+
+    #[test]
+    fn trim_action_form_omits_inapplicable_fields_and_applies_in_one_undo() {
+        use super::super::forms::FieldKind;
+        let mut session = Session::default();
+        session.execute("comp.new", json!({"width":64,"height":64,"duration":3})).unwrap();
+        let layer = session.execute("layer.newShape", json!({})).unwrap()["layer"].as_u64().unwrap();
+        let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| EffectcraftApp::new(session));
+        harness.run_steps(3);
+        let ctx = harness.ctx.clone();
+        menus::invoke(harness.state_mut(), &ctx, "anim.nativeAction", json!({})).unwrap();
+        for field in &mut harness.state_mut().dialog_state.form.fields {
+            if field.key == "action"
+                && let FieldKind::Choice { options, sel } = &mut field.kind
+            {
+                *sel = options.iter().position(|(_, value)| value == "trimIn").unwrap();
+            }
+            if field.key == "overshoot"
+                && let FieldKind::Number { value, .. } = &mut field.kind
+            {
+                *value = 20.0;
+            }
+        }
+        let form = harness.state().dialog_state.form.clone();
+        let params = form.params();
+        assert_eq!(params["action"], "trimIn");
+        for key in ["axis", "distance", "scalePercent", "angle", "overshoot"] {
+            assert!(params.get(key).is_none(), "inapplicable field: {key}");
+        }
+        let before = harness.state().session.project.clone();
+        let undo = harness.state().session.history.undo.len();
+        harness.state_mut().dialog = None;
+        harness.state_mut().session.execute_checked(&form.command, params).unwrap();
+        assert!(
+            harness.state().session.active_comp().unwrap().layer(effectcraft_engine::project::LayerId(layer)).unwrap().props.group("contents/trim").is_some()
+        );
+        assert_eq!(harness.state().session.history.undo.len(), undo + 1);
+        harness.state_mut().session.undo();
+        assert!(harness.state().session.project.same_content(&before));
+    }
 
     #[test]
     fn native_motion_dialogs_register_controls_and_apply_defaults() {

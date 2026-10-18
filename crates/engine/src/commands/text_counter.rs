@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use effectcraft_keyframe::Value as KV;
+use effectcraft_keyframe::{FigureWidth, Value as KV};
 use effectcraft_project::build::Ids;
 use effectcraft_project::{Expression, LayerSource};
 use serde_json::{Value, json};
@@ -52,6 +52,11 @@ fn affix(p: &Value, key: &str) -> Result<KV> {
 }
 
 fn install(s: &mut Session, p: &Value) -> Result<Value> {
+    let figure_width = match choice(p, "figureWidth", &["preserve", "tabular", "proportional"])? {
+        KV::Enum(1) => Some(FigureWidth::Tabular),
+        KV::Enum(2) => Some(FigureWidth::Proportional),
+        _ => None,
+    };
     let settings = [
         ("value", number(p, "value", 0.0, -1e15, 1e15, false)?),
         ("type", choice(p, "format", &["number", "time"])?),
@@ -118,8 +123,19 @@ fn install(s: &mut Session, p: &Value) -> Result<Value> {
             let uid = control.uid;
             let value_uid = control.get("value").map(|prop| prop.uid).ok_or_else(|| bad(COMMAND, "counter Value control is unavailable"))?;
             let layer = layer_mut(project, cid, *id)?;
-            layer.props.prop_mut("text/sourceText").ok_or_else(|| bad(COMMAND, "Source Text is unavailable"))?.expr =
-                Some(Expression { text: EXPRESSION.into(), enabled: true });
+            let source = layer.props.prop_mut("text/sourceText").ok_or_else(|| bad(COMMAND, "Source Text is unavailable"))?;
+            if let Some(width) = figure_width {
+                // Styling may itself have Source Text keys. Set the font feature on every
+                // saved document and run, retaining all other authored styling and times.
+                for value in std::iter::once(&mut source.value).chain(source.keys.iter_mut().map(|key| &mut key.value)) {
+                    let KV::Text(document) = value else { return Err(bad(COMMAND, "Source Text is malformed")) };
+                    document.opentype.figure_width = width;
+                    for run in &mut document.runs {
+                        run.style.opentype.figure_width = width;
+                    }
+                }
+            }
+            source.expr = Some(Expression { text: EXPRESSION.into(), enabled: true });
             layer.props.sub_mut("effects").ok_or_else(|| bad(COMMAND, "Effects group is unavailable"))?.children.push(control.into());
             project.next_id = next;
             selected.push((*id, value_uid));
@@ -150,7 +166,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Text Counter...",
         ["Animation", "Native Motion Tools"],
         None,
-        "{layers?,layer?,comp?,value?:number,format?:number|time,decimals?:0..10,padding?:0..32,grouping?:none|comma|period|space,prefix?:text,suffix?:text,currentTime?:bool,countDown?:bool,clockRate?:number,clockStart?:layer seconds,timeStyle?:hms|ms|seconds}",
+        "{layers?,layer?,comp?,value?:number,format?:number|time,decimals?:0..10,padding?:0..32,grouping?:none|comma|period|space,prefix?:text,suffix?:text,currentTime?:bool,countDown?:bool,clockRate?:number,clockStart?:layer seconds,timeStyle?:hms|ms|seconds,figureWidth?:preserve|tabular|proportional}",
         has_text_layers,
         install
     )]
@@ -201,6 +217,8 @@ mod tests {
             json!({"layer":first,"decimals":0.5}),
             json!({"layer":first,"value":1e300}),
             json!({"layer":first,"padding":33}),
+            json!({"layer":first,"figureWidth":true}),
+            json!({"layer":first,"figureWidth":"unknown"}),
             json!({"layer":first,"prefix":"😀".repeat(257)}),
         ] {
             assert!(s.execute(COMMAND, params).is_err());
@@ -225,5 +243,60 @@ mod tests {
         assert!(s.execute(COMMAND, json!({"layer":first})).is_err());
         assert!(s.project.same_content(&before));
         assert!(s.active_comp().unwrap().layer(effectcraft_project::LayerId(second)).unwrap().props.prop("text/sourceText").unwrap().expr.is_none());
+    }
+
+    #[test]
+    fn native_counter_digit_width_keeps_styled_source_keys_and_roundtrips_in_one_undo() {
+        use effectcraft_keyframe::Keyframe;
+        use effectcraft_time::Tick;
+        for (option, width) in [("preserve", None), ("tabular", Some(FigureWidth::Tabular)), ("proportional", Some(FigureWidth::Proportional))] {
+            let (mut s, layer) = session();
+            let cid = s.active_comp_id().unwrap();
+            let source = std::sync::Arc::make_mut(&mut s.project)
+                .comp_mut(cid)
+                .unwrap()
+                .layer_mut(effectcraft_project::LayerId(layer))
+                .unwrap()
+                .props
+                .prop_mut("text/sourceText")
+                .unwrap();
+            let KV::Text(document) = &mut source.value else { panic!("expected text") };
+            document.opentype.figure_width = FigureWidth::Proportional;
+            document.apply_style(0..1, |style| {
+                style.fill = [0.2, 0.6, 0.9, 1.0];
+                style.opentype.figure_width = FigureWidth::Default;
+            });
+            let mut animated = document.clone();
+            animated.size = 81.0;
+            source.keys = vec![Keyframe::new(Tick::from_seconds_f64(1.25), KV::Text(animated))];
+            let before = s.project.clone();
+            let undo = s.history.undo.len();
+            s.execute(COMMAND, json!({"layer":layer,"figureWidth":option})).unwrap();
+            assert_eq!(s.history.undo.len(), undo + 1);
+            let old = before.comp(cid).unwrap().layer(effectcraft_project::LayerId(layer)).unwrap().props.prop("text/sourceText").unwrap();
+            let actual = s.active_comp().unwrap().layer(effectcraft_project::LayerId(layer)).unwrap().props.prop("text/sourceText").unwrap();
+            let adapt = |value: &KV| {
+                let KV::Text(document) = value else { panic!("expected text") };
+                let mut document = document.clone();
+                if let Some(width) = width {
+                    document.opentype.figure_width = width;
+                    for run in &mut document.runs {
+                        run.style.opentype.figure_width = width;
+                    }
+                }
+                KV::Text(document)
+            };
+            assert_eq!(actual.value, adapt(&old.value));
+            let mut keys = old.keys.clone();
+            for key in &mut keys {
+                key.value = adapt(&key.value);
+            }
+            assert_eq!(actual.keys, keys);
+            let bytes = serde_json::to_vec(&*s.project).unwrap();
+            let loaded: effectcraft_project::Project = serde_json::from_slice(&bytes).unwrap();
+            assert!(loaded.same_content(&s.project));
+            s.undo();
+            assert!(s.project.same_content(&before));
+        }
     }
 }

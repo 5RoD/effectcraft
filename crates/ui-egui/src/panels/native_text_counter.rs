@@ -27,6 +27,16 @@ pub fn open_form(app: &mut EffectcraftApp, id: &str, params: &Value) -> bool {
             ),
             Field::text("prefix", "Prefix", ""),
             Field::text("suffix", "Suffix", ""),
+            Field::choice(
+                "figureWidth",
+                "Digit width",
+                &[
+                    ("Keep current styling", json!("preserve")),
+                    ("Tabular digits (font support required)", json!("tabular")),
+                    ("Proportional digits", json!("proportional")),
+                ],
+                0,
+            ),
             Field::bool("currentTime", "Use layer clock", false),
             Field::bool("countDown", "Count down (layer clock)", false),
             Field::num("clockRate", "Clock rate", 1.0),
@@ -60,10 +70,11 @@ mod tests {
         assert!(matches!(harness.state().dialog, Some(Dialog::Form)));
         harness.run_steps(3);
         let ids: Vec<&str> = harness.state().auto.previous.iter().chain(harness.state().auto.elements.iter()).map(|element| element.id.as_str()).collect();
-        for id in ["form.field.value", "form.field.format", "form.field.prefix", "form.field.suffix", "form.ok", "form.cancel"] {
+        for id in ["form.field.value", "form.field.format", "form.field.prefix", "form.field.suffix", "form.field.figureWidth", "form.ok", "form.cancel"] {
             assert!(ids.contains(&id), "missing {id}");
         }
         let form = harness.state().dialog_state.form.clone();
+        assert_eq!(form.params()["figureWidth"], "preserve");
         let count = harness.state().session.history.undo.len();
         harness.state_mut().dialog = None;
         harness.state_mut().session.execute_checked(&form.command, form.params()).unwrap();

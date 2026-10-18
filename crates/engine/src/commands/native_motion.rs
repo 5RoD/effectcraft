@@ -1,7 +1,7 @@
 //! Original animation and shake actions, stored as ordinary editable keyframes.
 
 use effectcraft_keyframe::{EaseCurve, Keyframe, Value as KV, set_key};
-use effectcraft_project::{Layer, Property, Uid};
+use effectcraft_project::{Layer, LayerSource, Project, Property, Uid, build};
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
@@ -84,10 +84,13 @@ struct Edit {
     keys: Vec<Keyframe>,
 }
 
-fn commit(s: &mut Session, cid: effectcraft_project::ItemId, label: &str, edits: Vec<Edit>) -> Result<Value> {
+fn commit(s: &mut Session, cid: effectcraft_project::ItemId, label: &str, edits: Vec<Edit>, prepared: Option<Project>) -> Result<Value> {
     let count: usize = edits.iter().map(|e| e.keys.len()).sum();
     let properties = edits.len();
     s.edit(label, None, |project, state| {
+        if let Some(prepared) = prepared {
+            *project = prepared;
+        }
         state.selected_keys.clear();
         state.selected_props.clear();
         for edit in edits {
@@ -132,7 +135,9 @@ fn action_settings<'a>(s: &Session, p: &'a Value) -> Result<ActionSettings<'a>> 
         "scaleOut" => ("transform/scale", true),
         "rotateIn" => ("transform/rotation", false),
         "rotateOut" => ("transform/rotation", true),
-        _ => return Err(bad(ACTION, "action: fadeIn|fadeOut|slideIn|slideOut|scaleIn|scaleOut|rotateIn|rotateOut")),
+        "trimIn" => ("contents/trim/end", false),
+        "trimOut" => ("contents/trim/end", true),
+        _ => return Err(bad(ACTION, "action: fadeIn|fadeOut|slideIn|slideOut|scaleIn|scaleOut|rotateIn|rotateOut|trimIn|trimOut")),
     };
     let axis = match str_p(p, "axis").unwrap_or("y") {
         "x" => 0,
@@ -151,7 +156,7 @@ fn action_settings<'a>(s: &Session, p: &'a Value) -> Result<ActionSettings<'a>> 
     };
     let amount = number(p, "amount", default_amount, -10_000.0, 10_000.0, ACTION)?;
     let overshoot = number(p, "overshoot", 0.0, 0.0, 100.0, ACTION)?;
-    if overshoot > 0.0 && action.starts_with("fade") {
+    if overshoot > 0.0 && (action.starts_with("fade") || action.starts_with("trim")) {
         return Err(bad(ACTION, "overshoot is available for Slide, Scale, and Rotate actions"));
     }
     let reverse = boolean(p, "reverse", ACTION)?;
@@ -161,6 +166,29 @@ fn action_settings<'a>(s: &Session, p: &'a Value) -> Result<ActionSettings<'a>> 
         crate::ease_presets::find(s, str_p(p, "ease").unwrap_or("Ease In-Out")).ok_or_else(|| bad(ACTION, "unknown easing preset"))?
     };
     Ok(ActionSettings { action, path, out, axis, duration, stagger, start, distance, amount, overshoot, reverse, curve })
+}
+
+/// Create missing root Trim Paths on a private draft. Planning failures must not publish
+/// a shape item, consume document ids or add an undo step.
+fn trim_project(s: &Session, cid: effectcraft_project::ItemId, selected: &std::collections::BTreeSet<effectcraft_project::LayerId>) -> Result<Project> {
+    let mut project = (*s.project).clone();
+    let mut next = project.next_id;
+    let comp = project.comp_mut(cid).ok_or(EngineError::NoComp)?;
+    for layer in comp.layers.iter_mut().filter(|layer| selected.contains(&layer.id)) {
+        if !matches!(layer.source, LayerSource::Shape) {
+            return Err(bad(ACTION, "Trim Paths actions require shape layers"));
+        }
+        let contents = layer.props.sub_mut("contents").ok_or_else(|| bad(ACTION, "the shape layer has no Contents group"))?;
+        if contents.sub("trim").is_none() {
+            // One group and four fixed controls; check the id budget before the builder.
+            next.checked_add(5)
+                .filter(|end| *end < effectcraft_project::MAX_DOCUMENT_ID)
+                .ok_or_else(|| bad(ACTION, "project property id space is exhausted"))?;
+            contents.children.push(build::shape_trim(&mut build::Ids(&mut next), 0.0, 100.0, 0.0).into());
+        }
+    }
+    project.next_id = next;
+    Ok(project)
 }
 
 fn action(s: &mut Session, p: &Value) -> Result<Value> {
@@ -178,6 +206,9 @@ fn action(s: &mut Session, p: &Value) -> Result<Value> {
     if ids.len().saturating_mul(3) > MAX_KEYS {
         return Err(bad(ACTION, "too many layers in one action"));
     }
+    let prepared = if action.starts_with("trim") { Some(trim_project(s, cid, &selected)?) } else { None };
+    let project = prepared.as_ref().unwrap_or(s.project.as_ref());
+    let comp = project.comp(cid).ok_or(EngineError::NoComp)?;
     let mut edits = vec![];
     for (index, id) in ids.iter().enumerate() {
         let layer = comp.layer(*id).ok_or_else(|| bad(ACTION, "missing layer"))?;
@@ -210,6 +241,12 @@ fn action(s: &mut Session, p: &Value) -> Result<Value> {
             validate_value(&base, ACTION)?;
             let other = if action.starts_with("fade") {
                 KV::Scalar(0.0)
+            } else if action.starts_with("trim") {
+                let start = checked_property(layer, "contents/trim/start", ACTION)?;
+                let KV::Scalar(value) = start.value_at(if out { lt1 } else { lt0 }) else {
+                    return Err(bad(ACTION, "a Trim Paths Start keyframe has the wrong value type"));
+                };
+                KV::Scalar(value)
             } else if action.starts_with("slide") {
                 delta(&base, dimension, distance, ACTION)?
             } else if action.starts_with("scale") {
@@ -256,9 +293,11 @@ fn action(s: &mut Session, p: &Value) -> Result<Value> {
         "scaleIn" => "Native Scale In",
         "scaleOut" => "Native Scale Out",
         "rotateIn" => "Native Rotate In",
+        "trimIn" => "Native Trim Paths In",
+        "trimOut" => "Native Trim Paths Out",
         _ => "Native Rotate Out",
     };
-    commit(s, cid, label, edits)
+    commit(s, cid, label, edits, prepared)
 }
 
 fn hash(mut n: u64) -> u64 {
@@ -392,7 +431,7 @@ fn shake(s: &mut Session, p: &Value) -> Result<Value> {
     if edits.is_empty() {
         return Err(bad(SHAKE, "set at least one nonzero shake amplitude"));
     }
-    commit(s, cid, "Native Seeded Shake", edits)
+    commit(s, cid, "Native Seeded Shake", edits, None)
 }
 
 // Portable settings reuse the existing native handlers; this is not command replay.
@@ -584,7 +623,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Animation Action...",
             ["Animation", "Native Motion Tools"],
             None,
-            "{layers?, layer?, comp?, action?:fadeIn|fadeOut|slideIn|slideOut|scaleIn|scaleOut|rotateIn|rotateOut, time?:seconds, duration?:seconds, stagger?:seconds, reverse?:bool, axis?:x|y|z, distance?:pixels, amount?:number, angle?:degrees, scalePercent?:percent, overshoot?:percent, ease?:name, curve?:EaseCurve}",
+            "{layers?, layer?, comp?, action?:fadeIn|fadeOut|slideIn|slideOut|scaleIn|scaleOut|rotateIn|rotateOut|trimIn|trimOut, time?:seconds, duration?:seconds, stagger?:seconds, reverse?:bool, axis?:x|y|z, distance?:pixels, amount?:number, angle?:degrees, scalePercent?:percent, overshoot?:percent, ease?:name, curve?:EaseCurve}",
             has_layers,
             action
         ),
@@ -604,6 +643,93 @@ pub fn specs() -> Vec<CommandSpec> {
 mod tests {
     use super::*;
     use crate::tests_timeline::{animate, prop, setup};
+
+    fn shape_session() -> (Session, u64) {
+        let mut session = Session::default();
+        session.execute("comp.new", json!({"width":64,"height":64,"duration":5})).unwrap();
+        let layer = session.execute("layer.newShape", json!({"kind":"rect","size":[32,32]})).unwrap()["layer"].as_u64().unwrap();
+        (session, layer)
+    }
+
+    #[test]
+    fn native_trim_adds_an_operator_renders_and_roundtrips_in_one_undo() {
+        use effectcraft_render::{Backend, NoFootage, RenderOpts, Renderer};
+        let (mut s, layer) = shape_session();
+        let before = s.project.clone();
+        let undo = s.history.undo.len();
+        s.execute(ACTION, json!({"layer":layer,"action":"trimIn","duration":1,"ease":"Linear"})).unwrap();
+        assert_eq!(s.history.undo.len(), undo + 1);
+        let end = prop(&s, layer, "contents/trim/end");
+        assert_eq!(end.keys.len(), 2);
+        assert_eq!(end.keys[0].value, KV::Scalar(0.0));
+        assert_eq!(end.keys[1].value, KV::Scalar(100.0));
+        let cid = s.active_comp_id().unwrap();
+        let renderer = Renderer::new(&s.project, &NoFootage, effectcraft_render::RenderOpts { backend: Backend::Cpu, ..RenderOpts::default() });
+        let hidden = renderer.comp_frame_checked(cid, Tick::ZERO).unwrap();
+        let visible = renderer.comp_frame_checked(cid, Tick::from_seconds_f64(1.0)).unwrap();
+        assert!(hidden.data.iter().all(|pixel| pixel[3] == 0.0));
+        assert!(visible.data.iter().any(|pixel| pixel[3] > 0.5));
+        let reopened = Project::from_json(&s.project.to_file_json().unwrap()).unwrap();
+        assert!(reopened.same_content(&s.project));
+        s.undo();
+        assert!(s.project.same_content(&before));
+    }
+
+    #[test]
+    fn native_trim_reuses_existing_start_skips_locks_and_preserves_outside_keys() {
+        let (mut s, layer) = shape_session();
+        s.execute("layer.addShapeItem", json!({"layer":layer,"kind":"trim"})).unwrap();
+        s.execute("prop.set", json!({"layer":layer,"path":"contents/trim/start","value":25})).unwrap();
+        animate(&mut s, layer, "contents/trim/end", &[(2.0, json!(80)), (4.0, json!(60))]);
+        let locked = s.execute("layer.newShape", json!({})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("layer.setSwitch", json!({"layer":locked,"switch":"locked","value":true})).unwrap();
+        for (action, first, last) in [("trimIn", 25.0, 80.0), ("trimOut", 80.0, 25.0)] {
+            let before = s.project.clone();
+            let undo = s.history.undo.len();
+            s.execute(ACTION, json!({"layers":[layer,locked],"action":action,"duration":1})).unwrap();
+            let end = prop(&s, layer, "contents/trim/end");
+            assert_eq!(end.keys.len(), 4);
+            assert_eq!(end.keys[0].value, KV::Scalar(first));
+            assert_eq!(end.keys[1].value, KV::Scalar(last));
+            assert_eq!(end.keys[2].value, KV::Scalar(80.0));
+            assert_eq!(end.keys[3].value, KV::Scalar(60.0));
+            let comp = s.active_comp().unwrap();
+            let contents = comp.layer(effectcraft_project::LayerId(layer)).unwrap().props.sub("contents").unwrap();
+            assert_eq!(contents.groups().filter(|group| group.match_id == "trim").count(), 1);
+            assert!(comp.layer(effectcraft_project::LayerId(locked)).unwrap().props.group("contents/trim").is_none());
+            assert_eq!(s.history.undo.len(), undo + 1);
+            s.undo();
+            assert!(s.project.same_content(&before));
+        }
+    }
+
+    #[test]
+    fn invalid_trim_plans_never_publish_shape_items_or_consume_ids() {
+        for case in ["mixed", "range", "overshoot", "ids", "expression"] {
+            let (mut s, layer) = shape_session();
+            let mut params = json!({"layer":layer,"action":"trimIn","duration":1});
+            match case {
+                "mixed" => {
+                    let non_shape_layer = s.execute("layer.newNull", json!({})).unwrap()["layer"].as_u64().unwrap();
+                    params = json!({"layers":[layer,non_shape_layer],"action":"trimIn","duration":1});
+                }
+                "range" => params["time"] = json!(5),
+                "overshoot" => params["overshoot"] = json!(20),
+                "ids" => std::sync::Arc::make_mut(&mut s.project).next_id = u64::MAX,
+                "expression" => {
+                    s.execute("layer.addShapeItem", json!({"layer":layer,"kind":"trim"})).unwrap();
+                    s.execute("prop.setExpression", json!({"layer":layer,"path":"contents/trim/start","expression":"value"})).unwrap();
+                }
+                _ => {}
+            }
+            let before = s.project.clone();
+            let undo = s.history.undo.len();
+            assert!(s.execute(ACTION, params).is_err(), "{case}");
+            assert!(s.project.same_content(&before), "{case}");
+            assert_eq!(s.project.next_id, before.next_id, "{case}");
+            assert_eq!(s.history.undo.len(), undo, "{case}");
+        }
+    }
 
     #[test]
     fn batch_stagger_locked_reverse_and_undo() {
@@ -732,6 +858,30 @@ mod native_preset_tests {
 
     fn load(s: &Session, path: &std::path::Path) -> Value {
         serde_json::from_slice(&s.services.read_file(path.to_str().unwrap()).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn trim_settings_presets_create_missing_operators_at_the_destination_playhead() {
+        let (mut s, _, path) = fixture("trim");
+        let target = s.execute("layer.newShape", json!({})).unwrap()["layer"].as_u64().unwrap();
+        let before = s.project.clone();
+        let undo = s.history.undo.len();
+        s.execute(SAVE_SETTINGS, json!({"path":path,"command":ACTION,"settings":{"action":"trimIn","duration":1,"ease":"Linear"}})).unwrap();
+        assert!(s.project.same_content(&before));
+        assert_eq!(s.history.undo.len(), undo);
+        assert_eq!(load(&s, &path)["nativeMotion"]["settings"]["action"], "trimIn");
+        s.execute("anim.applyPreset", json!({"path":path,"layer":target})).unwrap();
+        let layer = s.active_comp().unwrap().layer(LayerId(target)).unwrap();
+        let end = layer.props.prop("contents/trim/end").unwrap();
+        assert_eq!(end.keys.len(), 2);
+        assert_eq!(end.keys[0].time, layer.layer_time(Tick::from_seconds_f64(1.0)));
+        assert_eq!(end.keys[1].time, layer.layer_time(Tick::from_seconds_f64(2.0)));
+        assert_eq!(end.keys[0].value, KV::Scalar(0.0));
+        assert_eq!(end.keys[1].value, KV::Scalar(100.0));
+        assert_eq!(s.history.undo.len(), undo + 1);
+        s.undo();
+        assert!(s.project.same_content(&before));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
