@@ -362,6 +362,7 @@ fn retime_effect(group: &mut PropGroup, scale: f64, cmd: &str, mut time: impl Fn
         if result.is_err() {
             return;
         }
+        let spatial = pr.spatial;
         for key in &mut pr.keys {
             let mapped = time(key.time).and_then(|t| {
                 if !scale.is_finite() || scale == 0.0 {
@@ -369,7 +370,7 @@ fn retime_effect(group: &mut PropGroup, scale: f64, cmd: &str, mut time: impl Fn
                 }
                 // Spatial paths and non-numeric values ease along positive progress;
                 // numeric components instead store a signed value derivative.
-                let speed_scale = if pr.spatial || key.value.dims() == 0 { scale.abs() } else { scale };
+                let speed_scale = if spatial || key.value.dims() == 0 { scale.abs() } else { scale };
                 for ease in key.in_ease.iter_mut().chain(&mut key.out_ease) {
                     ease.speed /= speed_scale;
                     if !ease.speed.is_finite() {

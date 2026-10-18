@@ -102,7 +102,8 @@ fn transform(s: &mut Session, p: &Value) -> Result<Value> {
             kept.extend(moved);
             kept.sort_by_key(|k| k.time);
             pr.keys = kept;
-            effectcraft_keyframe::retime_roving(&mut pr.keys, pr.spatial);
+            let spatial = pr.spatial;
+            effectcraft_keyframe::retime_roving(&mut pr.keys, spatial);
         }
         st.selected_keys = new_sel;
         Ok(json!({"keys": st.selected_keys.len()}))

@@ -58,8 +58,9 @@ fn find_preset(want: &str) -> Option<Value> {
 /// seconds from `at`). Returns false when nothing in the request fits the property.
 fn set_prop(pr: &mut Property, v: Option<&Value>, keys: Option<&Value>, at: Tick, ease: bool, size: [f64; 2]) -> bool {
     // Point parameters are written as fractions of the layer size.
+    let point = matches!(pr.ui, ParamUi::Point);
     let scale = |val: KV| match val {
-        KV::Vec2(f) if matches!(pr.ui, ParamUi::Point) => KV::Vec2([f[0] * size[0], f[1] * size[1]]),
+        KV::Vec2(f) if point => KV::Vec2([f[0] * size[0], f[1] * size[1]]),
         other => other,
     };
     let mut ok = true;

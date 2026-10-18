@@ -594,7 +594,7 @@ mod tests {
         let r = s.execute("prop.setExpression", json!({"layer": a, "path": "transform/opacity", "expression": "1 +* ("})).unwrap();
         assert!(r["error"].is_string(), "{r}");
         let pr = s.active_comp().unwrap().layers[0].props.prop("transform/opacity").unwrap().clone();
-        assert!(!pr.expr.unwrap().enabled);
+        assert!(!pr.expr.as_ref().unwrap().enabled);
         assert_eq!(value(&s, a, "transform/opacity").as_f64(), 100.0);
         s.execute("prop.setExpression", json!({"layer": a, "path": "transform/opacity", "expression": "50"})).unwrap();
         assert_eq!(value(&s, a, "transform/opacity").as_f64(), 50.0);

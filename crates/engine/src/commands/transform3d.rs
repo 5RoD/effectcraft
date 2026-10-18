@@ -209,8 +209,8 @@ mod tests {
             session.execute("prop.addKey", json!({"layer":a,"path":"transform/positionX","time":time,"value":time*10.})).unwrap();
             session.execute("prop.addKey", json!({"layer":b,"path":"transform/scale","time":time,"value":[100,100,100]})).unwrap();
         }
-        let old_position = property(&session, a, "transform/positionX").keys;
-        let old_scale = property(&session, b, "transform/scale").keys;
+        let old_position = property(&session, a, "transform/positionX").into_data().keys;
+        let old_scale = property(&session, b, "transform/scale").into_data().keys;
         session.execute("layer.timeStretch", json!({"layer":b,"percent":200})).unwrap();
         session.execute(ID, json!({"time":1.,"changes":[{"layer":a,"position":[11,22,33]},{"layer":b,"scale":[150,160,170]}]})).unwrap();
         let position = property(&session, a, "transform/positionX");

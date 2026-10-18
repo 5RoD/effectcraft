@@ -922,7 +922,8 @@ pub(crate) fn edit_keys(s: &mut Session, label: &str, merge: Option<&str>, f: im
             // Resolve exact stored indices before roving changes their times. Deleted or
             // stale references cannot select a neighbouring key.
             let tracked: Vec<(Tick, usize)> = targets.into_iter().filter_map(|(at, old)| key_at(&pr.keys, at).map(|i| (old, i))).collect();
-            effectcraft_keyframe::retime_roving(&mut pr.keys, pr.spatial);
+            let spatial = pr.spatial;
+            effectcraft_keyframe::retime_roving(&mut pr.keys, spatial);
             for (old, i) in tracked {
                 if let Some(key) = pr.keys.get(i) {
                     remapped.insert(KeyRef { layer: lid, prop: uid, time: old }, KeyRef { layer: lid, prop: uid, time: key.time });
@@ -990,7 +991,8 @@ pub(crate) fn move_key_refs(comp: &mut effectcraft_project::Comp, from: &[KeyRef
         }
         // Resolve stored indices before roving keys change their times.
         let tracked: Vec<(Tick, usize)> = targets.into_iter().filter_map(|(t, old)| key_at(&pr.keys, t).map(|i| (old, i))).collect();
-        effectcraft_keyframe::retime_roving(&mut pr.keys, pr.spatial);
+        let spatial = pr.spatial;
+        effectcraft_keyframe::retime_roving(&mut pr.keys, spatial);
         for (old, i) in tracked {
             if let Some(key) = pr.keys.get(i) {
                 remapped.insert(at(old), at(key.time));

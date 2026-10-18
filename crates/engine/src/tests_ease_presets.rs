@@ -214,13 +214,13 @@ fn mixed_locked_ease_pairs_skip_locked_layers_in_one_undo_step() {
     s.execute("prop.select", json!({"layer": editable, "path": "transform/opacity"})).unwrap();
     s.execute("prop.select", json!({"layer": locked, "path": "transform/opacity", "add": true})).unwrap();
     s.execute("layer.setSwitch", json!({"layer": locked, "switch": "lock", "value": true})).unwrap();
-    let editable_before = prop(&s, editable, "transform/opacity").keys;
-    let locked_before = prop(&s, locked, "transform/opacity").keys;
+    let editable_before = prop(&s, editable, "transform/opacity").into_data().keys;
+    let locked_before = prop(&s, locked, "transform/opacity").into_data().keys;
     let steps = s.history.undo.len();
     let result = s.execute("keys.easePreset.apply", json!({"preset": "Ease In-Out"})).unwrap();
     assert_eq!(result["pairs"], 2);
     assert_eq!(s.history.undo.len(), steps + 1, "one undo step for all editable pairs");
-    let editable_after = prop(&s, editable, "transform/opacity").keys;
+    let editable_after = prop(&s, editable, "transform/opacity").into_data().keys;
     assert_ne!(editable_after, editable_before);
     assert_eq!(prop(&s, locked, "transform/opacity").keys, locked_before);
     s.execute("edit.undo", json!({})).unwrap();

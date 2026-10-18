@@ -438,7 +438,12 @@ fn build_group(project: &Project, comp: ItemId, eg: &EssentialGraphics, old: Opt
                     let Some((_, src)) = source_prop(project, comp, c) else { continue };
                     let prev = prev.and_then(Node::as_prop);
                     let uid = prev.map(|p| p.uid).unwrap_or_else(&mut *alloc);
-                    let mut p = Property { uid, match_id: m, name: c.name.clone(), keys: vec![], expr: None, ..src.clone() };
+                    let mut p = src.clone();
+                    p.uid = uid;
+                    p.match_id = m;
+                    p.name = c.name.clone();
+                    p.keys.clear();
+                    p.expr = None;
                     // Instance properties follow the source's look but are always editable.
                     p.static_only = false;
                     if let Some(prev) = prev.filter(|pp| over.contains(&pp.uid)) {
@@ -544,6 +549,7 @@ fn propagate_mirrors(before: &Project, after: &mut Project) {
         }
         let Some(c) = after.comp_mut(cid) else { continue };
         for (i, mm, src) in writes {
+            let src = src.into_data();
             if let Some(g) = c.layers[i].props.sub_mut(GROUP)
                 && let Some(dst) = find_prop_mut(&mut g.children, &mm)
             {

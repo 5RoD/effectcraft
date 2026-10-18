@@ -747,7 +747,9 @@ pub fn editable_text(proj: &mut Project, comp: &Comp, layer: &Layer, psd: &Psd, 
     l.out_point = layer.out_point;
     l.start_time = layer.start_time;
     if let (Some(o), Some(p)) = (layer.props.prop("transform/opacity"), l.props.prop_mut("transform/opacity")) {
-        *p = effectcraft_project::Property { uid: p.uid, ..o.clone() };
+        let uid = p.uid;
+        *p = o.clone();
+        p.uid = uid;
     }
     Some(l)
 }

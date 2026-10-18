@@ -125,6 +125,7 @@ fn install(s: &mut Session, p: &Value) -> Result<Value> {
             let layer = layer_mut(project, cid, *id)?;
             let source = layer.props.prop_mut("text/sourceText").ok_or_else(|| bad(COMMAND, "Source Text is unavailable"))?;
             if let Some(width) = figure_width {
+                let source = &mut **source;
                 // Styling may itself have Source Text keys. Set the font feature on every
                 // saved document and run, retaining all other authored styling and times.
                 for value in std::iter::once(&mut source.value).chain(source.keys.iter_mut().map(|key| &mut key.value)) {

@@ -136,6 +136,10 @@ application and Desktop shortcut have not been removed or replaced.
   panel can revisit them after reopening. History is retained without the old 32/99 edit cap by
   default; continuous gestures still form one undo step. Unchanged items and layers are shared in
   the archive, and changed values use lossless structural patches.
+- Retained snapshots share individual property data as well as whole layer trees. Editing an
+  opacity or effect control no longer duplicates untouched properties' animation keys, text,
+  paths or expressions. The edited property detaches before mutation; project JSON keeps its
+  existing representation. Long-history memory and application throughput still need measurement.
 - Every completed desktop edit is protected by a checked atomic journal, independently of the
   30-second background checkpoints. Recovery restores the current project and its complete
   branching history. Separate operating-system leases isolate simultaneous windows; write failures

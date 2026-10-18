@@ -134,7 +134,8 @@ fn paste(s: &mut Session, p: &Value) -> Result<Value> {
                 }
                 sel.push(KeyRef { layer: *lid, prop: *uid, time: lt });
             }
-            retime_roving(&mut pr.keys, pr.spatial);
+            let spatial = pr.spatial;
+            retime_roving(&mut pr.keys, spatial);
         }
         st.selected_keys = sel;
         Ok(json!(st.selected_keys.len()))
@@ -215,7 +216,8 @@ pub(super) fn paste_path(s: &mut Session, p: &Value, (cid, lid, uid): (ItemId, L
         }
         // Re-timing keeps the keys' order, so the pasted keys are found again by index.
         let pasted: Vec<usize> = pr.keys.iter().enumerate().filter(|(_, k)| sel.contains(&k.time)).map(|(i, _)| i).collect();
-        retime_roving(&mut pr.keys, pr.spatial);
+        let spatial = pr.spatial;
+        retime_roving(&mut pr.keys, spatial);
         st.selected_keys = pasted.iter().filter_map(|&i| pr.keys.get(i)).map(|k| KeyRef { layer: lid, prop: uid, time: k.time }).collect();
         Ok(json!(st.selected_keys.len()))
     })
@@ -317,7 +319,8 @@ fn set_key(s: &mut Session, p: &Value) -> Result<Value> {
             nt = Tick(nt.0.clamp(lo, hi));
             pr.keys[i].time = nt;
         }
-        retime_roving(&mut pr.keys, pr.spatial);
+        let spatial = pr.spatial;
+        retime_roving(&mut pr.keys, spatial);
         let nt = pr.keys.get(i).map(|k| k.time).unwrap_or(nt);
         for k in st.selected_keys.iter_mut().filter(|k| k.layer == lid && k.prop == uid && k.time == old_t) {
             k.time = nt;

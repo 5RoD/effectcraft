@@ -337,7 +337,7 @@ fn convert_expression_to_keyframes_on_a_reversed_layer_keeps_values() {
     let before = sample(&mut s);
     assert!(before[0] > before[1] && before[1] > before[2], "{before:?}");
     s.execute("prop.convertExpressionToKeyframes", json!({"layer": l, "path": "transform/rotation"})).unwrap();
-    let keys = prop(&s, l, "transform/rotation").keys;
+    let keys = prop(&s, l, "transform/rotation").into_data().keys;
     assert!(keys.len() > 1);
     assert!(keys.windows(2).all(|w| w[0].time < w[1].time));
     let after = sample(&mut s);
@@ -485,14 +485,14 @@ fn vertex_commands_fill_in_missing_tangents_of_a_loaded_animated_path() {
 fn alt_click_stopwatch_toggles_a_self_reference_expression() {
     let (mut s, l) = setup();
     s.execute("prop.setExpression", json!({"layer": l, "path": "transform/opacity"})).unwrap();
-    assert_eq!(prop(&s, l, "transform/opacity").expr.unwrap().text, "transform.opacity");
+    assert_eq!(prop(&s, l, "transform/opacity").into_data().expr.unwrap().text, "transform.opacity");
     s.execute("prop.setExpression", json!({"layer": l, "path": "transform/opacity", "enabled": false})).unwrap();
-    assert!(!prop(&s, l, "transform/opacity").expr.unwrap().enabled);
+    assert!(!prop(&s, l, "transform/opacity").into_data().expr.unwrap().enabled);
     s.execute("prop.setExpression", json!({"layer": l, "path": "transform/opacity", "enabled": true})).unwrap();
     s.execute("prop.setExpression", json!({"layer": l, "path": "transform/opacity"})).unwrap();
     assert!(prop(&s, l, "transform/opacity").expr.is_none());
     s.execute("edit.undo", json!({})).unwrap();
-    assert!(prop(&s, l, "transform/opacity").expr.unwrap().enabled);
+    assert!(prop(&s, l, "transform/opacity").into_data().expr.unwrap().enabled);
 }
 
 #[test]
@@ -505,7 +505,7 @@ fn add_expression_without_path_uses_the_selected_property() {
     // Animation > Add Expression sends no parameters.
     s.execute("prop.select", json!({"layer": l, "path": "transform/opacity"})).unwrap();
     s.execute("prop.setExpression", json!({})).unwrap();
-    assert_eq!(prop(&s, l, "transform/opacity").expr.unwrap().text, "transform.opacity");
+    assert_eq!(prop(&s, l, "transform/opacity").into_data().expr.unwrap().text, "transform.opacity");
     // One undo step removes it.
     s.execute("edit.undo", json!({})).unwrap();
     assert!(prop(&s, l, "transform/opacity").expr.is_none());
@@ -713,10 +713,10 @@ fn pick_whip_generates_ae_reference_expressions() {
     for (path, target, want) in cases {
         let got = s.execute("prop.pickWhip", json!({"layer": l, "path": path, "target": target})).unwrap();
         assert_eq!(got, json!(want));
-        assert_eq!(prop(&s, l, path).expr.unwrap().text, want);
+        assert_eq!(prop(&s, l, path).into_data().expr.unwrap().text, want);
     }
     s.execute("edit.undo", json!({})).unwrap();
-    assert_ne!(prop(&s, l, "transform/position").expr.map(|e| e.text), Some("thisComp.layer(\"Other\").transform.position".into()));
+    assert_ne!(prop(&s, l, "transform/position").into_data().expr.map(|e| e.text), Some("thisComp.layer(\"Other\").transform.position".into()));
     assert!(s.execute("prop.pickWhip", json!({"layer": l, "path": "transform/opacity", "target": {"layer": l, "path": "transform/opacity"}})).is_err());
 }
 
@@ -726,7 +726,7 @@ fn pick_whip_generates_ae_reference_expressions() {
 fn reset_gives_a_property_its_default() {
     let (mut s, l) = setup();
     s.execute("effect.apply", json!({"layer": l, "effect": "Gaussian Blur"})).unwrap();
-    let blur = prop(&s, l, "effects/#1/blurriness").value;
+    let blur = prop(&s, l, "effects/#1/blurriness").into_data().value;
     let set = [
         ("transform/anchor", json!([10, 20, 0])),
         ("transform/position", json!([10, 20, 0])),
@@ -743,7 +743,7 @@ fn reset_gives_a_property_its_default() {
     for (path, _) in &set {
         s.execute("prop.reset", json!({"layer": l, "path": path})).unwrap();
     }
-    let v = |s: &Session, path: &str| prop(s, l, path).value;
+    let v = |s: &Session, path: &str| prop(s, l, path).into_data().value;
     assert_eq!(v(&s, "transform/anchor"), KV::Vec3([50.0, 50.0, 0.0]), "the solid's centre");
     assert_eq!(v(&s, "transform/position"), KV::Vec3([200.0, 150.0, 0.0]), "the comp's centre");
     assert_eq!(v(&s, "transform/scale"), KV::Vec3([100.0; 3]));
@@ -796,7 +796,7 @@ fn pick_whip_picks_one_dimension_of_the_target() {
     let r = "thisComp.layer(\"Other\").transform.position";
     assert_eq!(whip(&mut s, "transform/rotation", 0).unwrap(), json!(format!("{r}[0]")));
     assert_eq!(whip(&mut s, "transform/scale", 1).unwrap(), json!(format!("temp = {r}[1];\n[temp, temp]")));
-    assert_eq!(prop(&s, l, "transform/scale").expr.unwrap().text, format!("temp = {r}[1];\n[temp, temp]"));
+    assert_eq!(prop(&s, l, "transform/scale").into_data().expr.unwrap().text, format!("temp = {r}[1];\n[temp, temp]"));
     // A 2D layer's Position has two.
     assert!(whip(&mut s, "transform/rotation", 2).is_err());
 }
@@ -817,7 +817,7 @@ fn pick_whip_inserts_into_the_expression_being_edited() {
     let r = "thisComp.layer(\"Ö\").transform.rotation";
     // Characters, not bytes: "é" before the cursor.
     assert_eq!(whip(&mut s, "é + 5", json!([1, 1])).unwrap(), json!(format!("é{r} + 5")));
-    assert_eq!(prop(&s, l, "transform/opacity").expr.unwrap().text, format!("é{r} + 5"));
+    assert_eq!(prop(&s, l, "transform/opacity").into_data().expr.unwrap().text, format!("é{r} + 5"));
     // A selection (either way round) is replaced; no range: at the end.
     assert_eq!(whip(&mut s, "a*2+b", json!([4, 2])).unwrap(), json!(format!("a*{r}b")));
     assert_eq!(whip(&mut s, "x + ", Value::Null).unwrap(), json!(format!("x + {r}")));
@@ -825,7 +825,7 @@ fn pick_whip_inserts_into_the_expression_being_edited() {
     assert_eq!(whip(&mut s, "7", json!([9, 99])).unwrap(), json!(format!("7{r}")));
     assert!(whip(&mut s, "7", json!([1])).is_err());
     s.execute("edit.undo", json!({})).unwrap();
-    assert_eq!(prop(&s, l, "transform/opacity").expr.unwrap().text, format!("x + {r}"));
+    assert_eq!(prop(&s, l, "transform/opacity").into_data().expr.unwrap().text, format!("x + {r}"));
 }
 
 /// Outer comp (4 s) containing a precomp whose 10×10 white solid moves x = 10 + 20·t (t in s).

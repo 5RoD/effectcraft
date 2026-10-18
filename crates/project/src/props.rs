@@ -95,8 +95,15 @@ pub struct Expression {
     pub enabled: bool,
 }
 
+/// Immutable snapshots share each property's data too. Editing another property in the same
+/// tree must not duplicate this property's keyframes, text, paths or expression.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Property(std::sync::Arc<PropertyData>);
+
+/// The editable property fields. The transparent owner preserves the existing project format.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Property {
+pub struct PropertyData {
     pub uid: Uid,
     /// Stable id within its parent kind (`position`, `blurriness`…).
     #[serde(rename = "match")]
@@ -130,10 +137,35 @@ pub struct Property {
     pub static_only: bool,
 }
 
+impl std::ops::Deref for Property {
+    type Target = PropertyData;
+
+    fn deref(&self) -> &PropertyData {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Property {
+    fn deref_mut(&mut self) -> &mut PropertyData {
+        std::sync::Arc::make_mut(&mut self.0)
+    }
+}
+
+impl PartialEq for Property {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0
+    }
+}
+
 impl Property {
+    /// Consume the owner, moving unique data or cloning when another snapshot still uses it.
+    pub fn into_data(self) -> PropertyData {
+        std::sync::Arc::unwrap_or_clone(self.0)
+    }
+
     pub fn new(uid: Uid, match_id: &str, name: &str, value: Value) -> Property {
         let hold_only = !value.interpolates();
-        Property {
+        Self(std::sync::Arc::new(PropertyData {
             uid,
             match_id: match_id.into(),
             name: name.into(),
@@ -147,7 +179,7 @@ impl Property {
             two_d_only: false,
             shown_dims: 0,
             static_only: false,
-        }
+        }))
     }
     pub fn with_ui(mut self, ui: ParamUi) -> Property {
         self.ui = ui;

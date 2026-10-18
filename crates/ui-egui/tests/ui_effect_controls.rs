@@ -716,7 +716,7 @@ fn file_and_text_parameters_have_widgets() {
     let fx = r["effects"][0].as_u64().unwrap();
     let lut = |h: &Harness<'_, EffectcraftApp>| {
         let g = layer(&h.state().session, l).effects().and_then(|f| f.groups().find(|g| g.uid == fx).cloned()).unwrap();
-        let p = g.get("lut").unwrap().clone();
+        let p = g.get("lut").unwrap().clone().into_data();
         (
             p.uid,
             match p.value {

@@ -20,6 +20,60 @@ fn project_with_layer() -> (Project, crate::ItemId) {
 }
 
 #[test]
+fn untouched_keyframes_stay_shared_when_another_property_changes_in_retained_snapshots() {
+    use crate::{PropGroup, Property, PropertyTree};
+    let mut animated = Property::new(1, "animated", "Animated", Value::Scalar(0.0));
+    animated.keys = (0..4096).map(|i| Keyframe::new(Tick(i * 1000), Value::Scalar(i as f64))).collect();
+    let original: PropertyTree = PropGroup::new(2, "root", "Root").with(animated).with(Property::new(3, "amount", "Amount", Value::Scalar(0.0))).into();
+    let original_buffer = original.prop("animated").unwrap().keys.as_ptr();
+    let versions: Vec<_> = (0..64)
+        .map(|i| {
+            let mut snapshot = original.clone();
+            snapshot.prop_mut("amount").unwrap().value = Value::Scalar(i as f64 + 1.0);
+            assert_eq!(
+                snapshot.prop("animated").unwrap().keys.as_ptr(),
+                original_buffer,
+                "editing an unrelated property must not copy thousands of untouched keys"
+            );
+            snapshot
+        })
+        .collect();
+    assert_eq!(original.prop("amount").unwrap().value, Value::Scalar(0.0));
+    let mut edited = versions[0].clone();
+    let key = edited.prop_mut("animated").unwrap().keys.get_mut(100).unwrap();
+    key.value = Value::Scalar(-77.0);
+    assert_ne!(edited.prop("animated").unwrap().keys.as_ptr(), original_buffer);
+    for snapshot in &versions {
+        let property = snapshot.prop("animated").unwrap();
+        assert_eq!(property.keys.as_ptr(), original_buffer);
+        assert_eq!(property.keys[100].value, Value::Scalar(100.0));
+    }
+    assert_eq!(edited.prop("animated").unwrap().keys[100].value, Value::Scalar(-77.0));
+}
+
+#[test]
+fn shared_property_edits_keep_legacy_json_and_all_detached_fields_independent() {
+    use crate::{Expression, Property};
+    let legacy = serde_json::json!({"uid":17,"match":"amount","name":"Amount","value":{"t":"Scalar","v":3.0},
+        "ui":{"kind":"Number"},"spatial":false,"hold_only":false,"three_d_only":false,"two_d_only":false,"shown_dims":0,"static_only":false});
+    let original: Property = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&original).unwrap(), legacy);
+    let mut edited = original.clone();
+    edited.name = "Edited".into();
+    edited.value = Value::Scalar(8.0);
+    edited.expr = Some(Expression { text: "value * 2".into(), enabled: true });
+    edited.keys.push(Keyframe::new(Tick::ZERO, Value::Scalar(9.0)).hold());
+    edited.spatial = true;
+    edited.shown_dims = 3;
+    assert_eq!(serde_json::to_value(&original).unwrap(), legacy, "no field may leak back into an earlier revision");
+    let restored: Property = serde_json::from_value(serde_json::to_value(&edited).unwrap()).unwrap();
+    assert_eq!(restored, edited);
+    let node: crate::Node =
+        serde_json::from_value(serde_json::json!({"node":"Prop","uid":17,"match":"amount","name":"Amount","value":{"t":"Scalar","v":3.0}})).unwrap();
+    assert_eq!(node.as_prop(), Some(&original), "legacy internally-tagged property nodes must still load");
+}
+
+#[test]
 fn hostile_project_and_property_ids_fail_before_counter_repair_can_overflow() {
     let (project, comp) = project_with_layer();
     let mut cases = vec![];

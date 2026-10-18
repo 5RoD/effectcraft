@@ -175,10 +175,11 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
         let comp = proj.comp_mut(cid).ok_or(EngineError::NoComp)?;
         let mut n = 0;
         for (lid, uid, i) in &pairs {
-            if let Some(pr) = comp.layer_mut(*lid).and_then(|l| l.props.find_mut(*uid))
-                && curve.apply(&mut pr.keys, *i, pr.spatial)
-            {
-                n += 1;
+            if let Some(pr) = comp.layer_mut(*lid).and_then(|l| l.props.find_mut(*uid)) {
+                let spatial = pr.spatial;
+                if curve.apply(&mut pr.keys, *i, spatial) {
+                    n += 1;
+                }
             }
         }
         Ok(n)
