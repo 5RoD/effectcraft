@@ -19,6 +19,75 @@ impl PropertyTree {
     pub fn downgrade(&self) -> std::sync::Weak<PropGroup> {
         std::sync::Arc::downgrade(&self.0)
     }
+
+    /// Reuse equal properties after decoding an independently serialized revision. Identity
+    /// only selects candidates: every field must match before storage is shared. Oversized
+    /// or deeply nested trees keep their decoded data; this optional optimization is bounded.
+    pub fn share_unchanged_properties(&mut self, previous: &Self) {
+        if std::sync::Arc::ptr_eq(&self.0, &previous.0) {
+            return;
+        }
+        const MAX_NODES: usize = 65_536;
+        const MAX_DEPTH: usize = 128;
+        let mut properties = std::collections::HashMap::new();
+        let mut pending = vec![previous.children.iter()];
+        let mut visited = 0usize;
+        while let Some(children) = pending.last_mut() {
+            match children.next() {
+                Some(node) => {
+                    if visited >= MAX_NODES {
+                        return;
+                    }
+                    visited += 1;
+                    match node {
+                        Node::Prop(property) => {
+                            properties.entry(property.uid).or_insert(property);
+                        }
+                        Node::Group(group) => {
+                            if pending.len() >= MAX_DEPTH {
+                                return;
+                            }
+                            pending.push(group.children.iter());
+                        }
+                    }
+                }
+                None => {
+                    pending.pop();
+                }
+            }
+        }
+        let mut pending = vec![std::sync::Arc::make_mut(&mut self.0).children.iter_mut()];
+        let mut visited = 0usize;
+        while let Some(children) = pending.last_mut() {
+            match children.next() {
+                Some(node) => {
+                    if visited >= MAX_NODES {
+                        return;
+                    }
+                    visited += 1;
+                    match node {
+                        Node::Prop(property) => {
+                            if let Some(old) = properties.get(&property.uid)
+                                && &*property == *old
+                                && property.same_serialized_data(old)
+                            {
+                                *property = (*old).clone();
+                            }
+                        }
+                        Node::Group(group) => {
+                            if pending.len() >= MAX_DEPTH {
+                                return;
+                            }
+                            pending.push(group.children.iter_mut());
+                        }
+                    }
+                }
+                None => {
+                    pending.pop();
+                }
+            }
+        }
+    }
 }
 
 impl From<PropGroup> for PropertyTree {
@@ -101,6 +170,27 @@ pub struct Expression {
 #[serde(transparent)]
 pub struct Property(std::sync::Arc<PropertyData>);
 
+/// Scratch space for exact storage comparison. An unavailable optimization must not allocate
+/// an unbounded second copy of a hostile property's serialized data.
+#[derive(Default)]
+struct PropertyBytes(Vec<u8>);
+
+impl std::io::Write for PropertyBytes {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        const LIMIT: usize = 8 * 1024 * 1024;
+        if bytes.len() > LIMIT.saturating_sub(self.0.len()) {
+            return Err(std::io::Error::other("property sharing comparison exceeds its byte limit"));
+        }
+        self.0.try_reserve(bytes.len()).map_err(|_| std::io::Error::other("property sharing scratch allocation unavailable"))?;
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// The editable property fields. The transparent owner preserves the existing project format.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PropertyData {
@@ -158,6 +248,18 @@ impl PartialEq for Property {
 }
 
 impl Property {
+    fn same_serialized_data(&self, other: &Self) -> bool {
+        if std::sync::Arc::ptr_eq(&self.0, &other.0) {
+            return true;
+        }
+        // Numeric PartialEq intentionally equates signed zero. Sharing decoded revisions
+        // must also preserve the exact stored representation, including values inside keys,
+        // paths, text style and UI metadata. A failed bounded comparison simply keeps both.
+        let mut left = PropertyBytes::default();
+        let mut right = PropertyBytes::default();
+        serde_json::to_writer(&mut left, self).is_ok() && serde_json::to_writer(&mut right, other).is_ok() && left.0 == right.0
+    }
+
     /// Consume the owner, moving unique data or cloning when another snapshot still uses it.
     pub fn into_data(self) -> PropertyData {
         std::sync::Arc::unwrap_or_clone(self.0)

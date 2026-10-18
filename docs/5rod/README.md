@@ -139,7 +139,9 @@ application and Desktop shortcut have not been removed or replaced.
 - Retained snapshots share individual property data as well as whole layer trees. Editing an
   opacity or effect control no longer duplicates untouched properties' animation keys, text,
   paths or expressions. The edited property detaches before mutation; project JSON keeps its
-  existing representation. Long-history memory and application throughput still need measurement.
+  existing representation. Saved-history and recovery reconstruction reuse equal decoded
+  properties too, with bounded iterative traversal. See the scoped measurements and loading
+  tradeoffs in [property storage and retained edits](property-sharing-performance.md).
 - Every completed desktop edit is protected by a checked atomic journal, independently of the
   30-second background checkpoints. Recovery restores the current project and its complete
   branching history. Separate operating-system leases isolate simultaneous windows; write failures

@@ -52,6 +52,68 @@ fn untouched_keyframes_stay_shared_when_another_property_changes_in_retained_sna
 }
 
 #[test]
+fn decoded_properties_share_only_equal_data_after_reordering_and_duplicate_ids() {
+    use crate::{Expression, Node, PropGroup, Property, PropertyTree};
+    let mut animated = Property::new(1, "animated", "Animated", Value::Scalar(3.0));
+    animated.keys.push(Keyframe::new(Tick::ZERO, Value::Scalar(3.0)));
+    let original: PropertyTree = PropGroup::new(2, "root", "Root")
+        .with(animated.clone())
+        .with(PropGroup::new(3, "nested", "Nested").with(Property::new(4, "amount", "Amount", Value::Scalar(5.0))))
+        .with(Property::new(5, "zero", "Zero", Value::Scalar(0.0)))
+        .into();
+    let mut restored: PropertyTree = serde_json::from_value(serde_json::to_value(&original).unwrap()).unwrap();
+    restored.children.reverse();
+    restored.prop_mut("nested/amount").unwrap().expr = Some(Expression { text: "value + 1".into(), enabled: true });
+    restored.prop_mut("zero").unwrap().value = Value::Scalar(-0.0);
+    let mut duplicate = animated.clone();
+    duplicate.name = "Different data with the same UID".into();
+    restored.children.push(Node::Prop(duplicate));
+    let before = serde_json::to_string(&restored).unwrap();
+    assert_ne!(restored.prop("animated").unwrap().keys.as_ptr(), animated.keys.as_ptr());
+    restored.share_unchanged_properties(&original);
+    assert_eq!(serde_json::to_string(&restored).unwrap(), before, "sharing must not alter any decoded field, numeric representation or order");
+    assert_eq!(restored.prop("animated").unwrap().keys.as_ptr(), animated.keys.as_ptr());
+    assert_eq!(restored.children.last().unwrap().name(), "Different data with the same UID");
+    restored.prop_mut("animated").unwrap().keys[0].value = Value::Scalar(9.0);
+    assert_eq!(animated.keys[0].value, Value::Scalar(3.0));
+    assert!(original.prop("nested/amount").unwrap().expr.is_none());
+}
+
+#[test]
+fn optional_property_sharing_keeps_deep_and_oversized_trees_intact() {
+    use crate::{Node, PropGroup, Property, PropertyTree};
+    let mut group = PropGroup::new(1, "leaf", "Leaf").with(Property::new(2, "value", "Value", Value::Scalar(3.0)));
+    for depth in 0..140 {
+        group = PropGroup::new(depth + 3, "group", "Group").with(group);
+    }
+    let original: PropertyTree = group.into();
+    let mut restored: PropertyTree = (*original).clone().into();
+    restored.share_unchanged_properties(&original);
+    assert_eq!(restored, original);
+    let property = Property::new(1, "value", "Value", Value::Scalar(3.0));
+    let mut group = PropGroup::new(2, "root", "Root");
+    group.children = vec![Node::Prop(property); 65_537];
+    let original: PropertyTree = group.into();
+    let mut restored = original.clone();
+    restored.name = "Changed root".into();
+    let before = restored.clone();
+    restored.share_unchanged_properties(&original);
+    assert_eq!(restored, before);
+    let name = "x".repeat(8 * 1024 * 1024 + 1);
+    let property = || {
+        let mut value = Property::new(1, "large", &name, Value::Scalar(3.0));
+        value.keys.push(Keyframe::new(Tick::ZERO, Value::Scalar(3.0)));
+        value
+    };
+    let original: PropertyTree = PropGroup::new(2, "root", "Root").with(property()).into();
+    let mut restored: PropertyTree = PropGroup::new(2, "root", "Root").with(property()).into();
+    let buffer = restored.prop("large").unwrap().keys.as_ptr();
+    restored.share_unchanged_properties(&original);
+    assert_eq!(restored.prop("large").unwrap().keys.as_ptr(), buffer, "oversized comparison must keep the decoded property intact");
+    assert_ne!(buffer, original.prop("large").unwrap().keys.as_ptr());
+}
+
+#[test]
 fn shared_property_edits_keep_legacy_json_and_all_detached_fields_independent() {
     use crate::{Expression, Property};
     let legacy = serde_json::json!({"uid":17,"match":"amount","name":"Amount","value":{"t":"Scalar","v":3.0},

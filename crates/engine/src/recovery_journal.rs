@@ -181,10 +181,12 @@ impl ProjectChange {
                                 let layer = available.get_mut(&id).ok_or_else(|| error("missing changed layer"))?;
                                 let mut value = serde_json::to_value(&*layer).map_err(error)?;
                                 remote::patch(&mut value, &ops).map_err(error)?;
-                                *layer = serde_json::from_value(value).map_err(error)?;
-                                if layer.id != id {
+                                let mut restored: Layer = serde_json::from_value(value).map_err(error)?;
+                                if restored.id != id {
                                     return Err(error("changed layer ID"));
                                 }
+                                history_file::share_patched_properties(&mut restored, layer, &ops);
+                                *layer = restored;
                             }
                         }
                     }
@@ -801,6 +803,35 @@ mod tests {
         s.end_recovery();
         assert!(store.read(crate::autosave::SENTINEL).is_none());
         assert!(store.list(&name).is_empty());
+    }
+
+    #[test]
+    fn recovered_layer_patches_share_unchanged_animation_and_detach_changed_keys() {
+        use effectcraft_project::{Keyframe, Value};
+        use effectcraft_time::Tick;
+        let mut session = Session::new();
+        session.execute("comp.new", json!({"width":32,"height":32})).unwrap();
+        session.execute("layer.newNull", json!({})).unwrap();
+        let comp = session.state.active_comp.unwrap();
+        let position = Arc::make_mut(&mut session.project).comp_mut(comp).unwrap().layers[0].props.prop_mut("transform/position").unwrap();
+        position.keys = (0..256).map(|i| Keyframe::new(Tick(i * 1000), Value::Vec2([i as f64, 2.0]))).collect();
+        let base = session.project.clone();
+        Arc::make_mut(&mut session.project).comp_mut(comp).unwrap().layers[0].props.prop_mut("transform/opacity").unwrap().value = Value::Scalar(33.0);
+        let delta = ProjectChange::between(&base, &session.project).unwrap();
+        let decoded: ProjectChange = serde_json::from_str(&serde_json::to_string(&delta).unwrap()).unwrap();
+        let restored = decoded.apply(&base).unwrap();
+        assert_eq!(restored, *session.project);
+        let original = base.comp(comp).unwrap().layers[0].props.prop("transform/position").unwrap();
+        assert_eq!(restored.comp(comp).unwrap().layers[0].props.prop("transform/position").unwrap().keys.as_ptr(), original.keys.as_ptr());
+        Arc::make_mut(&mut session.project).comp_mut(comp).unwrap().layers[0].props.prop_mut("transform/position").unwrap().keys[0].value =
+            Value::Vec2([9.0, 9.0]);
+        let delta = ProjectChange::between(&base, &session.project).unwrap();
+        let decoded: ProjectChange = serde_json::from_str(&serde_json::to_string(&delta).unwrap()).unwrap();
+        let changed = decoded.apply(&base).unwrap();
+        assert_eq!(changed, *session.project);
+        assert_ne!(changed.comp(comp).unwrap().layers[0].props.prop("transform/position").unwrap().keys.as_ptr(), original.keys.as_ptr());
+        assert_eq!(original.keys[0].value, Value::Vec2([0.0, 2.0]));
+        assert_eq!(restored.comp(comp).unwrap().layers[0].props.prop("transform/position").unwrap().keys[0].value, Value::Vec2([0.0, 2.0]));
     }
 
     #[test]

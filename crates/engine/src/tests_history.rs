@@ -86,6 +86,118 @@ fn saved_history_restores_branches_redo_and_all_edits() {
 }
 
 #[test]
+fn patched_property_sharing_preserves_reorders_duplicate_ids_group_changes_and_root_replacements() {
+    use effectcraft_project::{Keyframe, Layer, Node, PropGroup, Property, Value as PropertyValue};
+    use effectcraft_time::Tick;
+    let mut session = Session::default();
+    session.execute("comp.new", json!({})).unwrap();
+    session.execute("layer.newNull", json!({})).unwrap();
+    let mut base = session.project.comp(session.state.active_comp.unwrap()).unwrap().layers[0].clone();
+    let mut animated = Property::new(7, "animated", "Animated", PropertyValue::Scalar(0.0));
+    animated.keys = (0..256).map(|i| Keyframe::new(Tick(i * 1000), PropertyValue::Scalar(i as f64))).collect();
+    base.props = PropGroup::new(1, "root", "Root")
+        .with(animated)
+        .with(Property::new(7, "amount", "Amount", PropertyValue::Scalar(5.0)))
+        .with(Property::new(8, "other", "Other", PropertyValue::Scalar(0.0)))
+        .into();
+    let mut changed = base.clone();
+    let Node::Prop(amount) = &mut changed.props.children[1] else { panic!("property") };
+    amount.uid = 8;
+    amount.value = PropertyValue::Scalar(-0.0);
+    let mut reordered = changed.clone();
+    reordered.props.children.reverse();
+    let mut grouped = changed.clone();
+    grouped.props.children[1] =
+        Node::Group(PropGroup::new(9, "nested", "Nested").with(Property::new(10, "nestedValue", "Nested value", PropertyValue::Scalar(12.0))));
+    let mut metadata = changed.clone();
+    metadata.props.name = "New root name".into();
+    for (case, expected) in [changed, reordered, grouped, metadata].into_iter().enumerate() {
+        let before = serde_json::to_value(&base).unwrap();
+        let after = serde_json::to_value(&expected).unwrap();
+        let mut variants = vec![crate::remote::diff(&before, &after)];
+        variants.push(vec![crate::remote::Op { path: vec![], value: Some(after.clone()) }]);
+        for ops in variants {
+            let mut value = before.clone();
+            crate::remote::patch(&mut value, &ops).unwrap();
+            let mut restored: Layer = serde_json::from_value(value).unwrap();
+            crate::history_file::share_patched_properties(&mut restored, &base, &ops);
+            assert_eq!(
+                serde_json::to_string(&restored).unwrap(),
+                serde_json::to_string(&expected).unwrap(),
+                "case {case} must preserve exact numeric representation and all metadata"
+            );
+            assert_eq!(
+                restored.props.prop("animated").unwrap().keys.as_ptr(),
+                base.props.prop("animated").unwrap().keys.as_ptr(),
+                "case {case}: untouched animation stays shared even when property IDs collide"
+            );
+        }
+    }
+}
+
+#[test]
+fn saved_history_shares_untouched_animation_across_edited_layers_and_every_branch() {
+    use effectcraft_project::{Keyframe, Value as PropertyValue};
+    use effectcraft_time::Tick;
+    fn snapshots(session: &Session) -> Vec<Arc<Project>> {
+        let mut states = vec![session.project.clone()];
+        states.extend(session.history.undo.iter().chain(&session.history.redo).map(|(_, p)| p.clone()));
+        for branch in &session.history.branches {
+            states.push(branch.parent.clone());
+            states.extend(branch.steps.iter().map(|(_, p)| p.clone()));
+        }
+        states
+    }
+    let mut session = Session::default();
+    session.execute("comp.new", json!({"width":32,"height":32})).unwrap();
+    session.execute("layer.newNull", json!({})).unwrap();
+    let comp = session.state.active_comp.unwrap();
+    let position = Arc::make_mut(&mut session.project).comp_mut(comp).unwrap().layers[0].props.prop_mut("transform/position").unwrap();
+    position.keys = (0..256).map(|i| Keyframe::new(Tick(i * 1000), PropertyValue::Vec2([i as f64, 2.0]))).collect();
+    session.history = History::default();
+    for i in 0..8 {
+        session
+            .edit("Opacity", None, |project, _| {
+                project.comp_mut(comp).unwrap().layers[0].props.prop_mut("transform/opacity").unwrap().value = PropertyValue::Scalar(50.0 + i as f64);
+                Ok(())
+            })
+            .unwrap();
+    }
+    assert!(session.undo());
+    assert!(session.undo());
+    session
+        .edit("Alternative", None, |project, _| {
+            project.comp_mut(comp).unwrap().layers[0].props.prop_mut("transform/opacity").unwrap().value = PropertyValue::Scalar(12.0);
+            Ok(())
+        })
+        .unwrap();
+    assert!(session.undo());
+    assert!(!session.history.branches.is_empty() && !session.history.redo.is_empty());
+    let expected = snapshots(&session);
+    let text = crate::history_file::encode(&session.project, &session.history, true).unwrap();
+    let current = Arc::new(Project::from_json(&text).unwrap());
+    let history = crate::history_file::decode(&text, &current).unwrap().unwrap();
+    let reopened = Session { project: current, history, ..Default::default() };
+    let actual = snapshots(&reopened);
+    assert_eq!(actual.len(), expected.len());
+    let buffer = reopened.project.comp(comp).unwrap().layers[0].props.prop("transform/position").unwrap().keys.as_ptr();
+    for (before, after) in expected.iter().zip(&actual) {
+        assert_eq!(before, after, "every retained project must keep its exact content");
+        assert_eq!(
+            after.comp(comp).unwrap().layers[0].props.prop("transform/position").unwrap().keys.as_ptr(),
+            buffer,
+            "unchanged animation must remain shared after reopening every history line"
+        );
+    }
+    let mut edited = actual[0].clone();
+    Arc::make_mut(&mut edited).comp_mut(comp).unwrap().layers[0].props.prop_mut("transform/position").unwrap().keys[0].value =
+        PropertyValue::Vec2([99.0, 99.0]);
+    for state in &actual {
+        assert_eq!(state.comp(comp).unwrap().layers[0].props.prop("transform/position").unwrap().keys[0].value, PropertyValue::Vec2([0.0, 2.0]));
+    }
+}
+
+#[test]
 fn saved_history_shares_unchanged_compositions() {
     use effectcraft_project::ItemKind;
     use std::sync::Arc;

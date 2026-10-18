@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use effectcraft_project::{Item, ItemId, ItemKind, Layer, LayerId, Project};
+use effectcraft_project::{Item, ItemId, ItemKind, Layer, LayerId, Node, Project, PropGroup, Property, PropertyTree};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -64,6 +64,76 @@ fn present_value<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::resu
 
 fn invalid(e: impl std::fmt::Display) -> EngineError {
     EngineError::Other(format!("Saved edit history: {e}"))
+}
+
+/// Property-only patches cannot alter their enclosing groups. Retain the old shared tree
+/// and replace just the explicitly changed properties, avoiding serialization of every
+/// untouched animation a second time. Unknown/broader paths use exact bounded comparisons.
+pub(crate) fn share_patched_properties(layer: &mut Layer, previous: &Layer, ops: &[remote::Op]) {
+    fn property_path(group: &PropGroup, steps: &[remote::Step]) -> Option<Vec<usize>> {
+        let mut group = group;
+        let mut steps = steps;
+        let mut path = vec![];
+        loop {
+            let [remote::Step::Key(children), remote::Step::Index(index), rest @ ..] = steps else { return None };
+            if children != "children" || path.len() >= 128 {
+                return None;
+            }
+            path.push(*index);
+            match group.children.get(*index)? {
+                Node::Prop(_) => return Some(path),
+                Node::Group(next) => {
+                    group = next;
+                    steps = rest;
+                }
+            }
+        }
+    }
+    fn property_at<'a>(mut group: &'a PropGroup, path: &[usize]) -> Option<&'a Property> {
+        let (last, parents) = path.split_last()?;
+        for index in parents {
+            group = group.children.get(*index)?.as_group()?;
+        }
+        group.children.get(*last)?.as_prop()
+    }
+    fn patched_tree(layer: &Layer, previous: &Layer, ops: &[remote::Op]) -> Option<PropertyTree> {
+        if ops.len() > 65_536 {
+            return None;
+        }
+        let mut changed = BTreeMap::new();
+        for op in ops {
+            let (first, rest) = op.path.split_first()?;
+            let remote::Step::Key(key) = first else { return None };
+            if key != "props" {
+                continue;
+            }
+            let path = property_path(&previous.props, rest)?;
+            let old = property_at(&previous.props, &path)?;
+            let new = property_at(&layer.props, &path)?;
+            // A reorder can be expressed as edits to each array element. Let the exact
+            // matcher find moved properties instead of treating their animations as new.
+            if old.uid != new.uid || old.match_id != new.match_id {
+                return None;
+            }
+            changed.insert(path, new.clone());
+        }
+        let mut tree = previous.props.clone();
+        for (path, property) in changed {
+            let (last, parents) = path.split_last()?;
+            let mut group: &mut PropGroup = &mut tree;
+            for index in parents {
+                group = group.children.get_mut(*index)?.as_group_mut()?;
+            }
+            let Node::Prop(target) = group.children.get_mut(*last)? else { return None };
+            *target = property;
+        }
+        Some(tree)
+    }
+    if let Some(tree) = patched_tree(layer, previous, ops) {
+        layer.props = tree;
+    } else {
+        layer.props.share_unchanged_properties(&previous.props);
+    }
 }
 
 /// Current project plus its branching history. Old EffectCraft builds can read the current
@@ -224,14 +294,22 @@ fn decode_archive(text: &str, history: Option<Value>, current: &Arc<Project>, do
     }
     let mut items: Vec<Item> = Vec::with_capacity(archive.items.len());
     let mut layers: Vec<Layer> = Vec::with_capacity(archive.layers.len());
+    let current_layers: HashMap<_, _> = current.comps().flat_map(|(_, comp)| &comp.layers).map(|layer| (layer.id, layer)).collect();
     for stored in archive.layers {
         let layer = match stored {
-            Delta::Full(layer) => layer,
+            Delta::Full(mut layer) => {
+                if let Some(previous) = current_layers.get(&layer.id) {
+                    layer.props.share_unchanged_properties(&previous.props);
+                }
+                layer
+            }
             Delta::Patch { base, ops } => {
                 let parent = layers.get(base).ok_or_else(|| invalid("invalid layer reference"))?;
                 let mut value = serde_json::to_value(parent).map_err(invalid)?;
                 remote::patch(&mut value, &ops).map_err(invalid)?;
-                serde_json::from_value(value).map_err(invalid)?
+                let mut layer: Layer = serde_json::from_value(value).map_err(invalid)?;
+                share_patched_properties(&mut layer, parent, &ops);
+                layer
             }
         };
         layers.push(layer);
