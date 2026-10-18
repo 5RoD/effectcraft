@@ -364,11 +364,17 @@ mod tests {
         let mut app = crate::EffectcraftApp::new(session);
         let stopped = Arc::new(AtomicBool::new(false));
         let stop = stopped.clone();
-        app.hooks.audio_device = Some(Box::new(move |_| Some(Box::new(Device { stopped: stop.clone(), reject: false }))));
-        let mut harness = egui_kittest::Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_| app);
+        app.hooks.audio_device = Some(Arc::new(move |_| Some(Box::new(Device { stopped: stop.clone(), reject: false }))));
+        let mut harness = egui_kittest::Harness::builder().with_size(egui::vec2(1400.0, 900.0)).with_step_dt(0.001).build_eframe(|_| app);
         harness.run_steps(2);
         let now = harness.ctx.input(|input| input.time);
         harness.state_mut().scrub_audio(comp, Tick::ZERO, now);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while harness.state().scrub.is_none() {
+            assert!(Instant::now() < deadline, "the asynchronous device was not accepted");
+            harness.step();
+            std::thread::sleep(Duration::from_millis(1));
+        }
         entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         let scrub = harness.state().scrub.as_ref().unwrap();
         let feed = scrub.feed.clone();

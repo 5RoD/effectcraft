@@ -47,7 +47,7 @@ fn setup_long(audible: bool, fake: &Fake, duration: f64) -> (EffectcraftApp, Ite
     }
     let mut app = EffectcraftApp::new(s);
     let f = fake.clone();
-    app.hooks.audio_device = Some(Box::new(move |_| Some(Box::new(f.clone()) as Box<dyn AudioDevice>)));
+    app.hooks.audio_device = Some(Arc::new(move |_| Some(Box::new(f.clone()) as Box<dyn AudioDevice>)));
     (app, cid)
 }
 
@@ -62,15 +62,26 @@ fn wait_for_frames(app: &mut EffectcraftApp, feed: &AudioFeed, frames: usize) {
     }
 }
 
+fn wait_for_scrub(h: &mut Harness<'_, EffectcraftApp>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while h.state().scrub.is_none() {
+        assert!(std::time::Instant::now() < deadline, "scrub output was not opened");
+        h.step();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 #[test]
 fn scrubbing_plays_one_frame_per_new_frame() {
     let fake = Fake::default();
-    let (mut app, cid) = setup(true, &fake);
+    let (app, cid) = setup(true, &fake);
+    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).with_step_dt(0.001).build_eframe(|_| app);
     let t = |s: f64| Tick::from_seconds_f64(s);
-    app.scrub_audio(cid, t(0.5), 0.0);
+    h.state_mut().scrub_audio(cid, t(0.5), 0.0);
+    wait_for_scrub(&mut h);
     let feed = fake.0.lock().unwrap().0.clone().expect("the output opened");
     // One 30 fps frame at 48 kHz, and not silence.
-    wait_for_frames(&mut app, &feed, 1600);
+    wait_for_frames(h.state_mut(), &feed, 1600);
     assert_eq!(feed.queued_frames(), 1600);
     let mut out = vec![0.0f32; 3200];
     feed.pull(&mut out);
@@ -78,11 +89,11 @@ fn scrubbing_plays_one_frame_per_new_frame() {
     // Faded in: the first sample is silent.
     assert_eq!(out[0], 0.0);
     // The same frame again plays nothing; the next frame replaces what is left.
-    app.scrub_audio(cid, t(0.51), 0.1);
+    h.state_mut().scrub_audio(cid, t(0.51), 0.1);
     assert_eq!(feed.queued_frames(), 0);
     feed.push(&[0.0; 1000]);
-    app.scrub_audio(cid, t(0.6), 0.2);
-    wait_for_frames(&mut app, &feed, 1600);
+    h.state_mut().scrub_audio(cid, t(0.6), 0.2);
+    wait_for_frames(h.state_mut(), &feed, 1600);
     assert_eq!(feed.queued_frames(), 1600, "replaced, not piled up");
     // A silent comp opens nothing.
     let silent = Fake::default();
@@ -109,6 +120,7 @@ fn cmd_dragging_the_current_time_scrubs_and_an_idle_scrub_closes() {
         h.event(Event::PointerMoved(from + egui::vec2(40.0 * k as f32, 0.0)));
         h.step();
     }
+    wait_for_scrub(&mut h);
     assert!(h.state().scrub.is_some(), "Cmd-drag opened the scrub output");
     let feed = fake.0.lock().unwrap().0.clone().unwrap();
     wait_for_frames(h.state_mut(), &feed, 1600);
@@ -206,4 +218,83 @@ fn preview_with_audio_sounds_once_rendering_keeps_up() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     assert!(h.state().audio.is_some() && fake.0.lock().unwrap().0.is_some(), "the sound started within 2 s, at frame {last} of 900");
+}
+
+#[test]
+fn slow_device_discovery_coalesces_scrubs_and_cancels_when_the_project_changes() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let fake = Fake::default();
+    let (mut app, comp) = setup(true, &fake);
+    let (entered_tx, entered) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (counter, device) = (calls.clone(), fake.clone());
+    app.hooks.audio_device = Some(Arc::new(move |_| {
+        counter.fetch_add(1, Ordering::Relaxed);
+        entered_tx.send(std::thread::current().id()).unwrap();
+        release_rx.lock().unwrap().recv_timeout(Duration::from_secs(30)).unwrap();
+        Some(Box::new(device.clone()))
+    }));
+    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).with_step_dt(0.001).build_eframe(|_| app);
+    let started = Instant::now();
+    h.state_mut().scrub_audio(comp, Tick::from_seconds_f64(0.5), 0.0);
+    assert!(started.elapsed() < Duration::from_secs(1), "discovery blocked the UI");
+    assert_ne!(entered.recv_timeout(Duration::from_secs(10)).unwrap(), std::thread::current().id());
+    for k in 1..=10 {
+        h.state_mut().scrub_audio(comp, Tick::from_seconds_f64(0.5 + k as f64 / 30.0), k as f64 / 1000.0);
+        h.step();
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "one opening serves the latest gesture");
+    assert!(h.state().scrub.is_none());
+    h.state_mut().session.execute("file.newProject", json!({})).unwrap();
+    h.step();
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fake.0.lock().unwrap().1 {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(fake.0.lock().unwrap().0.is_none(), "abandoned device never started");
+}
+
+#[test]
+fn audio_only_preview_holds_its_frame_during_discovery_and_stop_cancels_it() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let fake = Fake::default();
+    let (mut app, _) = setup(true, &fake);
+    let (entered_tx, entered) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    let device = fake.clone();
+    app.hooks.audio_device = Some(Arc::new(move |_| {
+        entered_tx.send(()).unwrap();
+        release_rx.lock().unwrap().recv_timeout(Duration::from_secs(30)).unwrap();
+        Some(Box::new(device.clone()))
+    }));
+    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).with_step_dt(0.001).build_eframe(|_| app);
+    h.run_steps(2);
+    let now = h.ctx.input(|i| i.time);
+    let started = Instant::now();
+    h.state_mut().play_with(now, effectcraft_engine::preview::PreviewShortcut::AltNumpad0);
+    assert!(started.elapsed() < Duration::from_secs(1), "discovery blocked preview startup");
+    entered.recv_timeout(Duration::from_secs(10)).unwrap();
+    let before = h.state().session.time();
+    h.run_steps(10);
+    assert_eq!(h.state().session.time(), before);
+    assert!(h.state().playback.playing && h.state().audio.is_none());
+    h.state_mut().stop();
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fake.0.lock().unwrap().1 {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    h.step();
+    assert!(h.state().audio.is_none() && fake.0.lock().unwrap().0.is_none(), "stopped preview never starts late");
 }

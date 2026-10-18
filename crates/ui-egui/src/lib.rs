@@ -148,7 +148,8 @@ pub struct Hooks {
     pub pick_files: Option<Box<dyn Fn(&[&str]) -> Vec<String>>>,
     pub pick_save: Option<Box<dyn Fn(&str) -> Option<String>>>,
     pub pick_open_project: Option<Box<dyn Fn() -> Option<String>>>,
-    /// Opens the audio output for preview playback (the desktop app uses cpal).
+    /// Opens the audio output for preview playback (the desktop app uses cpal). Native
+    /// discovery/startup run on a bounded worker; browsers retain inline user-gesture startup.
     pub audio_device: Option<audio::AudioDeviceFactory>,
     /// Lists audio output devices (Settings ▸ Audio).
     pub audio_devices: Option<Box<dyn Fn() -> Vec<String>>>,
@@ -329,6 +330,8 @@ pub struct EffectcraftApp {
     pub audio: Option<audio::AudioPlayback>,
     /// Audio scrubbing's open output (Ctrl/Cmd-drag the current time, `playback.scrubAudio`).
     pub scrub: Option<audio::AudioScrub>,
+    #[cfg(not(target_arch = "wasm32"))]
+    audio_open: Option<audio::opening::Opening>,
     /// Audio panel VU meters.
     pub meter: audio::Meter,
     /// Waveform peak summaries per footage item (see `panels::waveform`).
@@ -418,6 +421,8 @@ impl EffectcraftApp {
             integrated_titlebar: false,
             audio: None,
             scrub: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            audio_open: None,
             meter: Default::default(),
             expression_diagnostics: Default::default(),
             waveforms: Default::default(),
@@ -988,6 +993,12 @@ impl EffectcraftApp {
     /// Start the preview of a Preview panel shortcut (its range, play-from, rate, skip,
     /// resolution, loop, caching, full screen and include options).
     pub fn play_with(&mut self, now: f64, sc: effectcraft_engine::preview::PreviewShortcut) {
+        self.audio = None;
+        self.scrub = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.audio_open = None;
+        }
         let Some(c) = self.session.active_comp_arc() else { return };
         let preset = self.session.prefs.preview.get(sc).clone();
         let plan = effectcraft_engine::preview::plan(&preset, &c, self.session.time());
@@ -1040,16 +1051,40 @@ impl EffectcraftApp {
     /// opens.
     fn start_audio(&mut self, t: Tick) {
         self.audio = None;
+        self.scrub = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.audio_open = None;
+        }
         self.meter.clipped = [false; 2];
         let (Some(pl), Some(cid)) = (self.playback.plan, self.session.active_comp_id()) else { return };
         let Some(c) = self.session.project.comp_arc(cid).filter(|_| self.audio_plays()) else { return };
         let out = audio::AudioOutput::from_prefs(&self.session.prefs);
-        let Some(dev) = self.hooks.audio_device.as_ref().and_then(|f| f(&out)) else { return };
         let mix = self.session.prefs.audio.preview_sample_rate;
         let fr = c.frame_rate;
-        match audio::AudioPlayback::start(dev, self.render_source(), cid, t, fr.tick_of(pl.start), fr.tick_of(pl.end + 1), pl.looping, mix) {
-            Ok(a) => self.audio = Some(a),
-            Err(e) => log::warn!("audio preview: {e}"),
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Some(factory) = self.hooks.audio_device.clone() else { return };
+            let source = self.render_source();
+            match audio::opening::Opening::new(factory, out, &self.session.project, cid, None, move |device| {
+                let feed = std::sync::Arc::new(audio::AudioFeed::suspended());
+                audio::AudioPlayback::start_with_feed(device, source, cid, t, fr.tick_of(pl.start), fr.tick_of(pl.end + 1), pl.looping, mix, feed)
+                    .map(audio::opening::Opened::Playback)
+            }) {
+                Ok(opening) => self.audio_open = Some(opening),
+                Err(error) => {
+                    log::warn!("audio preview: {error}");
+                    self.ui.status = format!("Audio preview: {error}");
+                }
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let Some(dev) = self.hooks.audio_device.as_ref().and_then(|f| f(&out)) else { return };
+            match audio::AudioPlayback::start(dev, self.render_source(), cid, t, fr.tick_of(pl.start), fr.tick_of(pl.end + 1), pl.looping, mix) {
+                Ok(a) => self.audio = Some(a),
+                Err(e) => log::warn!("audio preview: {e}"),
+            }
         }
     }
 
@@ -1061,13 +1096,39 @@ impl EffectcraftApp {
         }
         if self.scrub.is_none() {
             let out = audio::AudioOutput::from_prefs(&self.session.prefs);
-            let Some(dev) = self.hooks.audio_device.as_ref().and_then(|f| f(&out)) else { return };
-            match audio::AudioScrub::open(dev, now) {
-                Ok(s) => self.scrub = Some(s),
-                Err(e) => {
-                    log::warn!("audio scrubbing: {e}");
-                    self.ui.status = format!("Audio scrubbing: {e}");
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let mix = self.session.prefs.audio.preview_sample_rate;
+                if let Some(opening) = &mut self.audio_open
+                    && opening.scrub.is_some()
+                    && opening.context_current(&self.session.project, Some(comp), &out)
+                {
+                    opening.scrub = Some((t, mix, now));
                     return;
+                }
+                self.audio_open = None;
+                let Some(factory) = self.hooks.audio_device.clone() else { return };
+                match audio::opening::Opening::new(factory, out, &self.session.project, comp, Some((t, mix, now)), move |device| {
+                    audio::AudioScrub::open(device, now).map(audio::opening::Opened::Scrub)
+                }) {
+                    Ok(opening) => self.audio_open = Some(opening),
+                    Err(error) => {
+                        log::warn!("audio scrubbing: {error}");
+                        self.ui.status = format!("Audio scrubbing: {error}");
+                    }
+                }
+                return;
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let Some(dev) = self.hooks.audio_device.as_ref().and_then(|f| f(&out)) else { return };
+                match audio::AudioScrub::open(dev, now) {
+                    Ok(s) => self.scrub = Some(s),
+                    Err(e) => {
+                        log::warn!("audio scrubbing: {e}");
+                        self.ui.status = format!("Audio scrubbing: {e}");
+                        return;
+                    }
                 }
             }
         }
@@ -1088,14 +1149,62 @@ impl EffectcraftApp {
     }
 
     fn check_scrub_context(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.audio_open.as_ref().is_some_and(|opening| {
+            !opening.context_current(&self.session.project, self.session.active_comp_id(), &audio::AudioOutput::from_prefs(&self.session.prefs))
+                || opening.scrub.is_some() == self.playback.playing
+        }) {
+            self.audio_open = None;
+        }
         if self.scrub.as_ref().is_some_and(|scrub| !scrub.context_current(&self.session.project, self.session.active_comp_id())) {
             self.scrub = None;
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_audio_open(&mut self, ctx: &egui::Context) {
+        let Some(opening) = &self.audio_open else { return };
+        let now = ctx.input(|i| i.time);
+        // A slow driver must not play an old scrub after the user has stopped dragging.
+        if opening.scrub.is_some_and(|(_, _, used)| now - used > 1.0) {
+            self.audio_open = None;
+            return;
+        }
+        let Some(result) = opening.poll() else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(5));
+            return;
+        };
+        let Some(opening) = self.audio_open.take() else { return };
+        self.playback.start_wall = now;
+        self.playback.waiting = false;
+        match result {
+            Ok(Some(audio::opening::Opened::Playback(playback))) => {
+                playback.feed.resume();
+                self.audio = Some(playback);
+            }
+            Ok(Some(audio::opening::Opened::Scrub(mut scrub))) => {
+                if let (Some((time, mix, used)), Some(comp)) = (opening.scrub, self.session.active_comp_id()) {
+                    scrub.play(&self.render_source(), comp, time, mix, used);
+                    self.scrub = Some(scrub);
+                    self.check_scrub_error();
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                log::warn!("audio output: {error}");
+                self.ui.status = format!("Audio output: {error}");
+            }
+        }
+        ctx.request_repaint();
+    }
+
     pub fn stop(&mut self) {
         let was = std::mem::replace(&mut self.playback.playing, false);
         self.audio = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.audio_open = None;
+        }
         self.playback.caching = false;
         if !was {
             return;
@@ -1295,6 +1404,14 @@ impl EffectcraftApp {
             ctx.request_repaint();
         }
         self.check_scrub_error();
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.audio_open.as_ref().is_some_and(|opening| opening.scrub.is_none()) {
+            // Preserve the start frame while the driver opens. The accepted audio clock
+            // starts here; missing/failed devices rebase the silent clock in poll_audio_open.
+            self.playback.waiting = true;
+            ctx.request_repaint_after(std::time::Duration::from_millis(5));
+            return;
+        }
         if !self.playback.playing {
             self.cache_when_idle(ctx, &c, &series, now, (wa, wb));
             return;
@@ -1749,6 +1866,8 @@ impl EffectcraftApp {
         self.draw_toast(ui, full, lift);
         // A menu, shortcut or panel may have switched projects/comps during this frame.
         self.check_scrub_context();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.poll_audio_open(&ctx);
         if self.session.config.is_some() && self.workspace_store.has_changes(&self.ui) && !ctx.input(|i| i.pointer.any_down()) {
             if self.workspace_store.due(ctx.input(|i| i.time)) {
                 self.save_workspace_state();

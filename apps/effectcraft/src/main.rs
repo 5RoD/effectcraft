@@ -307,7 +307,7 @@ fn main() -> eframe::Result {
                 rfd::FileDialog::new().add_filter("EffectCraft Project", &["ecproj", "ecprojx"]).pick_file().map(|p| p.to_string_lossy().to_string())
             }));
             app.hooks.system_theme = appearance::service();
-            app.hooks.audio_device = Some(Box::new(audio_out::open));
+            app.hooks.audio_device = Some(std::sync::Arc::new(audio_out::open));
             app.hooks.audio_devices = Some(Box::new(audio_out::devices));
             app.hooks.pick_folder = Some(Box::new(|| rfd::FileDialog::new().pick_folder().map(|p| p.to_string_lossy().to_string())));
             app.hooks.pick_save_file = Some(Box::new(|name: &str, ext: &str| {

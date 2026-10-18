@@ -23,6 +23,8 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod opening;
 mod scrub;
 pub mod workers;
 pub use scrub::AudioScrub;
@@ -59,8 +61,12 @@ pub trait AudioDevice: Send {
     fn pump(&mut self) {}
 }
 
-/// Opens the default output device (`None` when there is none).
+/// Opens the selected output device (`None` when there is none). Native factories are shared
+/// with the bounded opening worker; browser factories stay on the user-gesture thread.
+#[cfg(target_arch = "wasm32")]
 pub type AudioDeviceFactory = Box<dyn Fn(&AudioOutput) -> Option<Box<dyn AudioDevice>>>;
+#[cfg(not(target_arch = "wasm32"))]
+pub type AudioDeviceFactory = Arc<dyn Fn(&AudioOutput) -> Option<Box<dyn AudioDevice>> + Send + Sync>;
 
 /// Which output to open (Settings ▸ Audio): device name (empty = the system default) and the
 /// 1-based device channels for left and right.
@@ -91,12 +97,14 @@ pub struct AudioFeed {
     finished: AtomicBool,
     /// A stopped preview never accepts late samples from its previous mixing operation.
     closed: AtomicBool,
+    /// An asynchronously opened output cannot consume sound before the UI accepts its context.
+    suspended: AtomicBool,
 }
 
 impl AudioFeed {
     /// Fill `out` (interleaved stereo) from the queue; silence where the queue runs dry.
     pub fn pull(&self, out: &mut [f32]) {
-        if self.closed.load(Ordering::Acquire) {
+        if self.closed.load(Ordering::Acquire) || self.suspended.load(Ordering::Acquire) {
             out.fill(0.0);
             return;
         }
@@ -244,7 +252,7 @@ impl AudioPlayback {
     /// at (resampled to the device's rate when they differ; 0 = the device's rate).
     #[allow(clippy::too_many_arguments)]
     pub fn start(
-        mut device: Box<dyn AudioDevice>,
+        device: Box<dyn AudioDevice>,
         src: RenderSource,
         comp: ItemId,
         start: Tick,
@@ -253,10 +261,23 @@ impl AudioPlayback {
         looping: bool,
         mix_rate: u32,
     ) -> Result<AudioPlayback, String> {
+        Self::start_with_feed(device, src, comp, start, wa, wb, looping, mix_rate, Arc::new(AudioFeed::default()))
+    }
+
+    pub(crate) fn start_with_feed(
+        mut device: Box<dyn AudioDevice>,
+        src: RenderSource,
+        comp: ItemId,
+        start: Tick,
+        wa: Tick,
+        wb: Tick,
+        looping: bool,
+        mix_rate: u32,
+        feed: Arc<AudioFeed>,
+    ) -> Result<AudioPlayback, String> {
         let rate = device_rate(device.sample_rate())?;
         let mix = if mix_rate == 0 { rate } else { mix_rate.clamp(8000, 192_000) };
         let span = PlaySpan::new(start, wa, wb, looping, rate);
-        let feed = Arc::new(AudioFeed::default());
         let stop = Arc::new(AtomicBool::new(false));
         if cfg!(target_arch = "wasm32") {
             // The device takes samples only in `pump`, which fills the queue first.

@@ -72,6 +72,13 @@ application and Desktop shortcut have not been removed or replaced.
   Auto without audio reached 119.01 over 35 seconds. The continuous-audio target still failed;
   a fully cached audio loop remained near 100 fps. The timestamp-clock correction and its
   outstanding acceptance are described in [audio preview timing](audio-preview-clock.md).
+- Native audio device discovery and startup use bounded background workers, including outputs
+  still opening after cancellation. Playback holds its starting frame and keeps queued samples
+  silent until the UI accepts the result. Stop, project/comp changes and changed output settings
+  discard obsolete openings; scrub requests share one opening and retain only the latest gesture.
+  Missing/failed devices leave a responsive silent preview and actionable errors. Browser audio
+  retains its inline user-gesture startup. Native device latency and sustained playback still
+  require production acceptance; windowless fake-device regressions verify cancellation and silence.
 - Native audio scrubbing decodes and mixes on one bounded worker with a replaceable latest
   request. New gestures and project/composition changes cancel obsolete sound; shutdown does
   not wait for a blocked read. Output/worker failures remain retryable. Synthetic regressions
