@@ -1064,6 +1064,7 @@ impl EffectcraftApp {
                 Ok(s) => self.scrub = Some(s),
                 Err(e) => {
                     log::warn!("audio scrubbing: {e}");
+                    self.ui.status = format!("Audio scrubbing: {e}");
                     return;
                 }
             }
@@ -1072,6 +1073,21 @@ impl EffectcraftApp {
         let mix = self.session.prefs.audio.preview_sample_rate;
         if let Some(s) = &mut self.scrub {
             s.play(&src, comp, t, mix, now);
+        }
+        self.check_scrub_error();
+    }
+
+    fn check_scrub_error(&mut self) {
+        if let Some(error) = self.scrub.as_mut().and_then(audio::AudioScrub::take_error) {
+            log::warn!("audio scrubbing: {error}");
+            self.ui.status = format!("Audio scrubbing: {error}");
+            self.scrub = None;
+        }
+    }
+
+    fn check_scrub_context(&mut self) {
+        if self.scrub.as_ref().is_some_and(|scrub| !scrub.context_current(&self.session.project, self.session.active_comp_id())) {
+            self.scrub = None;
         }
     }
 
@@ -1276,6 +1292,7 @@ impl EffectcraftApp {
             self.meter.update([0.0; 2], now);
             ctx.request_repaint();
         }
+        self.check_scrub_error();
         if !self.playback.playing {
             self.cache_when_idle(ctx, &c, &series, now, (wa, wb));
             return;
@@ -1674,6 +1691,7 @@ impl EffectcraftApp {
         self.run_script_tasks(&ctx);
         self.apply_prefs(&ctx);
         self.handle_events(&ctx);
+        self.check_scrub_context();
         panels::unsaved::on_close_requested(self, &ctx);
         let title = panels::unsaved::window_title(self);
         if title != self.window_title {
@@ -1727,6 +1745,8 @@ impl EffectcraftApp {
         panels::learn::coach(self, &ctx);
         let lift = panels::media_panels::import_card(self, ui, full);
         self.draw_toast(ui, full, lift);
+        // A menu, shortcut or panel may have switched projects/comps during this frame.
+        self.check_scrub_context();
         if self.session.config.is_some() && self.workspace_store.has_changes(&self.ui) && !ctx.input(|i| i.pointer.any_down()) {
             if self.workspace_store.due(ctx.input(|i| i.time)) {
                 self.save_workspace_state();

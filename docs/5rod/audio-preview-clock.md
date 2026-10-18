@@ -65,3 +65,21 @@ created. Browser audio retains its UI-thread device lifecycle. Synthetic tests u
 late callbacks, output rejection, full and contended registries, poisoning and worker panics.
 Repository validation and native playback acceptance remain required; this change does not
 remove the existing policy that holds audio when the every-frame preview encounters a cache miss.
+
+## Native audio scrubbing
+
+Scrubbing uses one worker from the same bounded feeder registry for the lifetime of an open
+native scrub output. The UI posts immutable source snapshots and immediately cancels the
+previous request. A replaceable mailbox keeps the latest request while a read is in flight;
+the worker does not hold the mailbox while decoding or mixing. Its wake channel has one slot.
+Only mailbox contention uses a single UI retry slot, retried by the normal audio pump.
+
+Cancellation is checked under the output queue lock before replacing samples, so a late result
+cannot play after a newer gesture clears the queue. Changing the project snapshot or active
+composition also retires the output, even when a new project reuses the same numeric IDs.
+Stop disconnects the idle worker and rejects late output from a busy worker. Worker failures close the output and expose a retryable status
+message. Device-derived allocations are capped by rejecting preview rates above 1,536,000 Hz;
+ordinary device rates and the existing browser inline path are retained. Synthetic tests cover
+gated reads, rapid replacement, duplicate frames, project switches, shutdown, contention, poisoning, panics,
+partial output failure and hostile device rates. These changes do not establish a native
+scrubbing-latency target or physical audiovisual synchronization.

@@ -51,6 +51,17 @@ fn setup_long(audible: bool, fake: &Fake, duration: f64) -> (EffectcraftApp, Ite
     (app, cid)
 }
 
+fn wait_for_frames(app: &mut EffectcraftApp, feed: &AudioFeed, frames: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while feed.queued_frames() != frames {
+        let scrub = app.scrub.as_mut().expect("scrub remains open");
+        scrub.pump();
+        assert!(scrub.take_error().is_none());
+        assert!(std::time::Instant::now() < deadline, "scrub samples were not delivered");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 #[test]
 fn scrubbing_plays_one_frame_per_new_frame() {
     let fake = Fake::default();
@@ -59,6 +70,7 @@ fn scrubbing_plays_one_frame_per_new_frame() {
     app.scrub_audio(cid, t(0.5), 0.0);
     let feed = fake.0.lock().unwrap().0.clone().expect("the output opened");
     // One 30 fps frame at 48 kHz, and not silence.
+    wait_for_frames(&mut app, &feed, 1600);
     assert_eq!(feed.queued_frames(), 1600);
     let mut out = vec![0.0f32; 3200];
     feed.pull(&mut out);
@@ -70,6 +82,7 @@ fn scrubbing_plays_one_frame_per_new_frame() {
     assert_eq!(feed.queued_frames(), 0);
     feed.push(&[0.0; 1000]);
     app.scrub_audio(cid, t(0.6), 0.2);
+    wait_for_frames(&mut app, &feed, 1600);
     assert_eq!(feed.queued_frames(), 1600, "replaced, not piled up");
     // A silent comp opens nothing.
     let silent = Fake::default();
@@ -97,6 +110,8 @@ fn cmd_dragging_the_current_time_scrubs_and_an_idle_scrub_closes() {
         h.step();
     }
     assert!(h.state().scrub.is_some(), "Cmd-drag opened the scrub output");
+    let feed = fake.0.lock().unwrap().0.clone().unwrap();
+    wait_for_frames(h.state_mut(), &feed, 1600);
     assert!(fake.0.lock().unwrap().0.as_ref().is_some_and(|f| f.queued_frames() > 0));
     h.event(Event::PointerButton { pos: from + egui::vec2(160.0, 0.0), button: egui::PointerButton::Primary, pressed: false, modifiers: cmd });
     h.step();

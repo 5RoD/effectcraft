@@ -23,7 +23,9 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod scrub;
 pub mod workers;
+pub use scrub::AudioScrub;
 use workers::AudioWorkers;
 
 static FEEDERS: AudioWorkers = AudioWorkers::new();
@@ -140,6 +142,15 @@ impl AudioFeed {
         self.finished.store(true, Ordering::Release);
     }
 
+    fn replace_current(&self, samples: &[f32], cancelled: &AtomicBool) {
+        let mut queue = self.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.closed.load(Ordering::Acquire) || cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        queue.clear();
+        queue.extend(samples.iter().copied());
+    }
+
     /// Sample frames waiting in the queue.
     pub fn queued_frames(&self) -> usize {
         self.queue.lock().map(|q| q.len() / 2).unwrap_or(0)
@@ -202,6 +213,14 @@ pub fn frame_of_sample(s: i64, rate: u32, fps: FrameRate) -> i64 {
 /// Block size the feeder mixes at a time.
 const BLOCK: usize = 1024;
 
+/// Bound device-derived snippet and queue allocations, retaining ordinary PCM device rates.
+fn device_rate(rate: u32) -> Result<u32, String> {
+    if rate > 1_536_000 {
+        return Err("audio output sample rate exceeds the preview allocation budget".into());
+    }
+    Ok(rate.max(8000))
+}
+
 /// A running audio preview: device + feeder thread.
 pub struct AudioPlayback {
     pub feed: Arc<AudioFeed>,
@@ -234,7 +253,7 @@ impl AudioPlayback {
         looping: bool,
         mix_rate: u32,
     ) -> Result<AudioPlayback, String> {
-        let rate = device.sample_rate().max(8000);
+        let rate = device_rate(device.sample_rate())?;
         let mix = if mix_rate == 0 { rate } else { mix_rate.clamp(8000, 192_000) };
         let span = PlaySpan::new(start, wa, wb, looping, rate);
         let feed = Arc::new(AudioFeed::default());
@@ -348,67 +367,6 @@ fn mix_block(src: &RenderSource, comp: ItemId, t: Tick, n: usize, rate: u32, mix
     resample_stereo(&render(m, mix), mix, rate, n)
 }
 
-/// Audio scrubbing: an open output that plays a short, faded snippet of the comp's mix each time
-/// the current time moves to another frame (each snippet replaces what is still queued, so the
-/// sound follows the pointer without lagging behind).
-pub struct AudioScrub {
-    pub feed: Arc<AudioFeed>,
-    device: Box<dyn AudioDevice>,
-    pub rate: u32,
-    /// The comp and frame last played (holding still repeats nothing).
-    last: Option<(ItemId, i64)>,
-    /// When it last played (UI seconds): an idle scrub closes the device.
-    pub last_used: f64,
-}
-
-impl AudioScrub {
-    pub fn open(mut device: Box<dyn AudioDevice>, now: f64) -> Result<AudioScrub, String> {
-        let rate = device.sample_rate().max(8000);
-        let feed = Arc::new(AudioFeed::default());
-        device.start(feed.clone())?;
-        Ok(AudioScrub { feed, device, rate, last: None, last_used: now })
-    }
-
-    /// Play the frame of `comp` at `t` (one frame long, 30–100 ms) unless it was the last one
-    /// played. Returns whether a snippet was queued.
-    pub fn play(&mut self, src: &RenderSource, comp: ItemId, t: Tick, mix_rate: u32, now: f64) -> bool {
-        self.last_used = now;
-        let Some(c) = src.project.comp(comp) else { return false };
-        let frame = c.frame_rate.frame_at(t);
-        if self.last == Some((comp, frame)) {
-            return false;
-        }
-        self.last = Some((comp, frame));
-        let rate = self.rate;
-        let mix = if mix_rate == 0 { rate } else { mix_rate.clamp(8000, 192_000) };
-        let n = (c.frame_duration().seconds().clamp(0.03, 0.1) * rate as f64) as usize;
-        let mut buf = mix_block(src, comp, c.frame_rate.tick_of(frame), n, rate, mix);
-        // 3 ms fades: no clicks where snippets meet.
-        let fade = (rate as usize * 3 / 1000).clamp(1, n / 2 + 1);
-        let frames = buf.len() / 2;
-        for i in 0..frames {
-            let g = (i.min(frames - 1 - i) as f32 / fade as f32).min(1.0);
-            buf[2 * i] *= g;
-            buf[2 * i + 1] *= g;
-        }
-        self.feed.clear();
-        self.feed.push(&buf);
-        true
-    }
-
-    /// Every UI frame while open (Web Audio moves queued samples to the output here).
-    pub fn pump(&mut self) {
-        self.device.pump();
-    }
-}
-
-impl Drop for AudioScrub {
-    fn drop(&mut self) {
-        self.feed.close();
-        self.device.stop();
-    }
-}
-
 /// Linear resampling of interleaved stereo from `from` Hz to `n` frames at `to` Hz.
 pub fn resample_stereo(src: &[f32], from: u32, to: u32, n: usize) -> Vec<f32> {
     let frames = src.len() / 2;
@@ -486,7 +444,7 @@ impl Meter {
 mod tests {
     use super::*;
 
-    fn audio_fixture(footage: Arc<dyn effectcraft_engine::render::FootageSource>) -> (RenderSource, ItemId) {
+    pub(super) fn audio_fixture(footage: Arc<dyn effectcraft_engine::render::FootageSource>) -> (RenderSource, ItemId) {
         use effectcraft_engine::color::Label;
         use effectcraft_engine::project::{Comp, Footage, FootageKind, ItemKind, LayerSource, Project, build};
         use effectcraft_engine::render::cache::LayerCache;
@@ -576,6 +534,30 @@ mod tests {
         assert_eq!(feed.queued_frames(), 0);
         assert_eq!(feed.consumed(), 0);
         assert!(feed.finished());
+    }
+
+    #[test]
+    fn unreasonable_audio_device_rates_are_rejected_before_opening_outputs() {
+        use effectcraft_engine::render::NoFootage;
+        struct Device(Arc<AtomicBool>);
+        impl AudioDevice for Device {
+            fn sample_rate(&self) -> u32 {
+                u32::MAX
+            }
+            fn start(&mut self, _: Arc<AudioFeed>) -> Result<(), String> {
+                self.0.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+            fn stop(&mut self) {}
+        }
+        let opened = Arc::new(AtomicBool::new(false));
+        assert!(AudioScrub::open(Box::new(Device(opened.clone())), 0.0).is_err());
+        let (source, comp) = audio_fixture(Arc::new(NoFootage));
+        assert!(AudioPlayback::start(Box::new(Device(opened.clone())), source, comp, Tick::ZERO, Tick::ZERO, Tick::from_seconds_f64(1.0), true, 0).is_err());
+        assert!(!opened.load(Ordering::Relaxed));
+        assert_eq!(device_rate(0).unwrap(), 8000);
+        assert_eq!(device_rate(192_000).unwrap(), 192_000);
+        assert_eq!(device_rate(1_536_000).unwrap(), 1_536_000);
     }
 
     #[test]
