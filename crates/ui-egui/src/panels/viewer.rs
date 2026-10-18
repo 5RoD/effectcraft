@@ -1045,6 +1045,19 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         // Layer Handles and Paths.
         let hs = app.session.prefs.general.path_point_size as f32 + 2.0;
         let label_handles = app.session.prefs.appearance.use_label_color_for_handles;
+        // Nulls are rig controls: their outlines remain visible without selection (#1642).
+        // Keep this separate from selected layers so they gain no handles, anchors or paths. Solo
+        // scope matches picking (`selectable_layers`), so a null that can't be clicked isn't drawn.
+        let any_solo = comp.layers.iter().any(|l| l.switches.solo && l.source.is_av());
+        for l in comp.layers.iter().filter(|l| {
+            matches!(l.source, LayerSource::Null) && !selected.contains(&l.id) && l.is_active_at(time) && l.switches.video && (!any_solo || l.switches.solo)
+        }) {
+            let outline = layer_outline(&ectx, l);
+            if outline.len() > 2 {
+                let col = if label_handles { t.label(l.label) } else { t.accent };
+                painter.add(egui::Shape::closed_line(outline.into_iter().map(|p| map.to_screen(p)).collect(), Stroke::new(1.0, col)));
+            }
+        }
         // A layer whose Video switch is off has no box, handles or paths in the viewer (a hidden
         // null disappears from the comp, as in After Effects), even while it is selected.
         for l in comp.layers.iter().filter(|l| selected.contains(&l.id) && l.is_active_at(time) && l.switches.video) {
@@ -1078,6 +1091,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         painter.add(egui::Shape::closed_line(sq, Stroke::new(1.0, col.gamma_multiply(0.6))));
                     }
                 }
+            }
+            // Path editing keeps vertices and tangents visible without the layer's transform
+            // box competing with them (#1220). The path's own free-transform box is separate.
+            let editing_path = paths.iter().any(|p| {
+                p.layer == l.id && (app.ui.tool.is_pen() || (app.ui.tool == Tool::Selection && sel_vertices.iter().any(|v| v.layer == l.id && v.mask == p.uid)))
+            });
+            if editing_path {
+                continue;
             }
             let Some((m, q, _)) = layer_quad(&ectx, l) else {
                 // A 3D layer reaching past the camera: the part of its box in front of it.
@@ -1353,7 +1374,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         caps
                     },
                 );
-                super::timeline::layer_menu(ui, &context_layers, caps, &mut context_actions);
+                super::timeline::layer_menu(ui, &context_layers, caps, (&mut app.auto, "viewer.layerMenu"), &mut context_actions);
             }
             ui.separator();
             if ui.button(copy_frame).clicked() {
@@ -1427,6 +1448,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 } else if vertex_at(hp, true).or_else(|| vertex_at(hp, false)).is_some() {
                     // A path point under a box handle is grabbed first: no resize cursor.
                     egui::CursorIcon::PointingHand
+                } else if super::viewer_gizmo::hit(&gizmo_hits, hp).is_some() {
+                    egui::CursorIcon::Move
                 } else if let Some((.., cursor)) = handle_hits.iter().find(|(_, _, h, _)| h.distance(hp) < HANDLE) {
                     *cursor
                 } else {
@@ -2195,6 +2218,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     crate::panels::effect_controls::viewer_hook(app, ui, &painter, &map, &ectx, &|c, l| l2c(c, l).0);
     // Selected shape gradients' start and end points (#612).
     crate::panels::gradient_handles::viewer_hook(app, ui, &painter, &map, &ectx, &|c, l| l2c(c, l).0);
+    // Selected text Range Selectors' Start and End bars (#1011).
+    crate::panels::text_range_handles::viewer_hook(app, ui, &painter, &map, &ectx, &|c, l| l2c(c, l).0);
 
     // Status chips (render time / caching).
     if app.playback.playing && app.playback.waiting {
@@ -2217,6 +2242,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
 }
 
+/// World to parent space for a 3D layer (identity without a parent).
+fn parent_world_inverse(ctx: &EvalCtx, l: &Layer) -> effectcraft_engine::geom::Mat4 {
+    match l.parent.and_then(|p| ctx.comp.layer(p)) {
+        Some(p) => ctx.world_matrix(p).inverse().unwrap_or_default(),
+        None => effectcraft_engine::geom::Mat4::IDENTITY,
+    }
+}
+
 /// Parent-space position change per comp pixel of drag (x and y) for a layer: 2D layers map
 /// through the parent transform; 3D layers move in the view plane at their depth.
 fn drag_axes(ctx: &EvalCtx, l: &Layer) -> ([f64; 3], [f64; 3]) {
@@ -2230,10 +2263,7 @@ fn drag_axes(ctx: &EvalCtx, l: &Layer) -> ([f64; 3], [f64; 3]) {
     let anchor = l.transform().map(|tr| ctx.v3(l, tr, "anchor", [0.0; 3])).unwrap_or([0.0; 3]);
     let wp = ctx.world_matrix(l).apply(anchor.into());
     let k = if cam.ortho { 1.0 / cam.zoom.max(1e-9) } else { cam.depth(wp).max(1.0) / cam.zoom.max(1e-9) };
-    let pinv = match l.parent.and_then(|p| ctx.comp.layer(p)) {
-        Some(p) => ctx.world_matrix(p).inverse().unwrap_or_default(),
-        None => effectcraft_engine::geom::Mat4::IDENTITY,
-    };
+    let pinv = parent_world_inverse(ctx, l);
     let a = pinv.apply_vec(cam.right() * k);
     let b = pinv.apply_vec(cam.down() * k);
     ([a.x, a.y, a.z], [b.x, b.y, b.z])

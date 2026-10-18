@@ -131,6 +131,61 @@ pub(crate) fn open_container(path: &Path) -> Result<Option<SharedSource>> {
     Ok(opened)
 }
 
+/// Optional ISO-BMFF metadata for rate correction. Samples stay on disk; all copied header
+/// boxes together share the same 64 MiB budget as a single positional read.
+pub(crate) fn movie_header(path: &Path) -> Option<Vec<u8>> {
+    let reader = FileReader::open(path).ok()?;
+    let header = movie_header_from(&reader)?;
+    reader.check_length().ok()?;
+    Some(header)
+}
+
+fn movie_header_from(reader: &dyn ByteReader) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut offset = 0u64;
+    for _ in 0..4096 {
+        if offset.checked_add(8)? > reader.len() {
+            return None;
+        }
+        let mut header = [0u8; 8];
+        reader.read_at(offset, &mut header).ok()?;
+        let short = u32::from_be_bytes(header.get(..4)?.try_into().ok()?);
+        let (size, minimum) = match short {
+            0 => (reader.len().checked_sub(offset)?, 8),
+            1 => {
+                if offset.checked_add(16)? > reader.len() {
+                    return None;
+                }
+                let mut extended = [0u8; 8];
+                reader.read_at(offset.checked_add(8)?, &mut extended).ok()?;
+                (u64::from_be_bytes(extended), 16)
+            }
+            size => (u64::from(size), 8),
+        };
+        let end = offset.checked_add(size)?;
+        if size < minimum || end > reader.len() {
+            return None;
+        }
+        let kind = header.get(4..8)?;
+        if kind == b"ftyp" || kind == b"moov" {
+            let size = usize::try_from(size).ok()?;
+            let start = bytes.len();
+            let end = start.checked_add(size)?;
+            if end > MAX_READ_BYTES {
+                return None;
+            }
+            bytes.try_reserve_exact(size).ok()?;
+            bytes.resize(end, 0);
+            reader.read_at(offset, bytes.get_mut(start..end)?).ok()?;
+            if kind == b"moov" {
+                return Some(bytes);
+            }
+        }
+        offset = end;
+    }
+    None
+}
+
 fn buffer_reader(name: &str, reader: &dyn ByteReader, limit: u64) -> Result<Vec<u8>> {
     let len = reader.len();
     if len > limit {
@@ -253,6 +308,52 @@ pub(crate) mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn rate_metadata_reads_headers_without_visiting_sparse_media() {
+        let bytes = movie();
+        let at = moov_start(&bytes);
+        let moov_at = 1 << 40;
+        let mut before = bytes[..at].to_vec();
+        before.extend_from_slice(&1u32.to_be_bytes());
+        before.extend_from_slice(b"free");
+        before.extend_from_slice(&(moov_at - at as u64).to_be_bytes());
+        let reader = SparseMovie { before, moov: bytes[at..].to_vec(), moov_at, bytes_read: AtomicU64::new(0) };
+        let header = movie_header_from(&reader).unwrap();
+        assert!(header.len() < 32 << 10);
+        assert!(reader.bytes_read.load(Ordering::Relaxed) < 32 << 10);
+        let parsed = filmcraft_isobmff::open(&header).unwrap();
+        assert_eq!(parsed.tracks.len(), 1);
+        assert_eq!(parsed.tracks[0].samples.len(), 3);
+        let file = TempFile::new("mp4", &bytes);
+        assert_eq!(movie_header(&file.0).unwrap(), header);
+    }
+
+    #[test]
+    fn rate_metadata_rejects_bad_extents_and_caps_all_copied_boxes_together() {
+        for header in [
+            [1u32.to_be_bytes().as_slice(), b"moov", 8u64.to_be_bytes().as_slice()].concat(),
+            [u32::MAX.to_be_bytes().as_slice(), b"moov"].concat(),
+            [1u32.to_be_bytes().as_slice(), b"moov", u64::MAX.to_be_bytes().as_slice()].concat(),
+        ] {
+            let reader = SparseMovie { before: header, moov: Vec::new(), moov_at: 16, bytes_read: AtomicU64::new(0) };
+            assert!(movie_header_from(&reader).is_none());
+        }
+        // The first box fills the budget. Another tiny ftyp must fail before extending it.
+        let first = [(MAX_READ_BYTES as u32).to_be_bytes().as_slice(), b"ftyp"].concat();
+        let rest = [8u32.to_be_bytes().as_slice(), b"ftyp", 8u32.to_be_bytes().as_slice(), b"moov"].concat();
+        let reader = SparseMovie { before: first, moov: rest, moov_at: MAX_READ_BYTES as u64, bytes_read: AtomicU64::new(0) };
+        assert!(movie_header_from(&reader).is_none());
+        assert_eq!(reader.bytes_read.load(Ordering::Relaxed), MAX_READ_BYTES as u64 + 16);
+        let reader = SparseMovie {
+            before: [8u32.to_be_bytes().as_slice(), b"free"].concat().repeat(4097),
+            moov: Vec::new(),
+            moov_at: 8 * 4097,
+            bytes_read: AtomicU64::new(0),
+        };
+        assert!(movie_header_from(&reader).is_none());
+        assert_eq!(reader.bytes_read.load(Ordering::Relaxed), 8 * 4096, "box walks are bounded too");
     }
 
     #[test]

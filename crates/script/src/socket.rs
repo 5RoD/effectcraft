@@ -50,8 +50,8 @@ mod imp {
 mod imp {
     use std::collections::BTreeMap;
     use std::io::{ErrorKind, Read, Write};
-    use std::net::{TcpListener, TcpStream, ToSocketAddrs};
-    use std::sync::Mutex;
+    use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -61,9 +61,20 @@ mod imp {
         Listener(TcpListener),
     }
 
+    /// One open socket. Reading, writing and polling lock only it, never the whole table, so a
+    /// socket blocked on a slow peer doesn't hold up the others (#1248).
+    struct Entry {
+        sock: Mutex<Sock>,
+        /// A second handle on a stream, so `close` can shut it down while another call is
+        /// blocked reading or writing it.
+        wake: Option<TcpStream>,
+        closed: Mutex<bool>,
+        changed: Condvar,
+    }
+
     struct Table {
         next: u32,
-        socks: BTreeMap<u32, Sock>,
+        socks: BTreeMap<u32, Arc<Entry>>,
     }
 
     fn table() -> &'static Mutex<Table> {
@@ -72,11 +83,70 @@ mod imp {
     }
 
     fn add(s: Sock) -> u32 {
+        let wake = match &s {
+            Sock::Stream { s, .. } => s.try_clone().ok(),
+            Sock::Listener(_) => None,
+        };
+        let entry = Arc::new(Entry { sock: Mutex::new(s), wake, closed: Mutex::new(false), changed: Condvar::new() });
         let mut t = table().lock().unwrap_or_else(|e| e.into_inner());
         let id = t.next;
         t.next += 1;
-        t.socks.insert(id, s);
+        t.socks.insert(id, entry);
         id
+    }
+
+    /// The socket `id`, if open. The table is locked only for the lookup.
+    fn get(id: u32) -> Option<Arc<Entry>> {
+        table().lock().unwrap_or_else(|e| e.into_inner()).socks.get(&id).cloned()
+    }
+
+    /// Forget socket `id`; a call blocked on it fails at once.
+    fn close(id: u32) {
+        let entry = table().lock().unwrap_or_else(|e| e.into_inner()).socks.remove(&id);
+        if let Some(entry) = entry {
+            *entry.closed.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            entry.changed.notify_all();
+            if let Some(w) = &entry.wake {
+                let _ = w.shutdown(Shutdown::Both);
+            }
+        }
+    }
+
+    /// Nonblocking sends preserve partial-write counts and let close interrupt backpressure
+    /// on Windows too. Wait only when full; a deadline and close signal bound every retry.
+    fn write(s: &mut TcpStream, entry: &Entry, data: &[u8], limit: Duration) -> std::io::Result<()> {
+        use std::io::{Error, Result};
+        let end = Instant::now().checked_add(limit).ok_or_else(|| Error::other("socket write deadline is out of range"))?;
+        s.set_nonblocking(true)?;
+        let result = (|| -> Result<()> {
+            let mut remaining = data;
+            while !remaining.is_empty() {
+                if *entry.closed.lock().unwrap_or_else(|e| e.into_inner()) {
+                    return Err(Error::new(ErrorKind::NotConnected, "socket was closed while writing"));
+                }
+                let left = end.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(Error::new(ErrorKind::TimedOut, "socket write deadline elapsed"));
+                }
+                match s.write(remaining) {
+                    Ok(0) => return Err(Error::new(ErrorKind::WriteZero, "socket accepted no more data")),
+                    Ok(n) => remaining = remaining.get(n..).ok_or_else(|| Error::other("socket returned an invalid write count"))?,
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        let closed = entry.closed.lock().unwrap_or_else(|e| e.into_inner());
+                        let (closed, _) =
+                            entry.changed.wait_timeout_while(closed, left.min(Duration::from_millis(2)), |closed| !*closed).unwrap_or_else(|e| e.into_inner());
+                        if *closed {
+                            return Err(Error::new(ErrorKind::NotConnected, "socket was closed while writing"));
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        })();
+        let restored = s.set_nonblocking(false).map_err(|e| std::io::Error::new(e.kind(), format!("cannot restore socket blocking mode: {e}")));
+        result.and(restored)
     }
 
     fn timeout(p: &J) -> Duration {
@@ -98,8 +168,9 @@ mod imp {
         if utf8 { String::from_utf8_lossy(b).into_owned() } else { b.iter().map(|&c| c as char).collect() }
     }
 
-    /// Fill a stream's buffer until `done(buf)` or the timeout / end of stream.
-    fn fill(s: &mut TcpStream, buf: &mut Vec<u8>, eof: &mut bool, limit: Duration, done: impl Fn(&[u8]) -> bool) {
+    /// Fill a stream's buffer until `done(buf)` or the timeout / end of stream. Fails only when
+    /// the read deadline can't be set.
+    fn fill(s: &mut TcpStream, buf: &mut Vec<u8>, eof: &mut bool, limit: Duration, done: impl Fn(&[u8]) -> bool) -> std::io::Result<()> {
         let end = Instant::now() + limit;
         let mut chunk = [0u8; 4096];
         while !done(buf) && !*eof {
@@ -107,7 +178,7 @@ mod imp {
             if left.is_zero() {
                 break;
             }
-            let _ = s.set_read_timeout(Some(left.max(Duration::from_millis(1))));
+            s.set_read_timeout(Some(left.max(Duration::from_millis(1))))?;
             match s.read(&mut chunk) {
                 Ok(0) => *eof = true,
                 Ok(n) => buf.extend_from_slice(&chunk[..n]),
@@ -119,6 +190,7 @@ mod imp {
                 Err(_) => *eof = true,
             }
         }
+        Ok(())
     }
 
     pub(super) fn run(op: &str, id: u32, p: &J) -> J {
@@ -156,29 +228,27 @@ mod imp {
                     Err(e) => err(format!("cannot listen on port {port}: {e}")),
                 }
             }
+            "close" => {
+                close(id);
+                json!({})
+            }
             _ => {
-                let mut t = table().lock().unwrap_or_else(|e| e.into_inner());
-                if op == "close" {
-                    t.socks.remove(&id);
-                    return json!({});
-                }
-                let Some(sock) = t.socks.get_mut(&id) else {
+                let Some(entry) = get(id) else {
                     return match op {
                         "connected" => json!({"value": false}),
                         "eof" => json!({"value": true}),
                         _ => err("the socket is not open"),
                     };
                 };
-                match (op, sock) {
+                let mut sock = entry.sock.lock().unwrap_or_else(|e| e.into_inner());
+                match (op, &mut *sock) {
                     ("poll", Sock::Listener(l)) => match l.accept() {
                         Ok((s, peer)) => {
-                            let _ = s.set_nonblocking(false);
+                            if let Err(e) = s.set_nonblocking(false) {
+                                return err(format!("cannot use the connection from {peer}: {e}"));
+                            }
                             let host = peer.to_string();
-                            let new = Sock::Stream { s, buf: vec![], eof: false };
-                            let nid = t.next;
-                            t.next += 1;
-                            t.socks.insert(nid, new);
-                            json!({"id": nid, "host": host})
+                            json!({"id": add(Sock::Stream { s, buf: vec![], eof: false }), "host": host})
                         }
                         Err(_) => json!({"id": null}),
                     },
@@ -202,19 +272,25 @@ mod imp {
                         let count = p.get("count").and_then(J::as_i64).unwrap_or(-1);
                         let limit = timeout(p);
                         if count < 0 {
-                            fill(s, buf, eof, limit, |_| false);
+                            if let Err(e) = fill(s, buf, eof, limit, |_| false) {
+                                return err(format!("cannot set the read timeout: {e}"));
+                            }
                             let all = std::mem::take(buf);
                             json!({"data": decode(&all, utf8)})
                         } else {
                             let n = count as usize;
-                            fill(s, buf, eof, limit, |b| b.len() >= n);
+                            if let Err(e) = fill(s, buf, eof, limit, |b| b.len() >= n) {
+                                return err(format!("cannot set the read timeout: {e}"));
+                            }
                             let take = n.min(buf.len());
                             let out: Vec<u8> = buf.drain(..take).collect();
                             json!({"data": decode(&out, utf8)})
                         }
                     }
                     ("readln", Sock::Stream { s, buf, eof }) => {
-                        fill(s, buf, eof, timeout(p), |b| b.contains(&b'\n'));
+                        if let Err(e) = fill(s, buf, eof, timeout(p), |b| b.contains(&b'\n')) {
+                            return err(format!("cannot set the read timeout: {e}"));
+                        }
                         let line: Vec<u8> = match buf.iter().position(|&c| c == b'\n') {
                             Some(i) => {
                                 let mut l: Vec<u8> = buf.drain(..=i).collect();
@@ -229,9 +305,16 @@ mod imp {
                         json!({"data": decode(&line, utf8)})
                     }
                     ("write", Sock::Stream { s, .. }) => {
+                        // A peer that stops reading fills the buffers: give up after `timeout`
+                        // instead of blocking the script for good (#1248).
+                        let limit = timeout(p).max(Duration::from_millis(1));
                         let data = p.get("data").and_then(J::as_str).unwrap_or("");
-                        match s.write_all(&encode(data, utf8)).and_then(|_| s.flush()) {
+                        match write(s, &entry, &encode(data, utf8), limit) {
                             Ok(()) => json!({"ok": true}),
+                            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => err(format!(
+                                "write timed out after {} s: the other side isn't reading (some of the data may have been sent)",
+                                limit.as_secs_f64()
+                            )),
                             Err(e) => err(e),
                         }
                     }
@@ -239,6 +322,141 @@ mod imp {
                     (op, _) => err(format!("`{op}` is not supported on this socket")),
                 }
             }
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        use serde_json::{Value as J, json};
+
+        use super::{Sock, get, run};
+        use std::io::{ErrorKind, Read, Write};
+
+        /// A loopback peer that accepts one connection and never reads from it; returns its
+        /// `host:port` and the accepted stream's keeper (drop it to let the connection go).
+        fn stalled_peer() -> (String, mpsc::Sender<()>) {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let host = l.local_addr().unwrap().to_string();
+            let (stop, wait) = mpsc::channel::<()>();
+            std::thread::spawn(move || {
+                let (_s, _): (TcpStream, _) = l.accept().unwrap();
+                let _ = wait.recv_timeout(Duration::from_secs(120));
+            });
+            (host, stop)
+        }
+
+        fn open(host: &str) -> u32 {
+            let r = run("open", 0, &json!({"host": host, "timeout": 5}));
+            r["id"].as_u64().unwrap_or_else(|| panic!("open {host}: {r}")) as u32
+        }
+
+        /// Establish backpressure instead of assuming a large blocking write fills OS buffers.
+        /// Windows can accept the original 64 MiB payload into its pending-send storage.
+        fn fill_buffers(id: u32) -> usize {
+            let entry = get(id).unwrap();
+            let mut socket = entry.sock.lock().unwrap();
+            let Sock::Stream { s, .. } = &mut *socket else { panic!("expected a stream") };
+            s.set_nonblocking(true).unwrap();
+            let chunk = [b'x'; 64 * 1024];
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (mut sent, mut blocked) = (0usize, 0usize);
+            while blocked < 3 {
+                assert!(sent < 16 * 1024 * 1024 && Instant::now() < deadline, "loopback backpressure was not established");
+                match s.write(&chunk) {
+                    Ok(n) => {
+                        assert!(n > 0);
+                        sent += n;
+                        blocked = 0;
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        blocked += 1;
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    Err(error) => panic!("filling loopback buffers: {error}"),
+                }
+            }
+            s.set_nonblocking(false).unwrap();
+            sent
+        }
+
+        /// Run `f` on a thread; its result, or `None` if it takes longer than `limit`.
+        fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(f());
+            });
+            rx.recv_timeout(limit).ok()
+        }
+
+        #[test]
+        fn a_write_to_a_peer_that_stops_reading_fails_after_the_timeout() {
+            // #1248: it used to block for good.
+            let (host, _keep) = stalled_peer();
+            let id = open(&host);
+            fill_buffers(id);
+            let data = "x".repeat(64 * 1024);
+            let t0 = Instant::now();
+            let r = within(Duration::from_secs(20), move || run("write", id, &json!({"data": data, "timeout": 1}))).expect("the write gave up");
+            assert!(r["error"].as_str().is_some_and(|e| e.contains("timed out")), "{r}");
+            assert!(t0.elapsed() < Duration::from_secs(15), "{:?}", t0.elapsed());
+            run("close", id, &J::Null);
+        }
+
+        #[test]
+        fn a_blocked_socket_doesnt_hold_up_the_others_and_close_interrupts_it() {
+            let (host_a, _keep_a) = stalled_peer();
+            let (host_b, _keep_b) = stalled_peer();
+            let (a, b) = (open(&host_a), open(&host_b));
+            // A write on A that would wait a minute.
+            fill_buffers(a);
+            let data = "x".repeat(64 * 1024);
+            let (tx, blocked) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(run("write", a, &json!({"data": data, "timeout": 60})));
+            });
+            std::thread::sleep(Duration::from_millis(500));
+            assert!(matches!(blocked.try_recv(), Err(mpsc::TryRecvError::Empty)), "A must still be blocked");
+            // Socket B answers meanwhile (the table isn't locked by A's write).
+            let r = within(Duration::from_secs(3), move || run("connected", b, &json!({}))).expect("socket B answered while A was blocked");
+            assert_eq!(r["value"], true, "{r}");
+            // Closing A returns at once and ends A's write.
+            within(Duration::from_secs(3), move || run("close", a, &J::Null)).expect("close returned while A was blocked");
+            let r = blocked.recv_timeout(Duration::from_secs(5)).expect("A's write ended when A was closed");
+            assert!(r.get("error").is_some(), "{r}");
+            run("close", b, &J::Null);
+        }
+
+        #[test]
+        fn backpressured_writes_preserve_exact_bytes_and_restore_blocking_reads() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let id = open(&listener.local_addr().unwrap().to_string());
+            let (mut peer, _) = listener.accept().unwrap();
+            let prefix = fill_buffers(id);
+            let text = "\u{03a9}\0x".repeat(32 * 1024);
+            let expected = text.as_bytes().to_vec();
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                tx.send(run("write", id, &json!({"data": text, "encoding": "UTF-8", "timeout": 5}))).unwrap();
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)), "the peer has not resumed reading yet");
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut received = vec![0; prefix + expected.len()];
+            peer.read_exact(&mut received).unwrap();
+            assert!(received[..prefix].iter().all(|&byte| byte == b'x'));
+            assert_eq!(&received[prefix..], expected);
+            assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap()["ok"], true);
+            let reply = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                peer.write_all(b"ready\n").unwrap();
+            });
+            assert_eq!(run("readln", id, &json!({"timeout": 1}))["data"], "ready");
+            reply.join().unwrap();
+            run("close", id, &J::Null);
         }
     }
 }

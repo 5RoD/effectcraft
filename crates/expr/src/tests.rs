@@ -1513,3 +1513,5 @@ fn time_to_frames_preserves_coercion_and_small_durations() {
         assert_eq!(f.num(expression, 0.0), expected, "{expression}");
     }
 }
+
+mod property_group;

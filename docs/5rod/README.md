@@ -37,6 +37,14 @@ application and Desktop shortcut have not been removed or replaced.
 - The upstream 0.12.0 integration retains this fork's journal, branching history, native tools and
   theme alongside the newer camera/3D, color, docking, relinking and bounded frame-queue work.
   Those features still need representative footage and workflow acceptance before installation.
+- The 18 October upstream refresh is pinned to `f3f24ef1`. It adds fixes for shadow-only 3D
+  materials, saved composition times, text/path controls, expression property groups and EXR
+  layer names. Merge reconciliation retains native counters, the existing 3D transform gizmo,
+  streaming readers and decoder-applied rotation. Frame-rate correction reads bounded metadata
+  only when the initial video rate is nonstandard; ordinary 60/120 fps recordings skip that
+  extra parse. Full repository validation is required before this integration is accepted.
+  Script socket writes use cancellable deadline waits when buffers fill, preserving partial
+  byte counts and allowing close to interrupt a stalled peer on Windows.
 - Control responses use bounded buffered writes and flush each complete JSON line. Three
   alternating production pairs on a generated 300-layer, 1,803-state history measured median
   history-query latency at 565.37 → 12.37 ms, project summaries at 43.29 → 2.26 ms, and
@@ -61,6 +69,10 @@ application and Desktop shortcut have not been removed or replaced.
   Auto without audio reached 119.01 over 35 seconds. The continuous-audio target still failed;
   a fully cached audio loop remained near 100 fps. The timestamp-clock correction and its
   outstanding acceptance are described in [audio preview timing](audio-preview-clock.md).
+- Native audio scrubbing decodes and mixes on one bounded worker with a replaceable latest
+  request. New gestures and project/composition changes cancel obsolete sound; shutdown does
+  not wait for a blocked read. Output/worker failures remain retryable. Synthetic regressions
+  cover these boundaries; native responsiveness and audiovisual acceptance remain separate.
 - Eligible desktop previews now retain the compositor's native texture through viewer drawing.
   Channel, exposure, region and nonidentity display-color conversions retain their existing
   processing. Cache planning includes every display mip and both RAM and GPU budgets, so
