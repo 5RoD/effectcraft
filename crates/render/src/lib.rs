@@ -58,6 +58,12 @@ pub enum FloatCurve {
 
 /// Supplies decoded footage frames (implemented by the media layer).
 pub trait FootageSource: Send + Sync {
+    /// Whether reduced native 8-bit 420 frames use the media half-size luma/chroma
+    /// prefilter before clipping and the ordinary bilinear resize. Opt in only when
+    /// `frame_at_size` has those same semantics; custom sources keep their own filter.
+    fn yuv420_half_size(&self) -> bool {
+        false
+    }
     /// Optional compact opaque video source. `Ok(None)` uses the ordinary image path;
     /// malformed media returns an error, never a successful substitute image.
     fn yuv420_frame_checked(&self, _item: ItemId, _footage: &Footage, _t: Tick) -> Result<Option<Arc<video::Yuv420Frame>>, String> {
@@ -191,6 +197,9 @@ impl CancellableFootage<'_> {
 }
 
 impl FootageSource for CancellableFootage<'_> {
+    fn yuv420_half_size(&self) -> bool {
+        self.inner.yuv420_half_size()
+    }
     fn yuv420_frame_checked(&self, item: ItemId, footage: &Footage, t: Tick) -> Result<Option<Arc<video::Yuv420Frame>>, String> {
         self.read_checked(|| self.inner.yuv420_frame_checked(item, footage, t))
     }
@@ -984,9 +993,10 @@ impl<'a> Renderer<'a> {
         Some((Renderer { opts: RenderOpts { scale: bs, ..base.opts }, ..base }, item, lt, bs))
     }
 
-    /// Compact source for the native GPU video path. Interpretation, reduced-resolution
-    /// resampling, fields, proxies, source motion blur and frame blending keep the reference
-    /// path. Placement still uses the ordinary transform, matte and blend operations.
+    /// Compact source for the native GPU video path. Even 420 sources may use the shared
+    /// half-size prefilter at reduced resolution. Other resampling, interpretation, fields,
+    /// proxies, source motion blur and frame blending keep the reference path. Placement
+    /// still uses the ordinary transform, matte and blend operations.
     pub fn yuv420_source(&self, ctx: &EvalCtx, layer: &Layer) -> Result<Option<Arc<video::Yuv420Frame>>, String> {
         let LayerSource::Footage { item } = layer.source else { return Ok(None) };
         let Some(ItemKind::Footage(f)) = self.project.item(item).map(|i| &i.kind) else { return Ok(None) };
@@ -997,7 +1007,11 @@ impl<'a> Renderer<'a> {
             || f.linear_light_applies()
             || f.fields != effectcraft_project::FieldOrder::Off
             || self.proxy_for(item).is_some()
-            || self.reduced_size(f.width, f.height).is_some()
+            || self.reduced_size(f.width, f.height).is_some_and(|(w, h)| {
+                // The native reduced path mirrors media's half-420 prefilter. Other
+                // resampling keeps the ordinary source's interpretation and filtering.
+                !self.footage.yuv420_half_size() || !f.width.is_multiple_of(2) || !f.height.is_multiple_of(2) || w > f.width / 2 || h > f.height / 2
+            })
             || self.content_times(ctx, layer).is_some()
             || frame_blend_mode(ctx, layer) != FrameBlend::Off
             || self.pipe.media_in(f).is_some()
@@ -1758,7 +1772,7 @@ impl<'a> Renderer<'a> {
 
     /// The size of `w` × `h` layer pixels in this render when it is reduced enough that footage
     /// is resampled to it (below 3/4 scale).
-    fn reduced_size(&self, w: u32, h: u32) -> Option<(u32, u32)> {
+    pub fn reduced_size(&self, w: u32, h: u32) -> Option<(u32, u32)> {
         let s = self.opts.scale;
         (s < 0.75).then(|| (((w as f64 * s).round() as u32).max(1), ((h as f64 * s).round() as u32).max(1)))
     }

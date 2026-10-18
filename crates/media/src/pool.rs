@@ -1012,6 +1012,9 @@ impl FootageSource for MediaPool {
     fn cancellable(&self, cancel: &Arc<AtomicBool>, f: &mut dyn FnMut()) {
         filmcraft_media::cancel::with_cancel(cancel, f)
     }
+    fn yuv420_half_size(&self) -> bool {
+        true
+    }
     fn frame(&self, item: ItemId, footage: &Footage, t: Tick) -> Option<Arc<Image>> {
         self.frame_sized(item, footage, t, None, FloatCurve::Srgb)
     }

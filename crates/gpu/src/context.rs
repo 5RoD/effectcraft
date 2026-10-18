@@ -556,26 +556,28 @@ impl GpuContext {
                 label: Some("effectcraft native video"),
                 source: wgpu::ShaderSource::Wgsl(include_str!("shaders/video.wgsl").into()),
             })
-        })
-        .and_then(|module| {
-            init_resource(&device, "video_yuv420", || {
-                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("video_yuv420"),
-                    layout: Some(&layout),
-                    module: &module,
-                    entry_point: Some("video_yuv420"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                })
-            })
         });
-        match video {
-            Ok(pipeline) => {
-                pipelines.insert("video_yuv420", pipeline);
-            }
-            Err(why) => {
-                log::warn!("gpu: compact video unavailable: {why}");
-                unavailable.push(("video_yuv420", why));
+        for entry in ["video_yuv420", "video_yuv420_half"] {
+            let pipeline = video.as_ref().map_err(Clone::clone).and_then(|module| {
+                init_resource(&device, entry, || {
+                    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some(entry),
+                        layout: Some(&layout),
+                        module,
+                        entry_point: Some(entry),
+                        compilation_options: Default::default(),
+                        cache: None,
+                    })
+                })
+            });
+            match pipeline {
+                Ok(pipeline) => {
+                    pipelines.insert(entry, pipeline);
+                }
+                Err(why) => {
+                    log::warn!("gpu: {entry} unavailable: {why}");
+                    unavailable.push((entry, why));
+                }
             }
         }
         for e in EFFECT_ENTRIES

@@ -135,10 +135,76 @@ impl AutoPick {
         self.stats.lock().ok()?.get(&key).copied()
     }
 
+    /// Read the bounded timing history without warming, choosing, or resetting a backend.
+    /// This is an explicit diagnostic query, never part of rendering a frame.
+    pub fn snapshots(&self) -> Result<Vec<(AutoKey, AutoStats)>, String> {
+        let stats = self.stats.lock().map_err(|_| "renderer timing history is poisoned; restart the renderer before measuring again".to_string())?;
+        if stats.len() > Self::MAX_KEYS + 1 {
+            return Err("renderer timing history exceeds its diagnostic key budget; reset the renderer before measuring again".into());
+        }
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(stats.len()).map_err(|e| format!("cannot read renderer timing history: {e}"))?;
+        rows.extend(stats.iter().map(|(key, value)| (*key, *value)));
+        rows.sort_unstable_by_key(|(key, _)| (key.comp.0, key.scale, key.display));
+        Ok(rows)
+    }
+
     /// Forget all history (settings that change both paths' costs).
     pub fn reset(&self) {
         if let Ok(mut m) = self.stats.lock() {
             m.clear();
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn timing_snapshots_are_bounded_deterministic_and_do_not_change_backend_history() {
+        let pick = AutoPick::default();
+        let key = AutoKey::new(ItemId(7), 1.0 / 3.0, true);
+        for _ in 0..3 {
+            pick.record(key, true, 2.0);
+            pick.record(key, false, 10.0);
+        }
+        pick.choose(key);
+        let before = pick.stats(key).unwrap();
+        for _ in 0..3 {
+            let rows = pick.snapshots().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].0, key);
+            let value = rows[0].1;
+            assert_eq!(
+                (value.cpu_ms, value.gpu_ms, value.cpu_frames, value.gpu_frames, value.since_probe, value.declined),
+                (before.cpu_ms, before.gpu_ms, before.cpu_frames, before.gpu_frames, before.since_probe, before.declined)
+            );
+        }
+        for comp in 0..AutoPick::MAX_KEYS * 3 {
+            pick.choose(AutoKey::new(ItemId(comp as u64), 1.0, true));
+        }
+        let rows = pick.snapshots().unwrap();
+        assert!(rows.len() <= AutoPick::MAX_KEYS + 1);
+        assert!(rows.windows(2).all(|pair| pair[0].0.comp.0 <= pair[1].0.comp.0));
+        for comp in 0..AutoPick::MAX_KEYS * 3 {
+            pick.record(AutoKey::new(ItemId(comp as u64), 0.5, true), true, 1.0);
+        }
+        assert!(pick.snapshots().unwrap_err().contains("diagnostic key budget"));
+    }
+
+    #[test]
+    fn poisoned_timing_snapshots_report_an_error() {
+        let pick = std::sync::Arc::new(AutoPick::default());
+        let worker = pick.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = worker.stats.lock().unwrap();
+                panic!("synthetic broken renderer timing writer");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(pick.snapshots().unwrap_err().contains("timing history is poisoned"));
     }
 }

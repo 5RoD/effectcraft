@@ -1145,6 +1145,9 @@ fn cancellable_footage_preserves_checked_color_and_native_video_reads() {
         reads: Mutex<Vec<(Option<(u32, u32)>, FloatCurve)>>,
     }
     impl FootageSource for Checked {
+        fn yuv420_half_size(&self) -> bool {
+            true
+        }
         fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<Image>> {
             panic!("the cancellable wrapper must preserve the checked decoder")
         }
@@ -1159,6 +1162,8 @@ fn cancellable_footage_preserves_checked_color_and_native_video_reads() {
     let source = Checked::default();
     let cancel = Arc::new(AtomicBool::new(false));
     let wrapped = CancellableFootage { inner: &source, cancel: cancel.clone() };
+    assert!(wrapped.yuv420_half_size());
+    assert!(!crate::NoFootage.yuv420_half_size());
     let footage = Footage::default();
     let mut expected = Vec::new();
     for size in [None, Some((4, 2))] {

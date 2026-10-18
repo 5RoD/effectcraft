@@ -151,6 +151,19 @@ fn err(e: impl std::fmt::Display) -> Outcome {
     Outcome::Done(json!({"ok": false, "error": e.to_string()}))
 }
 
+fn renderer_stats(pick: Option<&effectcraft_engine::render::AutoPick>) -> Result<Value, String> {
+    let mut paths = Vec::new();
+    if let Some(pick) = pick {
+        for (key, stats) in pick.snapshots()? {
+            paths.push(json!({"comp": key.comp.0, "scale": f64::from_bits(key.scale), "display": key.display,
+                "cpuMs": stats.cpu_ms, "gpuMs": stats.gpu_ms, "cpuFrames": stats.cpu_frames,
+                "gpuFrames": stats.gpu_frames, "sinceProbe": stats.since_probe, "declined": stats.declined}));
+        }
+    }
+    Ok(json!({"available": pick.is_some(), "paths": paths,
+        "scope": "Existing per-composition/scale CPU and GPU averages; read-only, no backend selection or reset. Not whole-frame presentation latency."}))
+}
+
 fn modifiers(p: &Value) -> egui::Modifiers {
     let m = p.get("modifiers").unwrap_or(p);
     let b = |k: &str| m.get(k).and_then(Value::as_bool).unwrap_or(false);
@@ -199,6 +212,13 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
         },
         "ui.menu.list" => ok(serde_json::to_value(crate::menus::menu_items(app)).unwrap_or_default()),
         "ui.inspect" => ok(inspect(app, ctx)),
+        "ui.renderer.stats" => {
+            use effectcraft_engine::render::Accelerator;
+            match renderer_stats(app.gpu.as_ref().and_then(|gpu| gpu.auto_pick())) {
+                Ok(stats) => ok(stats),
+                Err(error) => err(error),
+            }
+        }
         "ui.decoder.stats" => {
             let stats = effectcraft_host::hardware_decoder_stats();
             let work = effectcraft_host::media_work_stats();
@@ -708,6 +728,31 @@ pub fn encode_png(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn renderer_timing_query_reports_existing_choices_without_changing_them() {
+        use effectcraft_engine::project::ItemId;
+        use effectcraft_engine::render::{AutoKey, AutoPick};
+        assert_eq!(super::renderer_stats(None).unwrap()["paths"], serde_json::json!([]));
+        let pick = AutoPick::default();
+        let key = AutoKey::new(ItemId(9), 1.0 / 3.0, true);
+        for _ in 0..3 {
+            pick.record(key, true, 2.5);
+            pick.record(key, false, 11.0);
+        }
+        let first = super::renderer_stats(Some(&pick)).unwrap();
+        let second = super::renderer_stats(Some(&pick)).unwrap();
+        assert_eq!(first, second);
+        let row = &first["paths"][0];
+        assert_eq!(row["comp"], 9);
+        assert_eq!(row["scale"], 1.0 / 3.0);
+        assert_eq!(row["display"], true);
+        assert_eq!(row["cpuMs"], 11.0);
+        assert_eq!(row["gpuMs"], 2.5);
+        assert_eq!(row["cpuFrames"], 3);
+        assert_eq!(row["gpuFrames"], 3);
+        assert_eq!(row["sinceProbe"], 0);
+    }
+
     #[test]
     fn base64_rfc4648_vectors() {
         for (i, o) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="), ("fooba", "Zm9vYmE="), ("foobar", "Zm9vYmFy")] {

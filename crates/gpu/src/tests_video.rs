@@ -111,9 +111,20 @@ struct Source {
     fail: bool,
 }
 impl FootageSource for Source {
+    fn yuv420_half_size(&self) -> bool {
+        true
+    }
     fn frame(&self, _: ItemId, f: &Footage, t: Tick) -> Option<Arc<Image>> {
         self.image_calls.fetch_add(1, Ordering::Relaxed);
         Some(Arc::new(reference(&frame(f.width, f.height, 0.2126, 0.0722, t != Tick::ZERO))))
+    }
+    fn frame_at_size(&self, item: ItemId, f: &Footage, t: Tick, w: u32, h: u32) -> Option<Arc<Image>> {
+        if f.width.is_multiple_of(2) && f.height.is_multiple_of(2) && w <= f.width / 2 && h <= f.height / 2 {
+            self.image_calls.fetch_add(1, Ordering::Relaxed);
+            let half = reference_half(&frame(f.width, f.height, 0.2126, 0.0722, t != Tick::ZERO));
+            return Some(Arc::new(effectcraft_raster::resample(&half, w, h)));
+        }
+        self.frame(item, f, t)
     }
     fn yuv420_frame_checked(&self, _: ItemId, f: &Footage, t: Tick) -> Result<Option<Arc<Yuv420Frame>>, String> {
         self.raw_calls.fetch_add(1, Ordering::Relaxed);
@@ -125,14 +136,150 @@ impl FootageSource for Source {
 }
 
 fn scene(depth: BitDepth) -> Scene {
+    scene_size(depth, 97, 61)
+}
+
+fn scene_size(depth: BitDepth, width: u32, height: u32) -> Scene {
     let mut s = Scene::new(depth);
-    let layer = s.footage(97, 61);
+    let layer = s.footage(width, height);
     let effectcraft_project::LayerSource::Footage { item } = layer.source else { panic!("footage") };
     let ItemKind::Footage(f) = &mut s.p.item_mut(item).unwrap().kind else { panic!("footage item") };
     f.kind = FootageKind::Video;
     f.duration = Tick::from_seconds_f64(2.0);
     s.push(layer);
     s
+}
+
+/// Independent scalar form of media's half-420 filter: average luma, filter centred
+/// chroma vertically then horizontally, normalize before the horizontal filter, then clip.
+fn reference_half(frame: &Yuv420Frame) -> Image {
+    let (w, h) = (frame.width() as usize, frame.height() as usize);
+    assert!(w.is_multiple_of(2) && h.is_multiple_of(2));
+    let (cw, ch) = (w / 2, h / 2);
+    let planes = frame.planes();
+    let range = frame.range();
+    let matrix = frame.matrix();
+    let mut out = Image::new(cw as u32, ch as u32);
+    for y in 0..ch {
+        for x in 0..cw {
+            let chroma = |plane: &[u8]| {
+                let vertical = |xx: usize| {
+                    let a = plane[y.saturating_sub(1) * cw + xx] as f32;
+                    let b = plane[y * cw + xx] as f32;
+                    let c = plane[(y + 1).min(ch - 1) * cw + xx] as f32;
+                    ((a + c) * 0.125 + b * 0.75 - range[3]) * range[2]
+                };
+                (vertical(x.saturating_sub(1)) + vertical((x + 1).min(cw - 1))) * 0.125 + vertical(x) * 0.75
+            };
+            let (u, v) = (chroma(&planes[1]), chroma(&planes[2]));
+            let i = 2 * y * w + 2 * x;
+            let yy = ((planes[0][i] as f32 + planes[0][i + 1] as f32 + planes[0][i + w] as f32 + planes[0][i + w + 1] as f32) * 0.25 - range[1]) * range[0];
+            out.data[y * cw + x] =
+                [(yy + matrix[0] * v).clamp(0.0, 1.0), (yy - matrix[1] * v - matrix[2] * u).clamp(0.0, 1.0), (yy + matrix[3] * u).clamp(0.0, 1.0), 1.0];
+        }
+    }
+    out
+}
+
+#[test]
+fn native_reduced_video_matches_half_filter_resize_and_depth_quantization() {
+    let Some(g) = native_gpu() else { return };
+    assert!(g.ctx.has_kernel("video_yuv420_half"));
+    for (w, h) in [(2, 2), (32, 18), (98, 62)] {
+        for (kr, kb) in [(0.299, 0.114), (0.2126, 0.0722), (0.2627, 0.0593)] {
+            for full in [false, true] {
+                let frame = frame(w, h, kr, kb, full);
+                let half = reference_half(&frame);
+                for factor in [0.5, 1.0 / 3.0, 0.25, 0.125, 0.1] {
+                    let size = (((w as f64 * factor).round() as u32).max(1), ((h as f64 * factor).round() as u32).max(1));
+                    for depth in [BitDepth::Bpc8, BitDepth::Bpc16, BitDepth::Bpc32] {
+                        let mut expected = effectcraft_raster::resample(&half, size.0, size.1);
+                        let settings = effectcraft_project::ProjectSettings { bit_depth: depth, ..Default::default() };
+                        effectcraft_render::color::Pipe::of(&settings).quantize(&mut expected);
+                        let mut encoder = Enc::new(&g.ctx);
+                        let image = crate::video::upload_reduced(&mut encoder, &frame, depth.levels(), size).unwrap().unwrap();
+                        let actual = encoder.download(&image).unwrap();
+                        let tolerance = depth.levels().map_or(3e-6, |levels| 1.0 / levels + 3e-6);
+                        let difference = diff(&expected, &actual, tolerance);
+                        assert_eq!(difference.over, 0, "{w}x{h}->{size:?} {kr}/{kb} full={full} depth={depth:?}: {difference:?}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn native_reduced_video_rejects_invalid_sizes_before_transfers_and_declines_odd_sources() {
+    let Some(g) = native_gpu() else { return };
+    let input = frame(32, 18, 0.2126, 0.0722, false);
+    for size in [(0, 1), (1, 0), (17, 9), (16, 10), (u32::MAX, 1)] {
+        let before = g.context().transfer_stats();
+        let mut encoder = Enc::new(&g.ctx);
+        assert!(crate::video::upload_reduced(&mut encoder, &input, None, size).is_err());
+        assert_eq!(g.context().transfer_stats(), before);
+    }
+    let odd = frame(33, 19, 0.2126, 0.0722, false);
+    let before = g.context().transfer_stats();
+    assert!(crate::video::upload_reduced(&mut Enc::new(&g.ctx), &odd, None, (16, 9)).unwrap().is_none());
+    assert_eq!(g.context().transfer_stats(), before);
+}
+
+#[test]
+fn native_reduced_video_preserves_custom_source_resampling_without_opt_in() {
+    struct Custom(Source);
+    impl FootageSource for Custom {
+        fn frame(&self, item: ItemId, f: &Footage, t: Tick) -> Option<Arc<Image>> {
+            self.0.frame(item, f, t)
+        }
+        fn yuv420_frame_checked(&self, item: ItemId, f: &Footage, t: Tick) -> Result<Option<Arc<Yuv420Frame>>, String> {
+            self.0.yuv420_frame_checked(item, f, t)
+        }
+    }
+    let Some(g) = native_gpu() else { return };
+    let s = scene_size(BitDepth::Bpc32, 100, 64);
+    let source = Custom(Source { raw_calls: AtomicUsize::new(0), image_calls: AtomicUsize::new(0), fail: false });
+    let renderer = Renderer::new(&s.p, &source, RenderOpts { scale: 1.0 / 3.0, ..Default::default() });
+    let expected = renderer.comp_frame_cpu_checked(s.cid, Tick::ZERO).unwrap();
+    let actual = g.render(&renderer, s.cid, Tick::ZERO).unwrap();
+    assert_eq!(source.0.raw_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(diff(&expected, &actual, 1e-3).over, 0);
+}
+
+#[test]
+fn native_reduced_video_keeps_compact_source_through_transform_and_bloom() {
+    use effectcraft_keyframe::Value;
+    use effectcraft_render::Backend;
+    let Some(g) = native_gpu() else { return };
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc16, BitDepth::Bpc32] {
+        for scale in [0.5, 1.0 / 3.0, 0.25, 0.125] {
+            for bloom in [false, true] {
+                let mut s = scene_size(depth, 100, 64);
+                let mut layer = s.p.comp(s.cid).unwrap().layers[0].clone();
+                crate::tests::set(&mut layer, "transform/position", Value::Vec3([44.0, 28.0, 0.0]));
+                crate::tests::set(&mut layer, "transform/rotation", Value::Scalar(7.0));
+                crate::tests::set(&mut layer, "transform/opacity", Value::Scalar(63.0));
+                if bloom {
+                    s.effect(&mut layer, effectcraft_effects::bloom::ID, &[("radius", Value::Scalar(8.0)), ("threshold", Value::Scalar(0.2))]);
+                }
+                s.p.comp_mut(s.cid).unwrap().layers[0] = layer;
+                let source = Source { raw_calls: AtomicUsize::new(0), image_calls: AtomicUsize::new(0), fail: false };
+                let cpu_opts = RenderOpts { scale, backend: Backend::Cpu, ..Default::default() };
+                let expected = Renderer::new(&s.p, &source, cpu_opts).comp_frame_cpu_checked(s.cid, Tick::ZERO).unwrap();
+                let images = source.image_calls.load(Ordering::Relaxed);
+                let transfer = g.context().transfer_stats();
+                let renderer = Renderer::new(&s.p, &source, RenderOpts { backend: Backend::Gpu, ..cpu_opts }).with_accel(Some(g));
+                let actual = g.render(&renderer, s.cid, Tick::ZERO).unwrap();
+                assert_eq!(source.image_calls.load(Ordering::Relaxed), images, "reduced native preview must not convert source pixels on CPU");
+                assert_eq!(source.raw_calls.load(Ordering::Relaxed), 1);
+                let after = g.context().transfer_stats();
+                assert_eq!(after.uploads - transfer.uploads, 1);
+                assert_eq!(after.readbacks - transfer.readbacks, 1, "only the final test frame reads back");
+                let difference = diff(&expected, &actual, crate::tests::tolerance(depth));
+                assert_eq!(difference.over, 0, "scale={scale} {depth:?} bloom={bloom}: {difference:?}");
+            }
+        }
+    }
 }
 
 #[test]

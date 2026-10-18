@@ -24,8 +24,27 @@ pub(crate) fn supports_effects(layer: &effectcraft_project::Layer, supports: imp
 /// Upload only the used plane bytes; padding keeps storage-buffer loads aligned.
 /// `None` leaves unsupported device limits to the existing CPU source path.
 pub(crate) fn upload(e: &mut Enc, frame: &Yuv420Frame, levels: Option<f32>) -> Result<Option<GpuImage>, String> {
+    upload_inner(e, frame, levels, None)
+}
+
+/// Media's even, opaque 420 half-size prefilter followed by its ordinary bilinear resize.
+/// Quantisation follows the final resize, before effects, just as on the CPU source path.
+pub(crate) fn upload_reduced(e: &mut Enc, frame: &Yuv420Frame, levels: Option<f32>, size: (u32, u32)) -> Result<Option<GpuImage>, String> {
+    upload_inner(e, frame, levels, Some(size))
+}
+
+fn upload_inner(e: &mut Enc, frame: &Yuv420Frame, levels: Option<f32>, reduced: Option<(u32, u32)>) -> Result<Option<GpuImage>, String> {
     let g = e.g;
-    if !g.has_kernel("video_yuv420") || !g.fits(frame.width(), frame.height()) {
+    if let Some((w, h)) = reduced {
+        if w == 0 || h == 0 || w > frame.width() / 2 || h > frame.height() / 2 {
+            return Err("native reduced video dimensions must be nonzero and at most half the source".into());
+        }
+        if !frame.width().is_multiple_of(2) || !frame.height().is_multiple_of(2) {
+            return Ok(None);
+        }
+    }
+    let kernel = if reduced.is_some() { "video_yuv420_half" } else { "video_yuv420" };
+    if !g.has_kernel(kernel) || !g.fits(frame.width(), frame.height()) {
         return Ok(None);
     }
     let started = web_time::Instant::now();
@@ -72,11 +91,20 @@ pub(crate) fn upload(e: &mut Enc, frame: &Yuv420Frame, levels: Option<f32>) -> R
     p.u[1] = [padded[0] as u32, padded[0].saturating_add(padded[1]) as u32, 0, 0];
     p.f[0] = frame.range();
     p.f[1] = frame.matrix();
-    p.f[2] = [levels.unwrap_or(0.0), levels.map_or(0.0, |l| 1.0 / l), 0.0, 0.0];
-    let mut out = e.scratch(frame.width(), frame.height());
+    let initial_size = if reduced.is_some() { (frame.width() / 2, frame.height() / 2) } else { (frame.width(), frame.height()) };
+    let resize = reduced.filter(|size| *size != initial_size);
+    let initial_levels = if resize.is_some() { None } else { levels };
+    p.f[2] = [initial_levels.unwrap_or(0.0), initial_levels.map_or(0.0, |l| 1.0 / l), 0.0, 0.0];
+    let mut out = e.scratch(initial_size.0, initial_size.1);
     g.count_upload(size, started);
     let dummy = GpuImage::new(g.dummy_texture(), 1, 1);
-    e.pixels("video_yuv420", &p, &dummy, None, &out, Some(&data));
-    out.levels = levels;
+    e.pixels(kernel, &p, &dummy, None, &out, Some(&data));
+    out.levels = initial_levels;
+    if let Some((w, h)) = resize {
+        let transform = effectcraft_geom::Mat3::scale(effectcraft_geom::vec2(w as f64 / out.width as f64, h as f64 / out.height as f64));
+        let blank = e.zeros(w, h);
+        out =
+            crate::ops::warp_q(e, &blank, &out, &transform, effectcraft_raster::Sampling::Bilinear, effectcraft_color::BlendMode::Normal, 1.0, 0, None, levels);
+    }
     Ok(Some(out))
 }

@@ -47,7 +47,11 @@ application and Desktop shortcut have not been removed or replaced.
   New/Open does not join that writer or apply its saved state to the replacement document.
   Normal closing waits for completion and checks for newer edits. Engine calls remain
   synchronous unless requested otherwise. See the [save job protocol](../control-protocol.md).
-  Production responsiveness measurements for this change are still pending.
+  Three production runs of the 300-layer, 1,803-state fixture measured median command response
+  at 1,005 → 2.08 ms, median worst concurrent `ui.inspect` query at 1,003 → 8.00 ms, and complete
+  save at 1,005 → 372 ms. All history remained identical; 22 production safety checks and real
+  Windows Ctrl+S/Save As/reopen/save-before-quit checks passed. These are local save workflow
+  timings, including editor scheduling and recovery bookkeeping, not filesystem benchmarks.
 - The 18 October production playback comparison measured 115.62 fps with a 21.33 ms p99
   frame interval in the full-resolution 1440p/120 test, against 115.35 fps / 25.63 ms on the
   comparison build. The absolute 20 ms p99 target failed. This short, silent application-draw

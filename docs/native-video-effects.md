@@ -27,11 +27,26 @@ existing mixed CPU/GPU behavior. Checked errors retain their contextual frame
 diagnostics; a failed result cannot be published as a good frame or cached layer.
 
 Source masks, active layer styles/non-default style blending, fields, proxies,
-reduced-resolution resampling, source motion blur, frame blending, unsupported
+unsupported reduced-resolution resampling, source motion blur, frame blending, unsupported
 footage interpretation/color conversion, stretch and time remap retain the
 existing fallback guards. Missing video kernels/device limits also retain the
 reference source path. This change applies to ordinary 2D video placement; it
 does not add native source initialization to the 3D renderer.
+
+Reduced previews of even-sized opaque 8-bit YUV420 can also keep their planes on
+the GPU when the target is at most half the source size in each dimension. They
+use the media source's existing half-size filter: a 2×2 luma average and separable
+`[1 6 1]/8` centred chroma filter, with colour clipping after filtering. The
+ordinary box-prefiltered bilinear warp handles any remaining resize, and source
+bit-depth quantisation follows that resize before effects. This preserves the
+CPU source's clipping and sampling order. It does not resize already clipped,
+full-resolution RGB pixels in place of that filter.
+
+Custom `FootageSource` implementations keep their existing sampler unless they
+explicitly opt into `yuv420_half_size`; the native media pool and cancellation
+wrapper expose that capability. Odd source dimensions and intermediate targets
+larger than half retain the reference source path. The complete-resolution path
+is unchanged. Production performance acceptance for this extension is pending.
 
 Effects that read other layers or neighboring times still use their existing
 host paths, which can request converted source images and additional transfers.

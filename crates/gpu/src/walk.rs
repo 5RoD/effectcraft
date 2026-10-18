@@ -345,6 +345,7 @@ fn draw_precomp(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas:
 /// and supported effects stay on the GPU; placement, mattes and blending use ordinary kernels.
 fn draw_video(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage, opacity: f32) -> Option<Option<()>> {
     if !e.g.has_kernel("video_yuv420")
+        || (r.opts.scale < 0.75 && !e.g.has_kernel("video_yuv420_half"))
         || layer.masks().is_some_and(|m| !m.children.is_empty())
         || styles::active(ctx, layer)
         || !crate::video::supports_effects(layer, |id| r.active_accel().is_some_and(|accel| accel.supports_effect(id)))
@@ -357,7 +358,12 @@ fn draw_video(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
         Err(_) => return Some(None),
     };
     let pipe = r.pipe();
-    let img = match crate::video::upload(e, &frame, pipe.levels) {
+    let reduced = r.reduced_size(frame.width(), frame.height());
+    let uploaded = match reduced {
+        Some(size) => crate::video::upload_reduced(e, &frame, pipe.levels, size),
+        None => crate::video::upload(e, &frame, pipe.levels),
+    };
+    let img = match uploaded {
         Ok(Some(img)) => img,
         Ok(None) => return None,
         Err(error) => {
@@ -368,7 +374,8 @@ fn draw_video(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
     // The native conversion matches masked_source's quantized, untransformed source.
     // Run the ordinary evaluated stack in effect space, then rebase before placement.
     let origin = ctx.effect_bounds(layer).1;
-    let mut effects = crate::effects::GpuFx::new_resident(e, img, origin, 1.0, pipe.levels);
+    let source_scale = if reduced.is_some() { r.opts.scale } else { 1.0 };
+    let mut effects = crate::effects::GpuFx::new_resident(e, img, origin, source_scale, pipe.levels);
     r.run_layer_effects_on(ctx, layer, &mut effects);
     let processed = effects.finish();
     if !r.cache_allowed() {
