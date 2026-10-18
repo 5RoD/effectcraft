@@ -56,6 +56,11 @@ application and Desktop shortcut have not been removed or replaced.
   frame interval in the full-resolution 1440p/120 test, against 115.35 fps / 25.63 ms on the
   comparison build. The absolute 20 ms p99 target failed. This short, silent application-draw
   measurement establishes neither sustained audiovisual synchronization nor zero-lag 120 fps.
+- The reduced native video path improved three-pair Auto-preview cadence with audio from
+  78.27 to 99.50 app texture changes/s, reducing median CPU use from 6.63 to 1.76 cores.
+  Auto without audio reached 119.01 over 35 seconds. The continuous-audio target still failed;
+  a fully cached audio loop remained near 100 fps. The timestamp-clock correction and its
+  outstanding acceptance are described in [audio preview timing](audio-preview-clock.md).
 - Eligible desktop previews now retain the compositor's native texture through viewer drawing.
   Channel, exposure, region and nonidentity display-color conversions retain their existing
   processing. Cache planning includes every display mip and both RAM and GPU budgets, so

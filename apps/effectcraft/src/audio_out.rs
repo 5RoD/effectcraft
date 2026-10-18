@@ -10,11 +10,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
 use effectcraft_ui_egui::audio::{AudioDevice, AudioFeed, AudioOutput};
+
+mod clock;
+use clock::PlaybackClock;
 
 /// Device callback period: about 10 ms, clamped so Pulse/PipeWire/ALSA does not open a
 /// multi-hundred-millisecond default buffer that plays as silence at the start of preview (#554).
@@ -40,6 +43,7 @@ pub struct CpalOut {
     out: AudioOutput,
     rate: u32,
     latency: Arc<AtomicU64>,
+    clock: Arc<PlaybackClock>,
     stop: Option<mpsc::Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -76,7 +80,14 @@ pub fn open(out: &AudioOutput) -> Option<Box<dyn AudioDevice>> {
             .unwrap_or(false)
     };
     let rate = if out.rate > 0 && supports(out.rate) { out.rate } else { cfg.sample_rate().0 };
-    Some(Box::new(CpalOut { out: out.clone(), rate, latency: Arc::new(AtomicU64::new(0)), stop: None, thread: None }))
+    Some(Box::new(CpalOut {
+        out: out.clone(),
+        rate,
+        latency: Arc::new(AtomicU64::new(0)),
+        clock: Arc::new(PlaybackClock::new(rate)),
+        stop: None,
+        thread: None,
+    }))
 }
 
 fn run<T: SizedSample + FromSample<f32>>(
@@ -84,6 +95,7 @@ fn run<T: SizedSample + FromSample<f32>>(
     cfg: &cpal::StreamConfig,
     feed: Arc<AudioFeed>,
     latency: Arc<AtomicU64>,
+    clock: Arc<PlaybackClock>,
     map: (usize, usize),
 ) -> Result<cpal::Stream, String> {
     let ch = cfg.channels as usize;
@@ -94,9 +106,12 @@ fn run<T: SizedSample + FromSample<f32>>(
     dev.build_output_stream(
         cfg,
         move |out: &mut [T], info: &cpal::OutputCallbackInfo| {
+            let callback = Instant::now();
             let frames = out.len() / ch.max(1);
             stereo.resize(frames * 2, 0.0);
+            let first = feed.consumed();
             feed.pull(&mut stereo);
+            let real = feed.consumed().saturating_sub(first);
             for (f, s) in out.chunks_mut(ch.max(1)).zip(stereo.as_chunks::<2>().0.iter()) {
                 for (c, o) in f.iter_mut().enumerate() {
                     // Mono devices, or left and right mapped to the same channel, get the mix.
@@ -114,8 +129,12 @@ fn run<T: SizedSample + FromSample<f32>>(
             }
             // Frames between "handed over" and "audible": device latency plus this buffer.
             let ts = info.timestamp();
-            let dev_lat = ts.playback.duration_since(&ts.callback).map(|d| d.as_secs_f64()).unwrap_or(0.0);
-            latency.store((dev_lat * rate) as u64 + frames as u64, Ordering::Relaxed);
+            let delay = ts.playback.duration_since(&ts.callback);
+            let dev_lat = delay.map(|d| d.as_secs_f64()).unwrap_or(0.0);
+            latency.store(((dev_lat * rate) as u64).saturating_add(frames as u64), Ordering::Relaxed);
+            if let Some(at) = delay.and_then(|delay| callback.checked_add(delay)) {
+                clock.record(callback, at, first, real);
+            }
         },
         |e| log::warn!("audio output: {e}"),
         None,
@@ -133,6 +152,7 @@ impl AudioDevice for CpalOut {
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
         let latency = self.latency.clone();
+        let clock = self.clock.clone();
         let rate = self.rate;
         let name = self.out.device.clone();
         let map = ((self.out.left.max(1) - 1) as usize, (self.out.right.max(1) - 1) as usize);
@@ -162,10 +182,10 @@ impl AudioDevice for CpalOut {
                     };
                 }
                 let build = |cfg: &cpal::StreamConfig| match sup.sample_format() {
-                    cpal::SampleFormat::F32 => run::<f32>(&dev, cfg, feed.clone(), latency.clone(), map),
-                    cpal::SampleFormat::I16 => run::<i16>(&dev, cfg, feed.clone(), latency.clone(), map),
-                    cpal::SampleFormat::U16 => run::<u16>(&dev, cfg, feed.clone(), latency.clone(), map),
-                    cpal::SampleFormat::I32 => run::<i32>(&dev, cfg, feed.clone(), latency.clone(), map),
+                    cpal::SampleFormat::F32 => run::<f32>(&dev, cfg, feed.clone(), latency.clone(), clock.clone(), map),
+                    cpal::SampleFormat::I16 => run::<i16>(&dev, cfg, feed.clone(), latency.clone(), clock.clone(), map),
+                    cpal::SampleFormat::U16 => run::<u16>(&dev, cfg, feed.clone(), latency.clone(), clock.clone(), map),
+                    cpal::SampleFormat::I32 => run::<i32>(&dev, cfg, feed.clone(), latency.clone(), clock.clone(), map),
                     f => Err(format!("unsupported sample format {f:?}")),
                 };
                 let stream = match build(&cfg) {
@@ -206,10 +226,16 @@ impl AudioDevice for CpalOut {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+        self.clock.clear();
+        self.latency.store(0, Ordering::Relaxed);
     }
 
     fn latency_frames(&self) -> u64 {
         self.latency.load(Ordering::Relaxed)
+    }
+
+    fn played_frames(&self) -> Option<u64> {
+        self.clock.position(Instant::now())
     }
 }
 

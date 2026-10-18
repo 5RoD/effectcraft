@@ -8,8 +8,9 @@
 //! pushes it into an [`AudioFeed`]; the device callback pulls from the feed.
 //!
 //! **A/V sync:** while audio plays, the audio clock drives playback. The clock is the number of
-//! sample frames the device has actually consumed (underruns do not advance it) minus the
-//! device's output latency, mapped through the work-area loop ([`clock_sample`]); the viewer
+//! real sample frames audible at the device's playback timestamp, interpolated between
+//! callbacks and held through underruns. Devices without timestamps retain consumed frames
+//! minus output latency. The position maps through the work-area loop ([`clock_sample`]); the viewer
 //! shows the comp frame at that sample ([`frame_of_sample`]), dropping video frames rather
 //! than drifting.
 //!
@@ -38,6 +39,12 @@ pub trait AudioDevice: Send {
     /// Output latency in sample frames (device buffering), for A/V sync.
     fn latency_frames(&self) -> u64 {
         0
+    }
+    /// Real sample frames audible now, interpolated from device playback timestamps.
+    /// `None` keeps the consumed-minus-latency clock for devices without timestamps.
+    /// Count only submitted real audio, holding through partial/whole-buffer underruns.
+    fn played_frames(&self) -> Option<u64> {
+        None
     }
     /// Called every UI frame while playing: devices without an audio thread of their own (Web
     /// Audio) move queued samples to the output here.
@@ -145,7 +152,7 @@ impl PlaySpan {
     /// Span for comp times: start, work area [wa, wb).
     pub fn new(start: Tick, wa: Tick, wb: Tick, looping: bool, rate: u32) -> PlaySpan {
         let r = rate as i64;
-        PlaySpan { start: start.to_units_floor(r), wa: wa.to_units_floor(r), wb: wb.to_units_floor(r).max(wa.to_units_floor(r) + 1), looping }
+        PlaySpan { start: start.to_units_floor(r), wa: wa.to_units_floor(r), wb: wb.to_units_floor(r).max(wa.to_units_floor(r).saturating_add(1)), looping }
     }
 }
 
@@ -153,11 +160,12 @@ impl PlaySpan {
 /// `latency`, from the span start, wrapped into the work area when looping (clamped at its end
 /// otherwise).
 pub fn clock_sample(span: &PlaySpan, consumed: u64, latency: u64) -> i64 {
-    let s = span.start + consumed.saturating_sub(latency) as i64;
+    let elapsed = i64::try_from(consumed.saturating_sub(latency)).unwrap_or(i64::MAX);
+    let s = span.start.saturating_add(elapsed);
     if s < span.wb {
         return s;
     }
-    if span.looping { span.wa + (s - span.wb).rem_euclid((span.wb - span.wa).max(1)) } else { span.wb - 1 }
+    if span.looping { span.wa.saturating_add(s.saturating_sub(span.wb).rem_euclid(span.wb.saturating_sub(span.wa).max(1))) } else { span.wb.saturating_sub(1) }
 }
 
 /// Comp time of sample index `s` at `rate` Hz.
@@ -257,11 +265,14 @@ impl AudioPlayback {
 
     /// The comp sample index audible now.
     pub fn clock(&self) -> i64 {
-        clock_sample(&self.span, self.feed.consumed(), self.device.latency_frames())
+        match self.device.played_frames() {
+            Some(audible) => clock_sample(&self.span, audible, 0),
+            None => clock_sample(&self.span, self.feed.consumed(), self.device.latency_frames()),
+        }
     }
 
     pub fn finished(&self) -> bool {
-        self.feed.finished()
+        self.feed.finished() && self.device.played_frames().is_none_or(|played| played >= self.feed.consumed())
     }
 
     pub fn stop(&mut self) {
@@ -474,6 +485,16 @@ mod tests {
     }
 
     #[test]
+    fn extreme_audio_clock_counts_and_spans_do_not_overflow() {
+        let span = PlaySpan { start: i64::MAX - 1, wa: i64::MIN, wb: i64::MAX, looping: true };
+        assert_eq!(clock_sample(&span, u64::MAX, 0), i64::MIN);
+        assert_eq!(clock_sample(&PlaySpan { looping: false, ..span }, u64::MAX, 0), i64::MAX - 1);
+        assert_eq!(clock_sample(&PlaySpan { start: i64::MIN, wa: i64::MIN, wb: i64::MIN, looping: false }, 0, 0), i64::MIN);
+        let once = PlaySpan::new(Tick::MAX, Tick::MAX, Tick::MAX, false, u32::MAX);
+        assert!(once.wb >= once.wa);
+    }
+
+    #[test]
     fn feed_counts_real_frames_and_peaks() {
         let f = AudioFeed::default();
         f.push(&[0.5, -0.25, 0.1, 0.9]);
@@ -483,6 +504,47 @@ mod tests {
         assert_eq!(f.consumed(), 2);
         assert_eq!(f.take_peaks(), [0.5, 0.9]);
         assert_eq!(f.take_peaks(), [0.0, 0.0]);
+    }
+
+    #[test]
+    fn device_timestamps_drive_preview_and_final_audio_drains_before_finishing() {
+        struct Device(Option<u64>);
+        impl AudioDevice for Device {
+            fn sample_rate(&self) -> u32 {
+                48_000
+            }
+            fn start(&mut self, _: Arc<AudioFeed>) -> Result<(), String> {
+                Ok(())
+            }
+            fn stop(&mut self) {}
+            fn latency_frames(&self) -> u64 {
+                480
+            }
+            fn played_frames(&self) -> Option<u64> {
+                self.0
+            }
+        }
+        let feed = Arc::new(AudioFeed::default());
+        feed.consumed.store(2000, Ordering::Relaxed);
+        feed.finished.store(true, Ordering::Relaxed);
+        let mut playback = AudioPlayback {
+            feed,
+            device: Box::new(Device(Some(1750))),
+            stop: Arc::new(AtomicBool::new(false)),
+            thread: None,
+            feeder: None,
+            rate: 48_000,
+            span: PlaySpan { start: 4800, wa: 0, wb: 48_000, looping: false },
+        };
+        assert_eq!(playback.clock(), 6550, "timestamp position already accounts for device latency");
+        assert!(!playback.finished(), "queued PCM is still audible after its final callback");
+        playback.device = Box::new(Device(Some(2000)));
+        assert!(playback.finished());
+        playback.span = PlaySpan { start: 47_000, wa: 0, wb: 48_000, looping: true };
+        assert_eq!(playback.clock(), 1000, "cumulative timestamps retain work-area wrapping");
+        playback.device = Box::new(Device(None));
+        assert_eq!(playback.clock(), 520, "legacy devices retain consumed-minus-latency behavior");
+        assert!(playback.finished());
     }
 
     /// #408: starting a preview with sound returns at once even when reading the footage takes
