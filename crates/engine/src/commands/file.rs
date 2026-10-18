@@ -99,11 +99,16 @@ pub(crate) fn open(s: &mut Session, p: &Value) -> Result<Value> {
 /// project opened from an XML copy saves as XML again). Fails, writing nothing, when the project
 /// wouldn't read back.
 pub(crate) fn file_text(s: &Session, path: &str) -> Result<String> {
+    crate::project_save::check_idle(s)?;
     let json = crate::history_file::encode_with_view(&s.project, &s.history, false, &s.saved_view())?;
     if crate::xml_project::is_xml_path(path) { crate::xml_project::to_xml(&json).map_err(EngineError::Other) } else { Ok(json) }
 }
 
-fn save_to(s: &mut Session, path: &str) -> Result<Value> {
+fn save_to(s: &mut Session, path: &str, p: &Value) -> Result<Value> {
+    crate::project_save::check_idle(s)?;
+    if b_p(p, "background").unwrap_or(false) {
+        return crate::project_save::start(s, path);
+    }
     let json = file_text(s, path)?;
     s.services.write_file(path, json.as_bytes()).map_err(|e| EngineError::Other(format!("cannot write {path}: {e}")))?;
     s.path = Some(path.to_string());
@@ -116,19 +121,19 @@ fn save_to(s: &mut Session, path: &str) -> Result<Value> {
 
 fn save(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").map(str::to_string).or_else(|| s.path.clone()).ok_or_else(|| bad("file.save", "no path: use file.saveAs {path}"))?;
-    save_to(s, &path)
+    save_to(s, &path, p)
 }
 
 fn save_as(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad("file.saveAs", "missing `path`"))?;
-    save_to(s, path)
+    save_to(s, path, p)
 }
 
-fn increment_save(s: &mut Session, _: &Value) -> Result<Value> {
+fn increment_save(s: &mut Session, p: &Value) -> Result<Value> {
     let cur = s.path.clone().ok_or_else(|| bad("file.incrementAndSave", "save the project first"))?;
     // After Effects: `Intro.aep` → `Intro 2.aep` → `Intro 3.aep`.
     let next = crate::autosave::increment_path(&cur, |p| s.file_ops().is_file(std::path::Path::new(p)));
-    save_to(s, &next)
+    save_to(s, &next, p)
 }
 
 fn revert(s: &mut Session, _: &Value) -> Result<Value> {
@@ -733,9 +738,9 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("file.newProject", "New Project", ["File", "New"], Some("Cmd+Alt+N"), "{}", always, new_project),
         cmd!("file.openDemoProject", "Open Demo Project", ["Help"], None, "{}", always, demo),
         cmd!("file.open", "Open Project...", ["File"], Some("Cmd+O"), "{path}", always, open),
-        cmd!("file.save", "Save", ["File"], Some("Cmd+S"), "{path?}", always, save),
-        cmd!("file.saveAs", "Save As...", ["File", "Save As"], Some("Cmd+Shift+S"), "{path}", always, save_as),
-        cmd!("file.incrementAndSave", "Increment and Save", ["File"], Some("Cmd+Alt+Shift+S"), "{}", has_path, increment_save),
+        cmd!("file.save", "Save", ["File"], Some("Cmd+S"), "{path?, background?}", always, save),
+        cmd!("file.saveAs", "Save As...", ["File", "Save As"], Some("Cmd+Shift+S"), "{path, background?}", always, save_as),
+        cmd!("file.incrementAndSave", "Increment and Save", ["File"], Some("Cmd+Alt+Shift+S"), "{background?}", has_path, increment_save),
         cmd!("file.revert", "Revert", ["File"], None, "{}", has_path, revert),
         cmd!(
             "file.import",

@@ -1,6 +1,6 @@
 # EffectCraft for 5RoD — development status
 
-This is a Windows development fork of EffectCraft 0.8.0. The requested complete After Effects
+This is a Windows development fork of EffectCraft 0.12.0. The requested complete After Effects
 experience is the target; this build is not an accepted replacement yet. The existing installed
 application and Desktop shortcut have not been removed or replaced.
 
@@ -34,9 +34,24 @@ application and Desktop shortcut have not been removed or replaced.
   A local 114 GiB OBS Hybrid MP4 opened and decoded four full-resolution frames with observed
   peak commitment below 440 MiB in a standalone check. This establishes large-file input
   viability, not 120 fps timeline playback. See [streaming media](streaming-media.md).
-- The upstream 0.8.0 integration retains this fork's journal, branching history, native tools and
+- The upstream 0.12.0 integration retains this fork's journal, branching history, native tools and
   theme alongside the newer camera/3D, color, docking, relinking and bounded frame-queue work.
   Those features still need representative footage and workflow acceptance before installation.
+- Control responses use bounded buffered writes and flush each complete JSON line. Three
+  alternating production pairs on a generated 300-layer, 1,803-state history measured median
+  history-query latency at 565.37 → 12.37 ms, project summaries at 43.29 → 2.26 ms, and
+  `ui.inspect` at 9.80 → 1.84 ms. Every response retained its contents and correlation ID.
+  These are local agent/control-channel measurements, not playback or general UI speedups.
+- Native Save, Save As and Increment and Save snapshot the document and complete history for
+  one background writer. Later edits stay modified; failed writes keep the project open.
+  New/Open does not join that writer or apply its saved state to the replacement document.
+  Normal closing waits for completion and checks for newer edits. Engine calls remain
+  synchronous unless requested otherwise. See the [save job protocol](../control-protocol.md).
+  Production responsiveness measurements for this change are still pending.
+- The 18 October production playback comparison measured 115.62 fps with a 21.33 ms p99
+  frame interval in the full-resolution 1440p/120 test, against 115.35 fps / 25.63 ms on the
+  comparison build. The absolute 20 ms p99 target failed. This short, silent application-draw
+  measurement establishes neither sustained audiovisual synchronization nor zero-lag 120 fps.
 - Eligible desktop previews now retain the compositor's native texture through viewer drawing.
   Channel, exposure, region and nonidentity display-color conversions retain their existing
   processing. Cache planning includes every display mip and both RAM and GPU budgets, so

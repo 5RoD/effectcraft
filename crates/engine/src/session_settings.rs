@@ -182,10 +182,23 @@ impl Session {
 
     /// Remember a project in File ▸ Open Recent and in the crash-recovery sentinel.
     pub(crate) fn note_project_path(&mut self, path: &str) {
+        self.note_project_path_impl(path, true);
+    }
+
+    pub(crate) fn note_project_path_async(&mut self, path: &str) {
+        self.note_project_path_impl(path, false);
+    }
+
+    fn note_project_path_impl(&mut self, path: &str, wait: bool) {
         self.prefs.push_recent(path);
         self.save_prefs();
-        let _ = self.autosave_wait();
+        if wait {
+            let _ = self.autosave_wait();
+        }
         self.autosave = autosave::AutoSaveState {
+            // A prior checkpoint owns its immutable snapshot. Collect it on a later tick;
+            // its origin check prevents publishing it under a different project path.
+            pending: self.autosave.pending.take(),
             last: self.autosave.last,
             sentinel: self.autosave.sentinel,
             background: self.autosave.background,

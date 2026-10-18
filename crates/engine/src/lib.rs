@@ -35,6 +35,7 @@ pub mod offload;
 pub mod perf;
 pub mod prefs;
 pub mod preview;
+mod project_save;
 pub mod psd_import;
 pub mod recovery_journal;
 pub mod recovery_sessions;

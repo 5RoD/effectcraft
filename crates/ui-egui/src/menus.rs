@@ -313,7 +313,8 @@ fn only_comp(p: &Value) -> Option<effectcraft_engine::project::ItemId> {
 }
 
 /// Execute a UI or engine command by id.
-pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, params: Value) -> Result<Value, String> {
+pub fn invoke(app: &mut EffectcraftApp, ctx: &egui::Context, id: &str, mut params: Value) -> Result<Value, String> {
+    background_save_params(app, id, &mut params);
     if matches!(id, "effects.copyPresetsFolderPath" | "mediaBrowser.copySourcePath") {
         return frontend(app, ctx, id, params);
     }
@@ -1550,11 +1551,26 @@ fn run_with_picked(app: &mut EffectcraftApp, id: &str, key: &str, params: &Value
     }
     // Save (untitled) becomes Save As.
     let id = if id == "file.save" { "file.saveAs" } else { id };
-    let r = app.session.execute(id, Value::Object(p)).map_err(|e| e.to_string());
+    let mut params = Value::Object(p);
+    background_save_params(app, id, &mut params);
+    let r = app.session.execute(id, params).map_err(|e| e.to_string());
     if let Err(e) = &r {
         app.ui.status = e.clone();
     }
     r
+}
+
+fn background_save_params(app: &EffectcraftApp, id: &str, params: &mut Value) {
+    // Event-loop hosts already opt into background auto-save; native menu saves use the same
+    // policy. Explicit engine calls remain synchronous unless they request background work.
+    if app.session.autosave.background && matches!(id, "file.save" | "file.saveAs" | "file.incrementAndSave") {
+        if params.is_null() {
+            *params = json!({});
+        }
+        if let Some(params) = params.as_object_mut() {
+            params.entry("background").or_insert(Value::Bool(true));
+        }
+    }
 }
 
 /// A menu entry for display / `ui.menu.list`.
@@ -2653,5 +2669,34 @@ mod tests {
     fn menu_items_cover_the_tree() {
         assert_eq!(menus().last(), Some(&"Help"));
         assert!(effectcraft_engine::menus::entries().len() > 500);
+    }
+
+    #[test]
+    fn native_menu_saves_and_dialog_answers_start_background_jobs() {
+        use std::sync::{Arc, Mutex};
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        app.session.execute("comp.new", json!({"width": 64, "height": 64})).unwrap();
+        app.session.autosave.background = true;
+        let ctx = egui::Context::default();
+        let dir = std::env::temp_dir().join(format!("ec-background-menu-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Menu.ecproj");
+        let result = invoke(&mut app, &ctx, "file.saveAs", json!({"path": path.to_string_lossy()})).unwrap();
+        assert_eq!(result["started"], true);
+        app.session.wait_jobs();
+        assert_eq!(app.session.job_log.last().unwrap().status, "done");
+        assert!(path.is_file() && !app.session.needs_save());
+        let pending: Arc<Mutex<Vec<crate::DialogDone>>> = Arc::default();
+        let queue = pending.clone();
+        app.hooks.file_dialog_async = Some(Box::new(move |_, done| queue.lock().unwrap().push(done)));
+        invoke(&mut app, &ctx, "file.saveAs", json!({})).unwrap();
+        let next = dir.join("Dialog.ecproj");
+        pending.lock().unwrap().pop().unwrap()(vec![next.to_string_lossy().into_owned()]);
+        app.run_dialog_answers();
+        assert!(app.session.is_saving(), "the dialog answer must not wait on serialisation");
+        app.session.wait_jobs();
+        assert!(next.is_file() && !app.session.needs_save());
+        assert_eq!(invoke(&mut app, &ctx, "file.save", json!({"background": false})).unwrap()["path"], next.to_string_lossy().as_ref());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

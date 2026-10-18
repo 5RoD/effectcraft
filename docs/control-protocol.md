@@ -57,6 +57,22 @@ Useful query commands for `engine.execute` (they aren't journaled or undoable): 
 export formats, parity summary), `jobs.list` (Progress panel jobs, e.g. the background
 `footage.check` after File ▸ Open).
 
+Native File ▸ Save, Save As and Increment and Save serialize the document and **all branching
+history** in one background `projectSave` job, keeping the editor available. A menu invocation
+returns `{job, started: true}`; poll `jobs.list` until that job appears in `finished`, and check
+its `status` (`done` or `failed`) before relying on the file. The saved snapshot is the state at
+invocation; edits made during the write remain modified. New/Open can proceed while the old
+snapshot finishes, without applying its saved state to the new document. Only one manual save
+writer runs per session; another save/copy is rejected until completion. Saves cannot be
+cancelled halfway through an atomic write. A normal window close waits for the pending save
+and checks for newer unsaved edits again.
+
+`engine.execute` keeps synchronous saves by default. `file.save {path?, background?}`,
+`file.saveAs {path, background?}` and `file.incrementAndSave {background?}` accept
+`background: true` for the same job behavior. `background: false` is an explicit save barrier,
+also used when answering the unsaved-changes prompt. File ▸ Open still parses synchronously;
+this change does not make project loading asynchronous.
+
 Every engine command is reachable through `engine.execute`, and every interactive widget of every
 panel registers an element id; both are enforced by `crates/ui-egui/tests/ui_agent_audit.rs`.
 

@@ -273,7 +273,9 @@ impl Session {
         }
         for t in &self.tasks {
             let s = lock(&t.ctl.state).clone();
-            out.push(info(&format!("task:{}", t.id), t.kind, t.label.clone(), s.done, s.total, !s.finished, s.message));
+            let mut row = info(&format!("task:{}", t.id), t.kind, t.label.clone(), s.done, s.total, !s.finished, s.message);
+            row.cancellable &= t.kind != crate::project_save::TASK_KIND;
+            out.push(row);
         }
         out
     }
@@ -296,11 +298,11 @@ impl Session {
             _ => {
                 let Some(n) = id.strip_prefix("task:").and_then(|n| n.parse::<u64>().ok()) else { return false };
                 match self.tasks.iter().find(|t| t.id == n) {
-                    Some(t) => {
+                    Some(t) if t.kind != crate::project_save::TASK_KIND => {
                         t.ctl.cancel.store(true, Ordering::Relaxed);
                         true
                     }
-                    None => false,
+                    _ => false,
                 }
             }
         }
@@ -317,12 +319,14 @@ impl Session {
         h.merge_key = None;
     }
 
-    /// Cancel and drop every task (new/open project).
+    /// Cancel analyses on New/Open; immutable manual saves finish independently.
     pub(crate) fn drop_tasks(&mut self) {
-        for t in &self.tasks {
-            t.ctl.cancel.store(true, Ordering::Relaxed);
-        }
         for mut t in std::mem::take(&mut self.tasks) {
+            if t.kind == crate::project_save::TASK_KIND {
+                self.tasks.push(t);
+                continue;
+            }
+            t.ctl.cancel.store(true, Ordering::Relaxed);
             if let Some(th) = t.thread.take() {
                 let _ = th.join();
             }

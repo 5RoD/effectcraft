@@ -26,6 +26,8 @@ pub struct Pending {
     pub answered: bool,
     /// The window closes without asking (the user answered the Quit prompt).
     pub quitting: bool,
+    /// A normal close requested while a manual save is writing resumes after it completes.
+    pub close_after_save: bool,
 }
 
 /// Whether `id` needs the prompt first. When it does, the prompt opens holding the command and
@@ -48,11 +50,30 @@ fn ask(app: &mut EffectcraftApp, id: &str, params: &Value) -> bool {
 
 /// The window's close button (and Quit, which closes it): keep the window open and ask.
 pub fn on_close_requested(app: &mut EffectcraftApp, ctx: &egui::Context) {
-    if !ctx.input(|i| i.viewport().close_requested()) || app.dialog_state.unsaved.quitting {
+    if app.dialog_state.unsaved.quitting {
+        return;
+    }
+    if app.dialog_state.unsaved.close_after_save && !app.session.is_saving() {
+        app.dialog_state.unsaved.close_after_save = false;
+        // Completion arrives on an ordinary frame, without another native CloseRequested.
+        // Ask before sending Close: a failed save or later edits must keep the window open.
+        if ask(app, "app.quit", &json!({})) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        return;
+    }
+    if !ctx.input(|i| i.viewport().close_requested()) {
         return;
     }
     // Logged, so a window that closes on its own shows it (#234).
     log::info!("the window was asked to close");
+    if app.session.is_saving() {
+        app.dialog_state.unsaved.close_after_save = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        return;
+    }
     if ask(app, "app.quit", &json!({})) {
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
     }
@@ -162,7 +183,8 @@ fn answer_with(app: &mut EffectcraftApp, ctx: &egui::Context, a: Answer) {
         Answer::Cancel => return,
         Answer::Save => {
             // An untitled project asks for a path; cancelling that dialog cancels the command.
-            if let Err(e) = crate::menus::invoke(app, ctx, "file.save", json!({})) {
+            // Closing is an explicit save barrier. Ordinary menu/shortcut saves remain async.
+            if let Err(e) = crate::menus::invoke(app, ctx, "file.save", json!({"background": false})) {
                 app.ui.status = e;
                 return;
             }
@@ -352,5 +374,31 @@ mod tests {
         answer_with(&mut app, &ctx, Answer::Cancel);
         assert!(app.session.redo());
         assert_eq!(app.session.project.comps().count(), 1);
+    }
+
+    #[test]
+    fn close_during_background_save_waits_and_then_rechecks_unsaved_edits() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (mut app, ctx) = app();
+        modified(&mut app);
+        let (release, waiting) = mpsc::channel();
+        app.session
+            .spawn_task("projectSave", "Saving fixture", false, move |_| {
+                waiting.recv_timeout(Duration::from_secs(5)).map_err(|e| e.to_string())?;
+                Ok(Box::new(|session| {
+                    session.mark_saved();
+                    Ok(json!({}))
+                }))
+            })
+            .unwrap();
+        assert!(frame(&mut app, &ctx, true));
+        assert!(app.dialog_state.unsaved.close_after_save && app.dialog.is_none());
+        release.send(()).unwrap();
+        app.session.wait_jobs();
+        app.session.execute("layer.newNull", json!({})).unwrap();
+        assert!(frame(&mut app, &ctx, false), "completion must check edits without a fresh native close event");
+        assert!(!app.dialog_state.unsaved.close_after_save);
+        assert_eq!(app.dialog, Some(Dialog::UnsavedChanges), "edits after the saved snapshot still ask before closing");
     }
 }
