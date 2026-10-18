@@ -201,16 +201,22 @@ pub fn decode(text: &str, current: &Arc<Project>) -> Result<Option<History>> {
 /// without allocating a second whole-project JSON tree. Opening also obtains `savedBy`
 /// here, avoiding a separate metadata scan.
 pub(crate) fn read_metadata(text: &str, current: &Arc<Project>) -> (Option<String>, Result<Option<History>>) {
+    read_metadata_at(text, current, None)
+}
+
+/// Resolve archived footage against the same document as the visible project. This keeps
+/// path normalization from discarding history and applies the stored-path policy to branches.
+pub(crate) fn read_metadata_at(text: &str, current: &Arc<Project>, document: Option<&str>) -> (Option<String>, Result<Option<History>>) {
     match serde_json::from_str::<FileMetadata>(text) {
         Ok(metadata) => {
             let saved_by = metadata.saved_by.and_then(|v| v.as_str().map(str::to_string));
-            (saved_by, decode_archive(text, metadata.history, current))
+            (saved_by, decode_archive(text, metadata.history, current, document))
         }
         Err(e) => (effectcraft_project::saved_by(text), Err(invalid(e))),
     }
 }
 
-fn decode_archive(text: &str, history: Option<Value>, current: &Arc<Project>) -> Result<Option<History>> {
+fn decode_archive(text: &str, history: Option<Value>, current: &Arc<Project>, document: Option<&str>) -> Result<Option<History>> {
     let Some(value) = history else { return Ok(None) };
     let archive: Archive = serde_json::from_value(value).map_err(invalid)?;
     if archive.version != VERSION || archive.states.is_empty() {
@@ -288,6 +294,9 @@ fn decode_archive(text: &str, history: Option<Value>, current: &Arc<Project>) ->
         }
         let mut upgraded = original;
         crate::upgrade_effects(&mut upgraded);
+        if document.is_some() {
+            crate::doc_path::resolve_footage(&mut upgraded, document);
+        }
         if upgraded != **current {
             return Err(invalid("upgraded current project does not match history"));
         }
@@ -306,6 +315,9 @@ fn decode_archive(text: &str, history: Option<Value>, current: &Arc<Project>) ->
     // Cache by the shared composition Arc so old states keep sharing unchanged comps.
     for state in states.iter_mut().skip(1) {
         crate::upgrade_effects_cached(Arc::make_mut(state), &mut cache);
+        if document.is_some() {
+            crate::doc_path::resolve_footage(Arc::make_mut(state), document);
+        }
     }
     if let Some(first) = states.first_mut() {
         *first = current.clone();

@@ -761,6 +761,28 @@ pub struct Crop {
 }
 
 impl Crop {
+    /// Validated crop edges. Size displays may use a placeholder on failure; exporters must
+    /// propagate the error before allocating a cropped frame.
+    pub fn checked_edges(&self, w: u32, h: u32, scale: f64) -> Result<(i32, i32, i32, i32), crate::ProjectError> {
+        if !self.enabled || !self.use_roi {
+            return Ok(self.edges(w, h, scale));
+        }
+        let invalid = |message: &str| crate::ProjectError::Invalid(message.into());
+        let [x, y, rw, rh] = self.roi.ok_or_else(|| invalid("Region of Interest crop requires a region"))?;
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(invalid("render scale must be finite and positive"));
+        }
+        if [x, y, rw, rh].iter().any(|value| !value.is_finite()) || rw <= 0.0 || rh <= 0.0 {
+            return Err(invalid("ROI coordinates must be finite and its width and height positive"));
+        }
+        let values = [(y * scale).round(), (x * scale).round(), f64::from(h) - ((y + rh) * scale).round(), f64::from(w) - ((x + rw) * scale).round()];
+        if values.iter().any(|value| !value.is_finite() || *value < f64::from(i32::MIN) || *value > f64::from(i32::MAX)) {
+            return Err(invalid("scaled ROI edges exceed the signed 32-bit pixel range"));
+        }
+        let [top, left, bottom, right] = values.map(|value| value as i32);
+        Ok((top, left, bottom, right))
+    }
+
     /// Edges `(top, left, bottom, right)` in pixels of a `w`×`h` frame rendered at `scale`.
     pub fn edges(&self, w: u32, h: u32, scale: f64) -> (i32, i32, i32, i32) {
         if !self.enabled {
@@ -1095,7 +1117,9 @@ impl OutputModule {
     /// The size of the frames this module writes for frames rendered at `w`×`h` with render
     /// scale `scale`: after Crop and Resize (before codec rounding).
     pub fn frame_size(&self, w: u32, h: u32, scale: f64) -> (u32, u32) {
-        let (t, l, b, r) = self.crop.edges(w, h, scale);
+        let Ok((t, l, b, r)) = self.crop.checked_edges(w, h, scale) else {
+            return self.resized_size(1, 1);
+        };
         let cw = (i64::from(w) - i64::from(l) - i64::from(r)).clamp(1, i64::from(u32::MAX)) as u32;
         let ch = (i64::from(h) - i64::from(t) - i64::from(b)).clamp(1, i64::from(u32::MAX)) as u32;
         self.resized_size(cw, ch)
@@ -1499,6 +1523,20 @@ mod tests {
     }
 
     #[test]
+    fn invalid_roi_size_queries_use_a_placeholder_and_checked_edges_reject_them() {
+        for roi in [None, Some([-1e12, -1e12, 200.0, 200.0]), Some([f64::MAX, 0.0, 2.0, 2.0]), Some([f64::NAN, 0.0, 2.0, 2.0]), Some([0.0, 0.0, 0.0, 2.0])] {
+            let output = OutputModule { crop: Crop { enabled: true, use_roi: true, roi, ..Default::default() }, ..Default::default() };
+            assert!(output.crop.checked_edges(64, 48, 1.0).is_err());
+            assert_eq!(output.frame_size(64, 48, 1.0), (1, 1));
+        }
+        let output =
+            OutputModule { crop: Crop { enabled: true, use_roi: true, roi: Some([-16.0, -8.0, 32.0, 32.0]), ..Default::default() }, ..Default::default() };
+        assert_eq!(output.crop.checked_edges(64, 48, 1.0).unwrap(), (-8, -16, 24, 48));
+        assert_eq!(output.frame_size(64, 48, 1.0), (32, 32));
+        assert!(output.crop.checked_edges(64, 48, f64::INFINITY).is_err());
+    }
+
+    #[test]
     fn templates_and_sequences() {
         let v = TemplateVars { comp_name: "Main/Title", project_name: "P", width: 1920, height: 1080, frame_rate: 29.97, start_frame: 0, end_frame: 9 };
         assert_eq!(expand_template(DEFAULT_TEMPLATE, OutputFormat::H264, &v), "Main_Title.mp4");
@@ -1663,6 +1701,22 @@ mod tests {
         assert_eq!(s.frame_count(&c), 30);
         assert_eq!(s.first_frame(&c), 30);
         assert!(s.frame_time(&c, 0) >= Tick::from_seconds_f64(1.0));
+    }
+
+    #[test]
+    fn hostile_roi_cannot_overflow_crop_math() {
+        // `-1e12` saturates to `i32::MIN` on conversion: `w as i32 - l` must saturate,
+        // not overflow, and still yield a usable (degenerate) frame size.
+        let c = Comp::new(1920, 1080, FrameRate::new(30, 1), Tick::from_seconds_f64(1.0));
+        let rs = RenderSettings::default();
+        let mut m = OutputModule::for_format(OutputFormat::PngSequence);
+        m.crop = Crop { enabled: true, use_roi: true, roi: Some([-1e12, -1e12, 200.0, 200.0]), ..Default::default() };
+        let (w, h) = m.output_size(&c, &rs);
+        assert!((w, h) == (1, 1), "degenerate but valid: {w}x{h}");
+        // Sane ROIs are unaffected (existing behavior).
+        m.crop = Crop { enabled: true, use_roi: true, roi: Some([100.0, 50.0, 800.0, 400.0]), ..Default::default() };
+        let half = RenderSettings { resolution: 0.5, ..Default::default() };
+        assert_eq!(m.output_size(&c, &half), (400, 200));
     }
 
     #[test]

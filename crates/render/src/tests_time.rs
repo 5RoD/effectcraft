@@ -13,7 +13,7 @@ use effectcraft_time::{FrameRate, Tick};
 fn exact_effect_host_preserves_boundaries_neighbour_ticks_and_float_ulp_inputs() {
     use effectcraft_effects::EffectHost;
     use effectcraft_project::{BitDepth, Footage};
-    use std::sync::{Arc, Mutex, atomic::AtomicUsize};
+    use std::sync::{Arc, Mutex};
     struct Source(Mutex<Vec<Tick>>);
     impl crate::FootageSource for Source {
         fn frame(&self, _: ItemId, _: &Footage, time: Tick) -> Option<Arc<crate::Image>> {
@@ -53,7 +53,7 @@ fn exact_effect_host_preserves_boundaries_neighbour_ticks_and_float_ulp_inputs()
             }
             for time in times {
                 let ctx = crate::EvalCtx { project: &p, comp_id: cid, comp, time: comp.layers[0].comp_time(time), expr: None, footage: None };
-                let host = crate::FxHost { r: &renderer, ctx: &ctx, layer: &comp.layers[0], origin: [0.0; 2], index: AtomicUsize::new(0), original: None };
+                let host = crate::FxHost { r: &renderer, ctx: &ctx, layer: &comp.layers[0], origin: [0.0; 2], index: 0, original: None };
                 assert_eq!(host.time_ticks(), Some((time, ctx.time)));
                 source.0.lock().unwrap().clear();
                 assert!(host.self_at_tick(time, 0).is_some());
@@ -209,7 +209,6 @@ fn timewarp_shutter_samples_follow_a_speed_change_inside_the_exposure() {
 fn timewarp_native_rate_integration_keeps_ticks_and_evaluates_expressions_in_layer_time() {
     use effectcraft_effects::EffectHost;
     use effectcraft_project::Expression;
-    use std::sync::atomic::AtomicUsize;
     struct Rate;
     impl crate::eval::ExprHost for Rate {
         fn eval(&self, ctx: &crate::EvalCtx, layer: &effectcraft_project::Layer, _: &effectcraft_project::Property, _: &Value) -> Result<Value, String> {
@@ -230,7 +229,7 @@ fn timewarp_native_rate_integration_keeps_ticks_and_evaluates_expressions_in_lay
         let comp = project.comp(cid).unwrap();
         let layer = &comp.layers[0];
         let ctx = crate::EvalCtx { project, comp_id: cid, comp, time: layer.comp_time(at), expr, footage: None };
-        let host = crate::FxHost { r: &r, ctx: &ctx, layer, origin: [0.0; 2], index: AtomicUsize::new(0), original: None };
+        let host = crate::FxHost { r: &r, ctx: &ctx, layer, origin: [0.0; 2], index: 0, original: None };
         host.integrated_time("speed", 100.0, at).unwrap()
     };
     for at in [Tick(FrameRate::FPS_120.tick_of(31_000_003).0 - 1), Tick::from_seconds_f64(-0.5)] {

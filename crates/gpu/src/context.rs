@@ -1010,6 +1010,12 @@ impl GpuContext {
             .fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |n| Some(n.saturating_add(elapsed)));
     }
 
+    /// Entries in the layer upload cache.
+    #[cfg(test)]
+    pub(crate) fn upload_entries(&self) -> usize {
+        self.uploads.lock().map(|u| u.map.len()).unwrap_or_default()
+    }
+
     /// Upload a (layer cache) buffer, reusing the texture while the same `Arc` is alive: static
     /// layers upload once, not every frame.
     pub(crate) fn upload_buf(&self, buf: &Arc<Buf>) -> Option<GpuImage> {
@@ -1032,14 +1038,14 @@ impl GpuContext {
                 u.bytes -= old.bytes;
             }
             u.bytes += bytes;
-            // Drop textures of freed buffers, then the least recently used over budget.
+            // Drop textures of freed buffers at once (a layer whose buffer changes every frame
+            // makes a new one each time, and nothing can hit the old one again), then the least
+            // recently used over budget.
             let budget = self.upload_budget();
-            if u.bytes > budget {
-                let dead: Vec<usize> = u.map.iter().filter(|(_, e)| e.buf.strong_count() == 0).map(|(k, _)| *k).collect();
-                for k in dead {
-                    if let Some(e) = u.map.remove(&k) {
-                        u.bytes -= e.bytes;
-                    }
+            let dead: Vec<usize> = u.map.iter().filter(|(_, e)| e.buf.strong_count() == 0).map(|(k, _)| *k).collect();
+            for k in dead {
+                if let Some(e) = u.map.remove(&k) {
+                    u.bytes -= e.bytes;
                 }
             }
             if u.bytes > budget && !self.upload_full_warned.swap(true, std::sync::atomic::Ordering::Relaxed) {

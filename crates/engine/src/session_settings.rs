@@ -259,13 +259,14 @@ impl Session {
         let fail = |e: std::io::Error| EngineError::Other(format!("auto-save failed: {e}"));
         let prefs = self.autosave_prefs();
         let plan = autosave::plan_in(self.file_ops(), &prefs, self.path.as_deref(), root.as_deref(), self.autosave.last_slot).map_err(fail)?;
+        let path = plan.path.to_string_lossy().into_owned();
         if self.autosave.background && !cfg!(target_arch = "wasm32") {
             let project = self.project.clone();
             let history = self.history.clone();
             let config = self.config.clone();
             let job = plan.clone();
             let revision = self.revision;
-            let pending = autosave::PendingWrite::spawn(plan.path.clone(), self.revision, plan.slot, move || {
+            let pending = autosave::PendingWrite::spawn(plan.path.clone(), plan.slot, revision, self.path.clone(), self.script_ui.project_epoch, move || {
                 let json = recovery_text(&project, &history, revision).map_err(std::io::Error::other)?;
                 match &config {
                     Some(c) => job.write(c.files(), json.as_bytes()),
@@ -279,7 +280,7 @@ impl Session {
             plan.write(self.file_ops(), json.as_bytes()).map_err(fail)?;
             self.autosave_completed(&plan.path, plan.slot, self.revision);
         }
-        Ok(plan.path.to_string_lossy().to_string())
+        Ok(path)
     }
 
     fn autosave_completed(&mut self, path: &Path, slot: u32, revision: u64) {
@@ -295,7 +296,12 @@ impl Session {
         match self.autosave.pending.take() {
             Some(w) => {
                 w.join().map_err(|e| EngineError::Other(format!("auto-save failed: {e}")))?;
-                self.autosave_completed(&w.path, w.slot, w.revision);
+                // Open/New can replace the project before note_project_path collects this
+                // write. Save As changes only its path. Never publish the old snapshot as the
+                // new project's recovery record, even when that record's final reset fails.
+                if w.project_path == self.path && w.project_epoch == self.script_ui.project_epoch {
+                    self.autosave_completed(&w.path, w.slot, w.revision);
+                }
                 Ok(())
             }
             None => Ok(()),
@@ -312,6 +318,9 @@ impl Session {
         }
         // A timer tick must never join an unfinished writer on the UI thread.
         if self.autosave.pending.is_some() {
+            // A manual save can begin before the first timer tick. Keep that tick as the
+            // interval anchor so newer edits are not delayed for another whole interval.
+            self.autosave.last.get_or_insert(now);
             return None;
         }
         let a = &self.prefs.auto_save;

@@ -52,22 +52,7 @@ impl Geometry {
         if !scale.is_finite() || scale <= 0.0 {
             return Err(invalid("render scale must be finite and positive"));
         }
-        let crop = &output.crop;
-        let edges = if crop.enabled && crop.use_roi {
-            let [x, y, rw, rh] = crop.roi.ok_or_else(|| invalid("Region of Interest crop requires a region"))?;
-            if [x, y, rw, rh].iter().any(|value| !value.is_finite()) || rw <= 0.0 || rh <= 0.0 {
-                return Err(invalid("ROI coordinates must be finite and its width and height positive"));
-            }
-            let values =
-                [(y * scale).round(), (x * scale).round(), f64::from(height) - ((y + rh) * scale).round(), f64::from(width) - ((x + rw) * scale).round()];
-            if values.iter().any(|value| !value.is_finite() || *value < f64::from(i32::MIN) || *value > f64::from(i32::MAX)) {
-                return Err(invalid("scaled ROI edges exceed the signed 32-bit pixel range"));
-            }
-            let [top, left, bottom, right] = values.map(|value| value as i32);
-            (top, left, bottom, right)
-        } else {
-            crop.edges(width, height, scale)
-        };
+        let edges = output.crop.checked_edges(width, height, scale).map_err(invalid)?;
         let [width, height] = cropped_size(width, height, edges)?;
         // Apply resize to the checked crop once; never run another crop on these dimensions.
         let (width, height) = output.resized_size(width, height);

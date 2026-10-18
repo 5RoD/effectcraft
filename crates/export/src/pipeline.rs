@@ -48,23 +48,46 @@ pub(crate) fn gpu_inflight(var: Option<&str>) -> usize {
 /// chunk renders, keeping both stages busy within the same bounded window. Only completed
 /// results take a short collection lock; no render/encode holds a permit or waits on another
 /// frame. Nested parallelism and a single worker remain supported.
+#[cfg(test)]
 pub(crate) fn map_frames<I: Send, T: Send>(
     ks: Vec<u64>,
     cap: Option<usize>,
     render: impl Fn(u64) -> I + Sync + Send,
     encode: impl Fn(u64, I) -> T + Sync + Send,
 ) -> Vec<T> {
+    map_frames_while(ks, cap, || true, render, encode)
+}
+
+/// [`map_frames`] whose `cap` holds only while `capped()`: once it turns false (the GPU stopped
+/// for good, so every frame falls back to the CPU), the remaining frames render in parallel
+/// like the uncapped CPU path instead of one chunk of `cap` at a time.
+pub(crate) fn map_frames_while<I: Send, T: Send>(
+    ks: Vec<u64>,
+    cap: Option<usize>,
+    capped: impl Fn() -> bool + Sync,
+    render: impl Fn(u64) -> I + Sync + Send,
+    encode: impl Fn(u64, I) -> T + Sync + Send,
+) -> Vec<T> {
     use rayon::prelude::*;
-    let Some(n) = cap.map(|n| n.max(1)) else {
+    let Some(n) = cap.map(|n| n.max(1)).filter(|_| capped()) else {
         return ks.into_par_iter().map(|k| encode(k, render(k))).collect();
     };
     let window = n.max(rayon::current_num_threads());
     let mut out = Vec::with_capacity(ks.len());
-    for win in ks.chunks(window) {
+    for (w, win) in ks.chunks(window).enumerate() {
+        if !capped() {
+            let remaining = ks.get(w.saturating_mul(window)..).unwrap_or_default();
+            out.par_extend(remaining.par_iter().map(|&k| encode(k, render(k))));
+            break;
+        }
         let results = Mutex::new(Vec::with_capacity(win.len()));
         rayon::scope(|scope| {
             let mut index = 0usize;
-            for chunk in win.chunks(n) {
+            let mut remaining = win;
+            while !remaining.is_empty() {
+                let count = if capped() { n.min(remaining.len()) } else { remaining.len() };
+                let Some((chunk, rest)) = remaining.split_at_checked(count) else { break };
+                remaining = rest;
                 let images: Vec<_> = chunk.par_iter().map(|&k| render(k)).collect();
                 for (&k, image) in chunk.iter().zip(images) {
                     let (results, encode, order) = (&results, &encode, index);
@@ -200,7 +223,9 @@ impl<'a> Cx<'a> {
             }
             return Ok(out);
         }
-        map_frames(ks, self.gpu_cap(), |k| self.frame(comp, k), |k, image| image.map(|image| f(k, image))).into_iter().collect()
+        // Once the GPU has stopped, release its concurrency cap for CPU fallback.
+        let gpu_live = || self.job.accel.is_none_or(|a| a.available());
+        map_frames_while(ks, self.gpu_cap(), gpu_live, |k| self.frame(comp, k), |k, image| image.map(|image| f(k, image))).into_iter().collect()
     }
 
     /// GPU frames rendered at once (#879), decided once per batch: with a GPU accelerator every
@@ -478,6 +503,36 @@ mod tests {
             },
         );
         (out, max.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn frames_render_in_parallel_once_the_gpu_stops() {
+        // Every frame after the GPU stopped falls back to the CPU: the cap no longer applies.
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let (live, now, max) = (AtomicBool::new(true), AtomicUsize::new(0), AtomicUsize::new(0));
+        let out = pool.install(|| {
+            map_frames_while(
+                (0..24).collect(),
+                Some(1),
+                || live.load(Ordering::SeqCst),
+                |k| {
+                    if k == 1 {
+                        live.store(false, Ordering::SeqCst);
+                    }
+                    let c = now.fetch_add(1, Ordering::SeqCst) + 1;
+                    if k >= 2 {
+                        max.fetch_max(c, Ordering::SeqCst);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    now.fetch_sub(1, Ordering::SeqCst);
+                    k * 10
+                },
+                |_, v| v,
+            )
+        });
+        assert_eq!(out, (0..24).map(|k| k * 10).collect::<Vec<_>>());
+        assert!(max.load(Ordering::SeqCst) > 1, "frames after the GPU stopped ran one at a time");
     }
 
     #[test]
