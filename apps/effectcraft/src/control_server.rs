@@ -6,7 +6,7 @@
 //! bounded ([`MAX_LINE`]) and so is the number of open connections ([`MAX_CONNECTIONS`]); junk
 //! never reaches the UI thread. See `docs/control-protocol.md`.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -55,6 +55,9 @@ fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Con
 }
 
 fn serve(stream: TcpStream, tx: &Sender<ControlRequest>, ctx: &egui::Context) {
+    if let Err(error) = stream.set_nodelay(true) {
+        log::debug!("cannot disable Nagle for a control connection: {error}");
+    }
     let Ok(read) = stream.try_clone() else { return };
     serve_lines(read, stream, |method, params| {
         let (req, rrx) = ControlRequest::new(method, params);
@@ -124,8 +127,11 @@ fn read_bounded_line(reader: &mut impl BufRead, buf: &mut Vec<u8>, max: usize) -
 /// Serve requests from `read`, answering on `out`, until the peer closes, sends something that is
 /// not a request, or `handle` returns `None` (app gone). `handle` gets `(method, params)` and
 /// returns the reply object (the request's `id` is added here).
-fn serve_lines<R: Read, W: Write>(read: R, mut out: W, mut handle: impl FnMut(String, Value) -> Option<Value>) {
+fn serve_lines<R: Read, W: Write>(read: R, out: W, mut handle: impl FnMut(String, Value) -> Option<Value>) {
     let mut reader = BufReader::new(read);
+    // Value's Display writes individual JSON tokens. Batch them in a fixed-size buffer,
+    // then flush each complete reply so the next request never waits on buffered output.
+    let mut out = BufWriter::new(out);
     let mut buf = Vec::new();
     loop {
         let reject = match read_bounded_line(&mut reader, &mut buf, MAX_LINE) {
@@ -174,6 +180,60 @@ mod tests {
         assert_eq!(r[0]["id"], 1);
         assert_eq!(r[1]["id"], 2);
         assert_eq!(r[2]["id"], Value::Null);
+    }
+
+    #[test]
+    fn large_control_replies_batch_writes_and_flush_each_response() {
+        #[derive(Default)]
+        struct Sink {
+            bytes: Vec<u8>,
+            writes: usize,
+            flushes: usize,
+        }
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+        let history: Vec<_> =
+            (0..1803usize).map(|index| json!({"index":index,"label":format!("Edit {index}"),"parent":index.checked_sub(1),"current":false})).collect();
+        let mut sink = Sink::default();
+        serve_lines(&b"{\"id\":1,\"method\":\"history\"}\n{\"id\":2,\"method\":\"history\"}\n"[..], &mut sink, |_, _| {
+            Some(json!({"ok":true,"result":history}))
+        });
+        let replies: Vec<Value> = std::str::from_utf8(&sink.bytes).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(replies.len(), 2);
+        for (index, reply) in replies.iter().enumerate() {
+            assert_eq!(reply["id"], index + 1);
+            assert_eq!(reply["result"], json!(history));
+        }
+        assert_eq!(sink.flushes, 2, "each newline-delimited reply must be visible immediately");
+        assert!(sink.writes < 128, "JSON tokens must not become individual socket writes: {}", sink.writes);
+    }
+
+    #[test]
+    fn failed_reply_flush_stops_before_dispatching_another_request() {
+        struct Failed;
+        impl Write for Failed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "synthetic disconnect"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut dispatched = 0;
+        serve_lines(&b"{\"method\":\"first\"}\n{\"method\":\"second\"}\n"[..], Failed, |_, _| {
+            dispatched += 1;
+            Some(json!({"ok":true}))
+        });
+        assert_eq!(dispatched, 1);
     }
 
     #[test]
