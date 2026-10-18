@@ -79,6 +79,9 @@ application and Desktop shortcut have not been removed or replaced.
   Missing/failed devices leave a responsive silent preview and actionable errors. Browser audio
   retains its inline user-gesture startup. Native device latency and sustained playback still
   require production acceptance; windowless fake-device regressions verify cancellation and silence.
+- Audio Settings reads cached output names and refreshes them in the background while visible,
+  instead of querying the operating system every frame. Refresh failures retain the last usable
+  list and retry; newly connected or removed outputs appear on the next successful refresh.
 - Native audio scrubbing decodes and mixes on one bounded worker with a replaceable latest
   request. New gestures and project/composition changes cancel obsolete sound; shutdown does
   not wait for a blocked read. Output/worker failures remain retryable. Synthetic regressions

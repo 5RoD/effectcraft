@@ -17,7 +17,9 @@ use effectcraft_ui_egui::audio::workers::AudioWorkers;
 use effectcraft_ui_egui::audio::{AudioDevice, AudioFeed, AudioOutput};
 
 mod clock;
+mod device_list;
 use clock::PlaybackClock;
+pub use device_list::service as devices;
 
 static OUTPUTS: AudioWorkers = AudioWorkers::new();
 
@@ -48,13 +50,6 @@ pub struct CpalOut {
     clock: Arc<PlaybackClock>,
     stop: Option<mpsc::Sender<()>>,
     feed: Option<Arc<AudioFeed>>,
-}
-
-/// Names of the output devices (Settings ▸ Audio).
-pub fn devices() -> Vec<String> {
-    let host = cpal::default_host();
-    #[allow(deprecated)]
-    host.output_devices().map(|d| d.filter_map(|d| d.name().ok()).collect()).unwrap_or_default()
 }
 
 /// The named output device, or the default one.

@@ -308,7 +308,7 @@ fn main() -> eframe::Result {
             }));
             app.hooks.system_theme = appearance::service();
             app.hooks.audio_device = Some(std::sync::Arc::new(audio_out::open));
-            app.hooks.audio_devices = Some(Box::new(audio_out::devices));
+            app.hooks.audio_devices = Some(audio_out::devices(cc.egui_ctx.clone()));
             app.hooks.pick_folder = Some(Box::new(|| rfd::FileDialog::new().pick_folder().map(|p| p.to_string_lossy().to_string())));
             app.hooks.pick_save_file = Some(Box::new(|name: &str, ext: &str| {
                 // A default with a folder that exists opens the dialog there.
